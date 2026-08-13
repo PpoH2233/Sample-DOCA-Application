@@ -213,9 +213,14 @@ Docker build context ต้องเป็น directory นี้:
 
 ```bash
 sudo docker build \
+  --no-cache \
+  --progress=plain \
   -t vf-eswitch-forward:doca-3.4.0 \
   .
 ```
+
+ใช้ `--no-cache` หลังแก้ `meson.build` เพื่อไม่ให้ Docker นำ build layer
+ที่ล้มเหลวหรือ configuration เก่ากลับมาใช้
 
 Dockerfile ใช้ image เดียวกันทั้ง builder และ runtime เพื่อป้องกัน DOCA/DPDK
 library version skew:
