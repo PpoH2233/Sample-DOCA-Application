@@ -125,6 +125,23 @@ batch add 1→2 และ 2→1 + process callbacks
 destroy pipe → stop ports → doca_flow_destroy
 ```
 
+### Packet path: VF-A → VF-B
+
+```mermaid
+sequenceDiagram
+    participant A as "VF-A / port 1"
+    participant E as "BlueField eSwitch"
+    participant P as "vm_switching pipe"
+    participant C as "Entry 1 counter"
+    participant B as "VF-B / port 2"
+
+    A->>E: Packet enters representor port 1
+    E->>P: Evaluate root pipe
+    P->>P: Match parser_meta.port_id = 1
+    P->>C: Increment packets and bytes
+    P->>B: Hardware forward to port 2
+```
+
 ## 5. เตรียม BlueField
 
 รันบน BlueField Arm ไม่ใช่ x86 host:
