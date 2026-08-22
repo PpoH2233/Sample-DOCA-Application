@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -157,11 +158,16 @@ doca_error_t ethernet_ports_probe_representors(
 
   result = doca_dpdk_cap_is_rep_port_supported(
       doca_dev_as_devinfo(parent_device), &capability_supported);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Representor probe capability query failed: %s\n",
+            doca_error_get_descr(result));
     return result;
+  }
 
-  if (capability_supported == 0)
+  if (capability_supported == 0) {
+    fprintf(stderr, "Parent device does not support DPDK representor probe\n");
     return DOCA_ERROR_NOT_SUPPORTED;
+  }
 
   input_identities = calloc(representor_count, sizeof(*input_identities));
   is_mapped = calloc(representor_count, sizeof(*is_mapped));
@@ -172,13 +178,42 @@ doca_error_t ethernet_ports_probe_representors(
   }
 
   for (size_t i = 0; i < representor_count; i++) {
+    uint16_t dpdk_vf_index;
+
     result = get_vf_identity(representors[i], &input_identities[i]);
-    if (result != DOCA_SUCCESS)
+    if (result != DOCA_SUCCESS) {
+      fprintf(stderr, "Failed to read identity of representor[%zu]: %s\n", i,
+              doca_error_get_descr(result));
       goto cleanup;
+    }
+
+    result = doca_dpdk_get_rep_vf_index(
+        doca_dev_rep_as_devinfo(representors[i]), &dpdk_vf_index);
+    if (result != DOCA_SUCCESS) {
+      fprintf(stderr,
+              "Representor[%zu] host=%u pf=%u vf=%u cannot be used as a "
+              "DPDK VF representor: %s\n",
+              i, input_identities[i].host_index,
+              input_identities[i].pf_index, input_identities[i].vf_index,
+              doca_error_get_descr(result));
+      goto cleanup;
+    }
+
+    printf("Input representor[%zu]: host=%u pf=%u vf=%u dpdk-vf=%u "
+           "vuid=%s\n",
+           i, input_identities[i].host_index, input_identities[i].pf_index,
+           input_identities[i].vf_index, dpdk_vf_index,
+           input_identities[i].vuid);
 
     for (size_t previous = 0; previous < i; previous++) {
       if (vf_identity_is_equal(&input_identities[i],
                                &input_identities[previous])) {
+        fprintf(stderr,
+                "Representor[%zu] duplicates representor[%zu] "
+                "(host=%u pf=%u vf=%u vuid=%s)\n",
+                i, previous, input_identities[i].host_index,
+                input_identities[i].pf_index, input_identities[i].vf_index,
+                input_identities[i].vuid);
         result = DOCA_ERROR_INVALID_VALUE;
         goto cleanup;
       }
@@ -190,8 +225,13 @@ doca_error_t ethernet_ports_probe_representors(
 
   result = doca_dpdk_port_probe_with_representors(
       parent_device, devargs, representors, representor_count);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr,
+            "doca_dpdk_port_probe_with_representors rejected %zu "
+            "representor(s), devargs=\"%s\": %s\n",
+            representor_count, devargs, doca_error_get_descr(result));
     goto cleanup;
+  }
 
   probe_succeeded = true;
 
