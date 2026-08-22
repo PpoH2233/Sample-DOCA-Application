@@ -9,9 +9,7 @@
 #include "dpdk_runtime.h"
 #include "ethernet_ports.h"
 
-#define FLOW_SWITCH_DEVARGS                                                   \
-  "dv_flow_en=2,fdb_def_rule_en=0,vport_match=1,"                           \
-  "repr_matching_en=0,dv_xmeta_en=4"
+#define FLOW_SWITCH_DEVARGS "dv_flow_en=2,fdb_def_rule_en=0,dv_xmeta_en=4"
 
 static doca_error_t open_all_vf_representors(
     struct doca_dev *parent_device,
