@@ -88,14 +88,22 @@ static doca_error_t map_representor_port(
   if (result == DOCA_ERROR_NOT_FOUND)
     return DOCA_SUCCESS;
 
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr,
+            "Failed to reverse-map DPDK port %u as a representor: %s\n",
+            port_id, doca_error_get_descr(result));
     return result;
+  }
 
   *is_representor = true;
 
   result = get_vf_identity(mapped_representor, &mapped_identity);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr,
+            "Failed to read identity from DPDK port %u representor: %s\n",
+            port_id, doca_error_get_descr(result));
     goto close_mapped_representor;
+  }
 
   for (match_index = 0; match_index < representor_count; match_index++) {
     if (!is_mapped[match_index] &&
@@ -104,6 +112,11 @@ static doca_error_t map_representor_port(
   }
 
   if (match_index == representor_count) {
+    fprintf(stderr,
+            "DPDK port %u maps to an unexpected representor "
+            "(host=%u pf=%u vf=%u vuid=%s)\n",
+            port_id, mapped_identity.host_index, mapped_identity.pf_index,
+            mapped_identity.vf_index, mapped_identity.vuid);
     result = DOCA_ERROR_NOT_FOUND;
     goto close_mapped_representor;
   }
@@ -121,6 +134,11 @@ static doca_error_t map_representor_port(
 close_mapped_representor:
   {
     doca_error_t close_result = doca_dev_rep_close(mapped_representor);
+
+    if (close_result != DOCA_SUCCESS)
+      fprintf(stderr,
+              "Failed to close temporary representor for DPDK port %u: %s\n",
+              port_id, doca_error_get_descr(close_result));
 
     if (result == DOCA_SUCCESS && close_result != DOCA_SUCCESS)
       result = close_result;
@@ -234,13 +252,27 @@ doca_error_t ethernet_ports_probe_representors(
   }
 
   probe_succeeded = true;
+  printf("DPDK reports %u available Ethernet port(s) after probe\n",
+         rte_eth_dev_count_avail());
 
   result = doca_dpdk_get_port_ids(parent_device, port_ids, RTE_MAX_ETHPORTS,
                                   &port_count);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "doca_dpdk_get_port_ids failed after probe: %s\n",
+            doca_error_get_descr(result));
     goto cleanup;
+  }
+
+  printf("DOCA-DPDK mapping returned %u port ID(s):", port_count);
+  for (uint16_t i = 0; i < port_count; i++)
+    printf(" %u", port_ids[i]);
+  printf("\n");
 
   if (port_count != representor_count + 1) {
+    fprintf(stderr,
+            "Unexpected port count: expected %zu (1 parent + %zu reps), "
+            "received %u\n",
+            representor_count + 1, representor_count, port_count);
     result = DOCA_ERROR_BAD_STATE;
     goto cleanup;
   }
@@ -256,6 +288,7 @@ doca_error_t ethernet_ports_probe_representors(
     bool is_representor;
 
     if (!rte_eth_dev_is_valid_port(port_ids[i])) {
+      fprintf(stderr, "DPDK port ID %u is not valid after probe\n", port_ids[i]);
       result = DOCA_ERROR_NOT_FOUND;
       goto cleanup;
     }
@@ -263,14 +296,20 @@ doca_error_t ethernet_ports_probe_representors(
     result = map_representor_port(
         port_ids[i], parent_device, representors, input_identities, is_mapped,
         representor_count, &mapped_ports[i], &is_representor);
-    if (result != DOCA_SUCCESS)
+    if (result != DOCA_SUCCESS) {
+      fprintf(stderr, "Failed to classify DPDK port %u: %s\n", port_ids[i],
+              doca_error_get_descr(result));
       goto cleanup;
+    }
 
     if (is_representor)
       continue;
 
     result = doca_dpdk_port_as_dev(port_ids[i], &mapped_device);
     if (result != DOCA_SUCCESS || mapped_device != parent_device) {
+      fprintf(stderr, "DPDK port %u is neither an input representor nor the "
+                      "expected parent device: %s\n",
+              port_ids[i], doca_error_get_descr(result));
       if (result == DOCA_SUCCESS)
         result = DOCA_ERROR_NOT_FOUND;
       goto cleanup;
@@ -285,12 +324,16 @@ doca_error_t ethernet_ports_probe_representors(
   }
 
   if (parent_count != 1) {
+    fprintf(stderr, "Expected exactly one parent port, mapped %u\n",
+            parent_count);
     result = DOCA_ERROR_BAD_STATE;
     goto cleanup;
   }
 
   for (size_t i = 0; i < representor_count; i++) {
     if (!is_mapped[i]) {
+      fprintf(stderr, "Input representor[%zu] was not mapped to a DPDK port\n",
+              i);
       result = DOCA_ERROR_NOT_FOUND;
       goto cleanup;
     }
