@@ -20,6 +20,7 @@ executable(
     'main.c',
     'dpdk_runtime.c',
     'ethernet_ports.c',
+    'ethernet_ports_probe_representors.c',
     '../doca_device_discovery/open_pci_device.c',
   ],
   dependencies: dependencies,
