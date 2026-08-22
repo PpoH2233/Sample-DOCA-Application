@@ -85,7 +85,12 @@ static doca_error_t map_representor_port(
 
   result = doca_dpdk_open_dev_rep_by_port_id(port_id, parent_device,
                                               &mapped_representor);
-  if (result == DOCA_ERROR_NOT_FOUND)
+  /*
+   * DOCA 3.4 returns INVALID_VALUE, rather than NOT_FOUND, when this API is
+   * called for the parent DPDK port. Let the caller verify that port through
+   * doca_dpdk_port_as_dev().
+   */
+  if (result == DOCA_ERROR_NOT_FOUND || result == DOCA_ERROR_INVALID_VALUE)
     return DOCA_SUCCESS;
 
   if (result != DOCA_SUCCESS) {
