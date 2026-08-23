@@ -1,0 +1,105 @@
+root@bluefield3-101:/doca_devel/Sample-DOCA-Application/ethernet_device_discovery# /tmp/test-dpdk-ports/ethernet_device_discovery -l 0 -- 03:00.0
+EAL: Detected CPU lcores: 8
+EAL: Detected NUMA nodes: 1
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'VA'
+Opened 6 network VF representor(s)
+Input representor[0]: host=1 pf=0 vf=0 dpdk-vf=0 vuid=MT2417X00041MLNXS0D0F0VF1
+Input representor[1]: host=1 pf=0 vf=1 dpdk-vf=1 vuid=MT2417X00041MLNXS0D0F0VF2
+Input representor[2]: host=1 pf=0 vf=2 dpdk-vf=2 vuid=MT2417X00041MLNXS0D0F0VF3
+Input representor[3]: host=1 pf=0 vf=3 dpdk-vf=3 vuid=MT2417X00041MLNXS0D0F0VF4
+Input representor[4]: host=1 pf=0 vf=4 dpdk-vf=4 vuid=MT2417X00041MLNXS0D0F0VF5
+Input representor[5]: host=1 pf=0 vf=5 dpdk-vf=5 vuid=MT2417X00041MLNXS0D0F0VF6
+DPDK reports 7 available Ethernet port(s) after probe
+DOCA-DPDK mapping returned 7 port ID(s): 6 5 4 3 2 1 0
+Probe created 7 DPDK Ethernet port(s)
+
+=== Ethernet port 1 of 7 ===
+Role: VF representor
+DPDK port ID: 6
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4101
+MAC address: 0A:DA:70:C6:CF:97
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=5
+Representor VUID: MT2417X00041MLNXS0D0F0VF6
+
+=== Ethernet port 2 of 7 ===
+Role: VF representor
+DPDK port ID: 5
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4100
+MAC address: 8E:B2:3B:BD:51:4E
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=4
+Representor VUID: MT2417X00041MLNXS0D0F0VF5
+
+=== Ethernet port 3 of 7 ===
+Role: VF representor
+DPDK port ID: 4
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4099
+MAC address: F2:AC:99:CE:52:68
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=3
+Representor VUID: MT2417X00041MLNXS0D0F0VF4
+
+=== Ethernet port 4 of 7 ===
+Role: VF representor
+DPDK port ID: 3
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4098
+MAC address: 32:3C:C9:6E:D8:8B
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=2
+Representor VUID: MT2417X00041MLNXS0D0F0VF3
+
+=== Ethernet port 5 of 7 ===
+Role: VF representor
+DPDK port ID: 2
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4097
+MAC address: 8E:23:C8:7D:73:0F
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=1
+Representor VUID: MT2417X00041MLNXS0D0F0VF2
+
+=== Ethernet port 6 of 7 ===
+Role: VF representor
+DPDK port ID: 1
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=4096
+MAC address: 8A:70:5A:CA:8B:E6
+Current MTU: 1500
+VF topology: host=1 pf=0 vf=0
+Representor VUID: MT2417X00041MLNXS0D0F0VF1
+
+=== Ethernet port 7 of 7 ===
+Role: parent
+DPDK port ID: 0
+Driver: mlx5_pci
+NUMA socket: -1
+Queues: configured rx=0 tx=0, maximum rx=1024 tx=1024
+MTU range: 68-9978
+eSwitch: name=0000:03:00.0 domain=0 port=65535
+MAC address: 9C:63:C0:7B:9B:A2
+Current MTU: 1500

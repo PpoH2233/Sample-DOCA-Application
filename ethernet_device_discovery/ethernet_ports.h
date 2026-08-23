@@ -53,6 +53,16 @@ doca_error_t ethernet_ports_probe_representors(
     const char *devargs,
     struct ethernet_ports *ports);
 
+/* Find the parent port without relying on the order of ports->items. */
+struct ethernet_port *
+ethernet_ports_find_parent(struct ethernet_ports *ports);
+
+/* Find one VF representor by its complete host/PF/VF identity. */
+struct ethernet_port *ethernet_ports_find_vf(struct ethernet_ports *ports,
+                                             uint32_t host_index,
+                                             uint32_t pf_index,
+                                             uint32_t vf_index);
+
 /* Print basic information about a successfully probed Ethernet port. */
 doca_error_t ethernet_port_print_info(const struct ethernet_port *port);
 

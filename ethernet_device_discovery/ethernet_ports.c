@@ -38,6 +38,40 @@ doca_error_t ethernet_port_probe(struct doca_dev *device,
   return DOCA_SUCCESS;
 }
 
+struct ethernet_port *
+ethernet_ports_find_parent(struct ethernet_ports *ports) {
+  if (ports == NULL || !ports->is_probed || ports->items == NULL)
+    return NULL;
+
+  for (uint16_t i = 0; i < ports->count; i++) {
+    if (ports->items[i].is_probed &&
+        ports->items[i].role == ETHERNET_PORT_ROLE_PARENT)
+      return &ports->items[i];
+  }
+
+  return NULL;
+}
+
+struct ethernet_port *ethernet_ports_find_vf(struct ethernet_ports *ports,
+                                             uint32_t host_index,
+                                             uint32_t pf_index,
+                                             uint32_t vf_index) {
+  if (ports == NULL || !ports->is_probed || ports->items == NULL)
+    return NULL;
+
+  for (uint16_t i = 0; i < ports->count; i++) {
+    struct ethernet_port *port = &ports->items[i];
+
+    if (port->is_probed &&
+        port->role == ETHERNET_PORT_ROLE_REPRESENTOR &&
+        port->host_index == host_index && port->pf_index == pf_index &&
+        port->vf_index == vf_index)
+      return port;
+  }
+
+  return NULL;
+}
+
 doca_error_t ethernet_port_print_info(const struct ethernet_port *port) {
   struct rte_eth_dev_info device_info = {0};
   struct rte_ether_addr mac_address = {0};
