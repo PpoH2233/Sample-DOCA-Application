@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <time.h>
 
-#include <doca_bitfield.h>
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
 #include <rte_ether.h>
@@ -39,13 +38,22 @@ static doca_error_t read_ingress_port_id(
     uint16_t *port_id) {
   uint32_t metadata;
 
-  if ((packet->ol_flags & RTE_MBUF_DYNFLAG_RX_METADATA) == 0)
-    return DOCA_ERROR_NOT_FOUND;
-
-  metadata = DOCA_BETOH32(*RTE_FLOW_DYNF_METADATA(packet));
+  /*
+   * rte_flow_dynf_metadata_avail() was checked during slow_path_init().
+   * The mlx5/DOCA Flow RX path exposes pkt_meta through the registered
+   * dynamic field, but it does not reliably set a per-packet metadata
+   * offload flag.  DOCA 3.4 samples therefore read this field directly.
+   * The value returned by the PMD is already in host byte order.
+   */
+  metadata = *RTE_FLOW_DYNF_METADATA(packet);
   if (metadata > UINT16_MAX ||
-      find_ingress_port(ports, (uint16_t)metadata) == NULL)
+      find_ingress_port(ports, (uint16_t)metadata) == NULL) {
+    fprintf(stderr,
+            "RX metadata does not map to a switch endpoint: "
+            "value=%" PRIu32 " ol_flags=0x%" PRIx64 "\n",
+            metadata, packet->ol_flags);
     return DOCA_ERROR_INVALID_VALUE;
+  }
 
   *port_id = (uint16_t)metadata;
   return DOCA_SUCCESS;
