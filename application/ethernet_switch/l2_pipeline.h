@@ -26,6 +26,7 @@ struct l2_pipeline {
   struct doca_flow_pipe *rss_pipe;
   struct doca_flow_pipe *destination_pipe;
   struct doca_flow_pipe *learning_clone_pipe;
+  struct doca_flow_pipe *learning_dispatch_pipe;
   struct doca_flow_pipe **flood_pipes;
   struct doca_flow_pipe *flood_selector_pipe;
   struct doca_flow_pipe *source_guard_pipe;
@@ -33,6 +34,7 @@ struct l2_pipeline {
 
   struct l2_static_rule rss_rule;
   struct l2_static_rule learning_clone_rules[2];
+  struct l2_static_rule learning_dispatch_rule;
   struct l2_static_rule *flood_rules;
   uint32_t flood_rule_count;
   struct l2_static_rule *selector_rules;
@@ -46,7 +48,10 @@ struct l2_pipeline {
  * ingress(root) -> source guard --hit--> destination FDB --hit--> port
  *                         | miss                 | miss
  *                         v                      v
- *                  clone {RSS, FDB}       ingress-specific flood
+ *                 learning dispatch      ingress-specific flood
+ *                         |
+ *                         v
+ *                  clone {RSS, FDB}
  *
  * Example after learning 02:00:00:00:00:0a on DPDK port 1:
  *   source: (ingress=1, src=02:...:0a) -> destination pipe

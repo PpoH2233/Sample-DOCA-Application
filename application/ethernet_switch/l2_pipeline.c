@@ -348,6 +348,65 @@ destroy_cfg:
   return process_rules(pipeline, pipeline->learning_clone_rules, 2);
 }
 
+/*
+ * DOCA Flow 3.4 accepts HASH_PIPE forwarding on a pipe or entry, but not as
+ * the miss forwarding of a BASIC pipe.  This one-entry BASIC pipe adapts the
+ * source-guard miss path to the flooding hash pipe used for packet cloning.
+ */
+static doca_error_t create_learning_dispatch_pipe(
+    struct l2_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_fwd fwd = {0};
+  doca_error_t result;
+
+  fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
+  fwd.hash_pipe.pipe = pipeline->learning_clone_pipe;
+  fwd.hash_pipe.algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
+
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_create(L2_LEARNING_DISPATCH)",
+      doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port));
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = report_flow_api(
+      "configure L2_LEARNING_DISPATCH",
+      set_pipe_identity(cfg, "L2_LEARNING_DISPATCH", DOCA_FLOW_PIPE_BASIC,
+                        false, 1));
+  if (result != DOCA_SUCCESS)
+    goto destroy_cfg;
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_set_match(L2_LEARNING_DISPATCH)",
+      doca_flow_pipe_cfg_set_match(cfg, &match, NULL));
+  if (result != DOCA_SUCCESS)
+    goto destroy_cfg;
+  result = report_flow_api(
+      "doca_flow_pipe_create(L2_LEARNING_DISPATCH)",
+      doca_flow_pipe_create(cfg, &fwd, NULL,
+                            &pipeline->learning_dispatch_pipe));
+
+destroy_cfg:
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  flow_entry_cookie_prepare(&pipeline->learning_dispatch_rule.cookie,
+                            "learning dispatch", DOCA_FLOW_ENTRY_OP_ADD);
+  result = report_flow_api(
+      "doca_flow_pipe_basic_add_entry(L2_LEARNING_DISPATCH)",
+      doca_flow_pipe_basic_add_entry(
+          pipeline->runtime->queue_id, pipeline->learning_dispatch_pipe,
+          &match, 0, NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+          &pipeline->learning_dispatch_rule.cookie,
+          &pipeline->learning_dispatch_rule.entry));
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  return report_flow_api(
+      "doca_flow_entries_process(L2_LEARNING_DISPATCH)",
+      process_rules(pipeline, &pipeline->learning_dispatch_rule, 1));
+}
+
 static doca_error_t create_source_guard_pipe(struct l2_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
@@ -363,26 +422,34 @@ static doca_error_t create_source_guard_pipe(struct l2_pipeline *pipeline) {
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
   fwd.type = DOCA_FLOW_FWD_PIPE;
   fwd.next_pipe = pipeline->destination_pipe;
-  miss.type = DOCA_FLOW_FWD_HASH_PIPE;
-  miss.hash_pipe.pipe = pipeline->learning_clone_pipe;
-  miss.hash_pipe.algorithm = DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
+  miss.type = DOCA_FLOW_FWD_PIPE;
+  miss.next_pipe = pipeline->learning_dispatch_pipe;
 
-  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_create(L2_SOURCE_GUARD)",
+      doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port));
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, "L2_SOURCE_GUARD",
-                             DOCA_FLOW_PIPE_BASIC, false,
-                             SWITCH_MAX_FDB_ENTRIES);
+  result = report_flow_api(
+      "configure L2_SOURCE_GUARD",
+      set_pipe_identity(cfg, "L2_SOURCE_GUARD", DOCA_FLOW_PIPE_BASIC, false,
+                        SWITCH_MAX_FDB_ENTRIES));
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_set_match(L2_SOURCE_GUARD)",
+      doca_flow_pipe_cfg_set_match(cfg, &match, &mask));
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_set_monitor(L2_SOURCE_GUARD)",
+      doca_flow_pipe_cfg_set_monitor(cfg, &monitor));
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_pipe_create(cfg, &fwd, &miss,
-                                 &pipeline->source_guard_pipe);
+  result = report_flow_api(
+      "doca_flow_pipe_create(L2_SOURCE_GUARD)",
+      doca_flow_pipe_create(cfg, &fwd, &miss,
+                            &pipeline->source_guard_pipe));
 
 destroy_cfg:
   doca_flow_pipe_cfg_destroy(cfg);
@@ -492,6 +559,11 @@ doca_error_t l2_pipeline_create(struct flow_runtime *runtime,
                                  create_learning_clone_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
+  printf("Creating L2 pipeline stage: learning dispatch\n");
+  result = report_pipeline_stage("learning dispatch",
+                                 create_learning_dispatch_pipe(pipeline));
+  if (result != DOCA_SUCCESS)
+    goto fail;
   printf("Creating L2 pipeline stage: source guard\n");
   result = report_pipeline_stage("source guard",
                                  create_source_guard_pipe(pipeline));
@@ -519,6 +591,8 @@ void l2_pipeline_destroy(struct l2_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
   if (pipeline->source_guard_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->source_guard_pipe);
+  if (pipeline->learning_dispatch_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->learning_dispatch_pipe);
   if (pipeline->learning_clone_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->learning_clone_pipe);
   if (pipeline->destination_pipe != NULL)
