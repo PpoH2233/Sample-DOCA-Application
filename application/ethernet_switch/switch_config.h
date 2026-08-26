@@ -21,6 +21,8 @@
 #define SWITCH_AGING_SCAN_SECONDS 1
 #define SWITCH_FLOW_TIMEOUT_US 1000000
 #define SWITCH_ACTIONS_MEM_SIZE (64U * 1024U)
+#define SWITCH_FLOW_COUNTER_COUNT (SWITCH_MAX_FDB_ENTRIES + 64U)
+#define SWITCH_FLOW_RSS_COUNT 1U
 
 /*
  * DOCA Flow uses the mlx5 hardware steering path in switch mode.

@@ -57,7 +57,13 @@ doca_error_t flow_runtime_init(struct flow_runtime *runtime,
   result = doca_flow_cfg_set_mode_args(cfg, SWITCH_FLOW_MODE_ARGS);
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_cfg_set_nr_counters(cfg, counter_count);
+  /*
+   * The switch uses a non-shared RSS object and non-shared counters.  In
+   * DOCA Flow 3.4 those resources are reserved on each Flow port, so select
+   * port-level accounting here and provide the actual quantities in
+   * flow_ports.c before every port is started.
+   */
+  result = doca_flow_cfg_set_resource_mode(cfg, DOCA_FLOW_RESOURCE_MODE_PORT);
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
   result = doca_flow_cfg_set_cb_entry_process(cfg, entry_process_callback);

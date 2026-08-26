@@ -41,6 +41,21 @@ static uint32_t next_power_of_two(uint32_t value) {
   return capacity;
 }
 
+static doca_error_t report_pipeline_stage(const char *stage,
+                                          doca_error_t result) {
+  if (result != DOCA_SUCCESS)
+    fprintf(stderr, "L2 pipeline stage '%s' failed: %s\n", stage,
+            doca_error_get_descr(result));
+  return result;
+}
+
+static doca_error_t report_flow_api(const char *api, doca_error_t result) {
+  if (result != DOCA_SUCCESS)
+    fprintf(stderr, "  %s failed: %s\n", api,
+            doca_error_get_descr(result));
+  return result;
+}
+
 static doca_error_t process_rules(struct l2_pipeline *pipeline,
                                   struct l2_static_rule *rules,
                                   uint32_t count) {
@@ -66,14 +81,18 @@ static doca_error_t create_rss_pipe(struct l2_pipeline *pipeline) {
   uint16_t queue = SWITCH_RX_QUEUE_ID;
   doca_error_t result;
 
-  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  result = report_flow_api(
+      "doca_flow_pipe_cfg_create(L2_RSS_PIPE)",
+      doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port));
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, "L2_RSS_PIPE", DOCA_FLOW_PIPE_BASIC,
-                             false, 1);
+  result = report_flow_api(
+      "configure L2_RSS_PIPE",
+      set_pipe_identity(cfg, "L2_RSS_PIPE", DOCA_FLOW_PIPE_BASIC, false, 1));
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
+  result = report_flow_api("doca_flow_pipe_cfg_set_match(L2_RSS_PIPE)",
+                           doca_flow_pipe_cfg_set_match(cfg, &match, NULL));
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
 
@@ -82,7 +101,9 @@ static doca_error_t create_rss_pipe(struct l2_pipeline *pipeline) {
   fwd.rss.queues_array = &queue;
   fwd.rss.nr_queues = 1;
   fwd.rss.inner_flags = DOCA_FLOW_RSS_AUTO;
-  result = doca_flow_pipe_create(cfg, &fwd, NULL, &pipeline->rss_pipe);
+  result = report_flow_api(
+      "doca_flow_pipe_create(L2_RSS_PIPE)",
+      doca_flow_pipe_create(cfg, &fwd, NULL, &pipeline->rss_pipe));
 
 destroy_cfg:
   doca_flow_pipe_cfg_destroy(cfg);
@@ -91,13 +112,16 @@ destroy_cfg:
 
   flow_entry_cookie_prepare(&pipeline->rss_rule.cookie, "rss catch-all",
                             DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_basic_add_entry(
-      pipeline->runtime->queue_id, pipeline->rss_pipe, &match, 0, NULL, NULL,
-      NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &pipeline->rss_rule.cookie,
-      &pipeline->rss_rule.entry);
+  result = report_flow_api(
+      "doca_flow_pipe_basic_add_entry(L2_RSS_PIPE)",
+      doca_flow_pipe_basic_add_entry(
+          pipeline->runtime->queue_id, pipeline->rss_pipe, &match, 0, NULL,
+          NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+          &pipeline->rss_rule.cookie, &pipeline->rss_rule.entry));
   if (result != DOCA_SUCCESS)
     return result;
-  return process_rules(pipeline, &pipeline->rss_rule, 1);
+  return report_flow_api("doca_flow_entries_process(L2_RSS_PIPE)",
+                         process_rules(pipeline, &pipeline->rss_rule, 1));
 }
 
 static doca_error_t create_one_flood_pipe(struct l2_pipeline *pipeline,
@@ -444,25 +468,38 @@ doca_error_t l2_pipeline_create(struct flow_runtime *runtime,
   pipeline->ports = ports;
   pipeline->switch_port = ports->switch_port;
 
-  result = create_rss_pipe(pipeline);
+  printf("Creating L2 pipeline stage: RSS slow path\n");
+  result = report_pipeline_stage("RSS slow path", create_rss_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_flood_pipes(pipeline);
+  printf("Creating L2 pipeline stage: flood groups\n");
+  result = report_pipeline_stage("flood groups",
+                                 create_flood_pipes(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_flood_selector_pipe(pipeline);
+  printf("Creating L2 pipeline stage: flood selector\n");
+  result = report_pipeline_stage("flood selector",
+                                 create_flood_selector_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_destination_pipe(pipeline);
+  printf("Creating L2 pipeline stage: destination FDB\n");
+  result = report_pipeline_stage("destination FDB",
+                                 create_destination_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_learning_clone_pipe(pipeline);
+  printf("Creating L2 pipeline stage: learning clone\n");
+  result = report_pipeline_stage("learning clone",
+                                 create_learning_clone_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_source_guard_pipe(pipeline);
+  printf("Creating L2 pipeline stage: source guard\n");
+  result = report_pipeline_stage("source guard",
+                                 create_source_guard_pipe(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
-  result = create_ingress_classifier(pipeline);
+  printf("Creating L2 pipeline stage: ingress classifier\n");
+  result = report_pipeline_stage("ingress classifier",
+                                 create_ingress_classifier(pipeline));
   if (result != DOCA_SUCCESS)
     goto fail;
 

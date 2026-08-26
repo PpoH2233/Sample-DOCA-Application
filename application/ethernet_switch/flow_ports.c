@@ -29,6 +29,22 @@ static doca_error_t start_one_port(struct ethernet_port *ethernet,
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
 
+  /* Must match the port-level resource mode selected by flow_runtime_init(). */
+  result = doca_flow_port_cfg_set_nr_resources(
+      cfg, DOCA_FLOW_RESOURCE_COUNTER, SWITCH_FLOW_COUNTER_COUNT);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Failed to reserve counters for DPDK port %u: %s\n",
+            ethernet->port_id, doca_error_get_descr(result));
+    goto destroy_cfg;
+  }
+  result = doca_flow_port_cfg_set_nr_resources(
+      cfg, DOCA_FLOW_RESOURCE_RSS, SWITCH_FLOW_RSS_COUNT);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Failed to reserve RSS for DPDK port %u: %s\n",
+            ethernet->port_id, doca_error_get_descr(result));
+    goto destroy_cfg;
+  }
+
   if (ethernet->role == ETHERNET_PORT_ROLE_PARENT)
     result = doca_flow_port_cfg_set_dev(cfg, ethernet->device);
   else

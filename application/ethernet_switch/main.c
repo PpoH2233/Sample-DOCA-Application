@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     goto cleanup_devices;
   }
 
-  result = flow_runtime_init(&flow_runtime, SWITCH_MAX_FDB_ENTRIES + 64);
+  result = flow_runtime_init(&flow_runtime, SWITCH_FLOW_COUNTER_COUNT);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize DOCA Flow: %s\n",
             doca_error_get_descr(result));
