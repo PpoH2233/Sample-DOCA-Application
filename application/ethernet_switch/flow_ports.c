@@ -1,5 +1,6 @@
 #include "flow_ports.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "switch_config.h"
@@ -46,6 +47,8 @@ destroy_cfg:
 
 doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
                                      struct switch_flow_ports *ports) {
+  struct ethernet_port *parent;
+  uint16_t total_count;
   doca_error_t result;
 
   if (ethernet_ports == NULL || ports == NULL ||
@@ -54,30 +57,74 @@ doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
   if (ports->started)
     return DOCA_ERROR_BAD_STATE;
 
-  ports->items = calloc(ethernet_ports->count, sizeof(*ports->items));
+  total_count = ethernet_ports->count;
+  ports->items = calloc(total_count, sizeof(*ports->items));
   if (ports->items == NULL)
     return DOCA_ERROR_NO_MEMORY;
-  ports->count = ethernet_ports->count;
 
-  for (uint16_t i = 0; i < ports->count; i++) {
-    ports->items[i].ethernet = &ethernet_ports->items[i];
-    result = start_one_port(ports->items[i].ethernet,
-                            &ports->items[i].flow);
+  /*
+   * In switch mode the parent is the proxy port. It must be started before
+   * any representor and stopped after every representor.
+   */
+  parent = ethernet_ports_find_parent(ethernet_ports);
+  if (parent == NULL) {
+    result = DOCA_ERROR_NOT_FOUND;
+    goto error;
+  }
+
+  ports->items[0].ethernet = parent;
+  printf("Starting DOCA Flow parent port %u\n", parent->port_id);
+  result = start_one_port(parent, &ports->items[0].flow);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Failed to start parent DPDK port %u: %s\n",
+            parent->port_id, doca_error_get_descr(result));
+    goto error;
+  }
+  ports->count = 1;
+
+  for (uint16_t i = 0; i < total_count; i++) {
+    struct ethernet_port *ethernet = &ethernet_ports->items[i];
+    struct switch_flow_port *flow_port;
+
+    if (ethernet->role == ETHERNET_PORT_ROLE_PARENT)
+      continue;
+
+    flow_port = &ports->items[ports->count];
+    flow_port->ethernet = ethernet;
+    printf("Starting DOCA Flow representor port %u "
+           "(host=%u pf=%u vf=%u)\n",
+           ethernet->port_id, ethernet->host_index, ethernet->pf_index,
+           ethernet->vf_index);
+
+    result = start_one_port(ethernet, &flow_port->flow);
     if (result != DOCA_SUCCESS) {
-      ports->count = i;
-      (void)switch_flow_ports_stop(ports);
-      return result;
+      fprintf(stderr,
+              "Failed to start representor DPDK port %u "
+              "(host=%u pf=%u vf=%u): %s\n",
+              ethernet->port_id, ethernet->host_index, ethernet->pf_index,
+              ethernet->vf_index, doca_error_get_descr(result));
+      goto error;
     }
+    ports->count++;
+  }
+
+  if (ports->count != total_count) {
+    result = DOCA_ERROR_BAD_STATE;
+    goto error;
   }
 
   ports->switch_port = doca_flow_port_switch_get(NULL);
   if (ports->switch_port == NULL) {
-    (void)switch_flow_ports_stop(ports);
-    return DOCA_ERROR_NOT_FOUND;
+    result = DOCA_ERROR_NOT_FOUND;
+    goto error;
   }
 
   ports->started = true;
   return DOCA_SUCCESS;
+
+error:
+  (void)switch_flow_ports_stop(ports);
+  return result;
 }
 
 doca_error_t switch_flow_ports_stop(struct switch_flow_ports *ports) {
