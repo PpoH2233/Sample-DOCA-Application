@@ -19,6 +19,19 @@ static void print_mac(const struct rte_ether_addr *mac) {
          mac->addr_bytes[3], mac->addr_bytes[4], mac->addr_bytes[5]);
 }
 
+static void free_entry(struct l2_fdb_entry *entry) {
+  free(entry->destination_rules);
+  free(entry);
+}
+
+static void print_fdb_delete(const struct l2_fdb_entry *entry,
+                             const char *reason) {
+  printf("FDB DELETE: mac=");
+  print_mac(&entry->mac);
+  printf(" port=%u reason=%s rules=%u\n", entry->learned_port_id, reason,
+         entry->destination_rule_count + 1);
+}
+
 static struct l2_fdb_entry *find_entry(struct l2_fdb *fdb,
                                        uint16_t vlan_id,
                                        const struct rte_ether_addr *mac) {
@@ -86,12 +99,16 @@ doca_error_t l2_fdb_learn(struct l2_fdb *fdb,
     fdb->head = entry;
     fdb->count++;
 
-    printf("FDB learn: ");
+    printf("FDB ADD: mac=");
     print_mac(source);
-    printf(" -> DPDK port %u (entries=%zu)\n", ingress_port_id,
-           fdb->count);
+    printf(" port=%u rules=%u entries=%zu\n", ingress_port_id,
+           entry->destination_rule_count + 1, fdb->count);
     return DOCA_SUCCESS;
   }
+
+  /* Aging owns this record until every hardware handle is gone. */
+  if (entry->state == L2_FDB_DELETING)
+    return DOCA_SUCCESS;
 
   if (entry->learned_port_id == ingress_port_id) {
     entry->last_seen_ns = now_ns;
@@ -106,10 +123,10 @@ doca_error_t l2_fdb_learn(struct l2_fdb *fdb,
     return result;
   }
 
-  printf("FDB move:  ");
+  printf("FDB UPDATE: mac=");
   print_mac(source);
-  printf(" port %u -> port %u\n", entry->learned_port_id,
-         ingress_port_id);
+  printf(" port=%u->%u rules=%u\n", entry->learned_port_id,
+         ingress_port_id, entry->destination_rule_count + 1);
   entry->learned_port_id = ingress_port_id;
   entry->last_seen_ns = now_ns;
   entry->last_source_packets = 0;
@@ -130,42 +147,43 @@ doca_error_t l2_fdb_age(struct l2_fdb *fdb, uint64_t now_ns) {
     uint64_t packet_count = 0;
     doca_error_t result;
 
-    result = l2_pipeline_query_source_counter(entry, &packet_count);
-    if (result != DOCA_SUCCESS) {
-      if (first_error == DOCA_SUCCESS)
-        first_error = result;
-      cursor = &entry->next;
-      continue;
+    if (entry->state != L2_FDB_DELETING) {
+      result = l2_pipeline_query_source_counter(entry, &packet_count);
+      if (result != DOCA_SUCCESS) {
+        if (first_error == DOCA_SUCCESS)
+          first_error = result;
+        cursor = &entry->next;
+        continue;
+      }
+
+      if (packet_count != entry->last_source_packets) {
+        entry->last_source_packets = packet_count;
+        entry->last_seen_ns = now_ns;
+        cursor = &entry->next;
+        continue;
+      }
+
+      if (now_ns - entry->last_seen_ns < fdb->aging_ns) {
+        cursor = &entry->next;
+        continue;
+      }
+
+      entry->state = L2_FDB_DELETING;
     }
 
-    if (packet_count != entry->last_source_packets) {
-      entry->last_source_packets = packet_count;
-      entry->last_seen_ns = now_ns;
-      cursor = &entry->next;
-      continue;
-    }
-
-    if (now_ns - entry->last_seen_ns < fdb->aging_ns) {
-      cursor = &entry->next;
-      continue;
-    }
-
-    entry->state = L2_FDB_DELETING;
     result = l2_pipeline_remove_fdb_entry(fdb->pipeline, entry);
     if (result != DOCA_SUCCESS) {
-      entry->state = L2_FDB_ACTIVE;
+      /* Keep DELETING so the next maintenance pass resumes at the first
+       * non-NULL hardware handle instead of querying a removed source rule. */
       if (first_error == DOCA_SUCCESS)
         first_error = result;
       cursor = &entry->next;
       continue;
     }
 
-    printf("FDB age:   ");
-    print_mac(&entry->mac);
-    printf(" removed from port %u\n", entry->learned_port_id);
+    print_fdb_delete(entry, "aged");
     *cursor = entry->next;
-    free(entry->destination_rules);
-    free(entry);
+    free_entry(entry);
     fdb->count--;
   }
 
@@ -180,7 +198,7 @@ void l2_fdb_print(const struct l2_fdb *fdb) {
          fdb->capacity);
   for (const struct l2_fdb_entry *entry = fdb->head; entry != NULL;
        entry = entry->next) {
-    printf("  vlan=%u mac=", entry->vlan_id);
+    printf("  mac=");
     print_mac(&entry->mac);
     printf(" port=%u packets=%" PRIu64 " state=%d\n",
            entry->learned_port_id, entry->last_source_packets,
@@ -189,26 +207,49 @@ void l2_fdb_print(const struct l2_fdb *fdb) {
 }
 
 doca_error_t l2_fdb_destroy(struct l2_fdb *fdb) {
+  struct l2_fdb_entry **cursor;
   doca_error_t first_error = DOCA_SUCCESS;
 
   if (fdb == NULL)
     return DOCA_ERROR_INVALID_VALUE;
 
+  cursor = &fdb->head;
+  while (*cursor != NULL) {
+    struct l2_fdb_entry *entry = *cursor;
+
+    if (fdb->pipeline != NULL && fdb->pipeline->created &&
+        (entry->source_rule.entry != NULL ||
+         entry->destination_rules != NULL)) {
+      doca_error_t result =
+          l2_pipeline_remove_fdb_entry(fdb->pipeline, entry);
+      if (result != DOCA_SUCCESS) {
+        if (first_error == DOCA_SUCCESS)
+          first_error = result;
+        cursor = &entry->next;
+        continue;
+      }
+    }
+
+    print_fdb_delete(entry, "shutdown");
+    *cursor = entry->next;
+    free_entry(entry);
+    fdb->count--;
+  }
+
+  if (fdb->head == NULL)
+    *fdb = (struct l2_fdb){0};
+  return first_error;
+}
+
+void l2_fdb_release(struct l2_fdb *fdb) {
+  if (fdb == NULL)
+    return;
+
   while (fdb->head != NULL) {
     struct l2_fdb_entry *entry = fdb->head;
 
     fdb->head = entry->next;
-    if (fdb->pipeline != NULL && fdb->pipeline->created &&
-        entry->source_rule.entry != NULL) {
-      doca_error_t result =
-          l2_pipeline_remove_fdb_entry(fdb->pipeline, entry);
-      if (first_error == DOCA_SUCCESS && result != DOCA_SUCCESS)
-        first_error = result;
-    }
-    free(entry->destination_rules);
-    free(entry);
+    free_entry(entry);
   }
-
   *fdb = (struct l2_fdb){0};
-  return first_error;
 }

@@ -22,6 +22,24 @@ static uint64_t monotonic_time_ns(void) {
          (uint64_t)value.tv_nsec;
 }
 
+static void log_arm_packet(uint16_t ingress_port_id,
+                           const struct rte_mbuf *packet,
+                           const struct rte_ether_hdr *ethernet) {
+  printf("ARM RX: port=%u len=%" PRIu32 " src=", ingress_port_id,
+         rte_pktmbuf_pkt_len(packet));
+  printf("%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8
+         ":%02" PRIx8 ":%02" PRIx8,
+         ethernet->src_addr.addr_bytes[0], ethernet->src_addr.addr_bytes[1],
+         ethernet->src_addr.addr_bytes[2], ethernet->src_addr.addr_bytes[3],
+         ethernet->src_addr.addr_bytes[4], ethernet->src_addr.addr_bytes[5]);
+  printf(" dst=%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8
+         ":%02" PRIx8 ":%02" PRIx8 " ether_type=0x%04" PRIx16 "\n",
+         ethernet->dst_addr.addr_bytes[0], ethernet->dst_addr.addr_bytes[1],
+         ethernet->dst_addr.addr_bytes[2], ethernet->dst_addr.addr_bytes[3],
+         ethernet->dst_addr.addr_bytes[4], ethernet->dst_addr.addr_bytes[5],
+         rte_be_to_cpu_16(ethernet->ether_type));
+}
+
 static const struct switch_flow_port *find_ingress_port(
     const struct switch_flow_ports *ports,
     uint16_t port_id) {
@@ -114,10 +132,12 @@ static doca_error_t process_learning_packet(struct slow_path *slow_path,
    * software while omitting it from the hardware FDB would mix two VLANs.
    */
   if (vlan_id != 0) {
-    fprintf(stderr, "Ignoring VLAN %u learning copy (untagged only)\n",
-            vlan_id);
     return DOCA_SUCCESS;
   }
+
+  /* Only packets that enter this application's untagged ARM slow path are
+   * logged. Tagged learning copies are discarded silently above. */
+  log_arm_packet(ingress_port_id, packet, &ethernet);
 
   if (!rte_is_valid_assigned_ether_addr(&ethernet.src_addr))
     return DOCA_SUCCESS;
@@ -173,7 +193,8 @@ doca_error_t slow_path_run(struct slow_path *slow_path,
       doca_error_t result = l2_fdb_age(slow_path->fdb, now_ns);
 
       if (result != DOCA_SUCCESS)
-        return result;
+        fprintf(stderr, "FDB maintenance will retry: %s\n",
+                doca_error_get_descr(result));
       slow_path->next_aging_scan_ns = now_ns +
           (uint64_t)SWITCH_AGING_SCAN_SECONDS * 1000000000ULL;
     }

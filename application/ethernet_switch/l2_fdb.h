@@ -57,8 +57,8 @@ doca_error_t l2_fdb_init(struct l2_pipeline *pipeline,
  * Learn or move one unicast source. vlan_id=0 is the untagged bridge.
  *
  * Example output:
- *   FDB learn: 02:00:00:00:00:0a -> DPDK port 1 (entries=1)
- *   FDB move:  02:00:00:00:00:0a port 1 -> port 2
+ *   FDB ADD: mac=02:00:00:00:00:0a port=1 rules=8 entries=1
+ *   FDB UPDATE: mac=02:00:00:00:00:0a port=1->2 rules=8
  */
 doca_error_t l2_fdb_learn(struct l2_fdb *fdb,
                           uint16_t vlan_id,
@@ -71,5 +71,8 @@ doca_error_t l2_fdb_age(struct l2_fdb *fdb, uint64_t now_ns);
 
 void l2_fdb_print(const struct l2_fdb *fdb);
 doca_error_t l2_fdb_destroy(struct l2_fdb *fdb);
+
+/* Free software records after the hardware pipeline has been destroyed. */
+void l2_fdb_release(struct l2_fdb *fdb);
 
 #endif /* L2_FDB_H */

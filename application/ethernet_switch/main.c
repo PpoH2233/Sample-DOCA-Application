@@ -150,11 +150,13 @@ int main(int argc, char **argv) {
   exit_status = EXIT_SUCCESS;
 
 cleanup_fdb:
-  l2_fdb_print(&fdb);
   report_cleanup_error("Failed to remove FDB entries", l2_fdb_destroy(&fdb),
                        &exit_status);
 cleanup_pipeline:
   l2_pipeline_destroy(&pipeline);
+  /* Failed entry removals keep their callback cookies alive until the pipes
+   * are gone.  It is safe to release the remaining software records now. */
+  l2_fdb_release(&fdb);
 cleanup_flow_ports:
   report_cleanup_error("Failed to stop DOCA Flow ports",
                        switch_flow_ports_stop(&flow_ports), &exit_status);

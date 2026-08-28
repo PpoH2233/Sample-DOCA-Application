@@ -771,45 +771,63 @@ out:
 
 doca_error_t l2_pipeline_remove_fdb_entry(struct l2_pipeline *pipeline,
                                           struct l2_fdb_entry *entry) {
-  struct flow_entry_cookie **cookies;
-  uint32_t operation_count = entry->destination_rule_count + 1;
-  uint32_t cursor = 0;
+  struct flow_entry_cookie *cookie;
   doca_error_t result;
 
   if (pipeline == NULL || entry == NULL || !pipeline->created)
     return DOCA_ERROR_INVALID_VALUE;
 
-  cookies = calloc(operation_count, sizeof(*cookies));
-  if (cookies == NULL)
-    return DOCA_ERROR_NO_MEMORY;
+  /*
+   * Dynamic rules were installed destination-first and source-last.  Remove
+   * them in reverse order so a packet cannot keep hitting SOURCE_GUARD while
+   * its destination rules are being dismantled.
+   *
+   * Entry deletion is a latency-sensitive control-path operation.  The DOCA
+   * switch sample uses NO_WAIT for removal; batching deletes from different
+   * pipes can complete with DOCA_FLOW_ENTRY_STATUS_ERROR on the HWS switch
+   * port.  Process one deletion at a time so a successful handle can be
+   * cleared immediately and will never be submitted a second time.
+   */
+  if (entry->source_rule.entry != NULL) {
+    flow_entry_cookie_prepare(&entry->source_rule.cookie, "remove source",
+                              DOCA_FLOW_ENTRY_OP_DEL);
+    result = doca_flow_pipe_remove_entry(
+        pipeline->runtime->queue_id, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        entry->source_rule.entry);
+    if (result != DOCA_SUCCESS)
+      return result;
+
+    cookie = &entry->source_rule.cookie;
+    result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
+                                  &cookie, 1);
+    if (result != DOCA_SUCCESS)
+      return result;
+    entry->source_rule.entry = NULL;
+  }
 
   for (uint16_t i = 0; i < entry->destination_rule_count; i++) {
     struct l2_dynamic_rule *rule = &entry->destination_rules[i];
 
+    if (rule->entry == NULL)
+      continue;
+
     flow_entry_cookie_prepare(&rule->cookie, "remove destination",
                               DOCA_FLOW_ENTRY_OP_DEL);
-    cookies[cursor++] = &rule->cookie;
     result = doca_flow_pipe_remove_entry(
-        pipeline->runtime->queue_id, DOCA_FLOW_ENTRY_FLAGS_WAIT_FOR_BATCH,
+        pipeline->runtime->queue_id, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
         rule->entry);
     if (result != DOCA_SUCCESS)
-      goto out;
+      return result;
+
+    cookie = &rule->cookie;
+    result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
+                                  &cookie, 1);
+    if (result != DOCA_SUCCESS)
+      return result;
+    rule->entry = NULL;
   }
 
-  flow_entry_cookie_prepare(&entry->source_rule.cookie, "remove source",
-                            DOCA_FLOW_ENTRY_OP_DEL);
-  cookies[cursor++] = &entry->source_rule.cookie;
-  result = doca_flow_pipe_remove_entry(
-      pipeline->runtime->queue_id, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-      entry->source_rule.entry);
-  if (result != DOCA_SUCCESS)
-    goto out;
-
-  result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
-                                cookies, operation_count);
-out:
-  free(cookies);
-  return result;
+  return DOCA_SUCCESS;
 }
 
 doca_error_t l2_pipeline_query_source_counter(
