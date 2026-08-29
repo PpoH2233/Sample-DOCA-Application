@@ -10,17 +10,89 @@
 
 #include "eswitch_config.h"
 
-static void usage(const char *program) {
-  fprintf(stderr,
-          "Usage:\n"
-          "  %s status\n"
-          "  %s vs-create <id>\n"
-          "  %s vs-delete <id>\n"
-          "  %s vs-port-attach <vs-id> <port-id>\n"
-          "  %s vs-list\n"
-          "  %s show_fdb [vs-id]\n"
-          "  %s list-port-available\n",
-          program, program, program, program, program, program, program);
+static void print_help(FILE *output, const char *program) {
+  fprintf(output,
+          "Usage: %s <command> [arguments]\n\n"
+          "Commands:\n"
+          "  status                              Show daemon status\n"
+          "  vs-create --id <id>                 Create a virtual switch\n"
+          "  vs-delete --id <id>                 Delete a virtual switch\n"
+          "  vs-port-attach --vs <id> --port <p> Attach an available port\n"
+          "  vs-port-detach --vs <id> --port <p> Detach a member port\n"
+          "  vs-list                             List virtual switches\n"
+          "  show_fdb [--id <id>]                Show all or one FDB\n"
+          "  list-port-available                 List unassigned DPDK ports\n"
+          "  list-port-avaiable                  Compatibility spelling\n"
+          "  --help, -h                          Show this help\n\n"
+          "Control socket: %s\n"
+          "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",
+          program, ESWITCH_SOCKET_PATH);
+}
+
+static bool parse_u16_value(const char *text) {
+  char *end = NULL;
+  unsigned long value;
+
+  if (text == NULL || *text == '\0')
+    return false;
+  errno = 0;
+  value = strtoul(text, &end, 0);
+  return errno == 0 && *end == '\0' && value <= UINT16_MAX;
+}
+
+static bool valid_id_arguments(int count, char **arguments, bool optional) {
+  if (count == 0)
+    return optional;
+  if (count == 1)
+    return parse_u16_value(arguments[0]);
+  return count == 2 && strcmp(arguments[0], "--id") == 0 &&
+         parse_u16_value(arguments[1]);
+}
+
+static bool valid_port_arguments(int count, char **arguments) {
+  bool found_vswitch = false;
+  bool found_port = false;
+
+  if (count == 2)
+    return parse_u16_value(arguments[0]) && parse_u16_value(arguments[1]);
+  if (count != 4)
+    return false;
+  for (int i = 0; i < count; i += 2) {
+    if ((strcmp(arguments[i], "--vs") == 0 ||
+         strcmp(arguments[i], "--id") == 0) &&
+        !found_vswitch) {
+      found_vswitch = parse_u16_value(arguments[i + 1]);
+      if (!found_vswitch)
+        return false;
+    } else if (strcmp(arguments[i], "--port") == 0 && !found_port) {
+      found_port = parse_u16_value(arguments[i + 1]);
+      if (!found_port)
+        return false;
+    } else {
+      return false;
+    }
+  }
+  return found_vswitch && found_port;
+}
+
+static bool valid_command_line(int argc, char **argv) {
+  const char *command = argv[1];
+  int argument_count = argc - 2;
+  char **arguments = &argv[2];
+
+  if (strcmp(command, "status") == 0 || strcmp(command, "vs-list") == 0 ||
+      strcmp(command, "list-port-available") == 0 ||
+      strcmp(command, "list-port-avaiable") == 0)
+    return argument_count == 0;
+  if (strcmp(command, "vs-create") == 0 ||
+      strcmp(command, "vs-delete") == 0)
+    return valid_id_arguments(argument_count, arguments, false);
+  if (strcmp(command, "vs-port-attach") == 0 ||
+      strcmp(command, "vs-port-detach") == 0)
+    return valid_port_arguments(argument_count, arguments);
+  if (strcmp(command, "show_fdb") == 0)
+    return valid_id_arguments(argument_count, arguments, true);
+  return false;
 }
 
 int main(int argc, char **argv) {
@@ -35,7 +107,17 @@ int main(int argc, char **argv) {
   int fd;
 
   if (argc < 2) {
-    usage(argv[0]);
+    print_help(stderr, argv[0]);
+    return EXIT_FAILURE;
+  }
+  if (argc == 2 &&
+      (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0)) {
+    print_help(stdout, argv[0]);
+    return EXIT_SUCCESS;
+  }
+  if (!valid_command_line(argc, argv)) {
+    fprintf(stderr, "Invalid command or arguments.\n\n");
+    print_help(stderr, argv[0]);
     return EXIT_FAILURE;
   }
   if (socket_path == NULL || *socket_path == '\0')
@@ -70,7 +152,16 @@ int main(int argc, char **argv) {
   address.sun_family = AF_UNIX;
   snprintf(address.sun_path, sizeof(address.sun_path), "%s", socket_path);
   if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
-    fprintf(stderr, "Cannot connect to %s: %s\n", socket_path, strerror(errno));
+    if (errno == ENOENT || errno == ECONNREFUSED) {
+      fprintf(stderr,
+              "eSwitch Management control socket is not available: %s\n"
+              "The daemon may not be running. Check it with:\n"
+              "  systemctl status eswitch-management\n",
+              socket_path);
+    } else {
+      fprintf(stderr, "Cannot connect to control socket %s: %s\n",
+              socket_path, strerror(errno));
+    }
     close(fd);
     return EXIT_FAILURE;
   }

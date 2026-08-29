@@ -156,6 +156,85 @@ out:
   return result;
 }
 
+static doca_error_t detach_port(struct eswitch_manager *manager,
+                                uint16_t vswitch_id, uint16_t port_id) {
+  struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
+  struct eswitch_flood_group replacement = {0};
+  uint16_t *members;
+  uint16_t member_count = 0;
+  int port_index;
+  doca_error_t result;
+
+  if (vswitch == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+  port_index = find_port_index(manager, port_id);
+  if (port_index < 0)
+    return DOCA_ERROR_NOT_FOUND;
+  if (manager->port_owner[port_index] != vswitch_id)
+    return DOCA_ERROR_INVALID_VALUE;
+  members = calloc(manager->ports->count, sizeof(*members));
+  if (members == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    if (i != (uint16_t)port_index &&
+        manager->port_owner[i] == vswitch_id)
+      members[member_count++] = manager->ports->items[i].ethernet->port_id;
+  }
+
+  result = eswitch_fdb_flush_vswitch(&manager->fdb, vswitch_id,
+                                     "port-detach");
+  if (result != DOCA_SUCCESS)
+    goto out;
+  result = eswitch_pipeline_detach_port(manager->pipeline,
+                                        (uint16_t)port_index);
+  if (result != DOCA_SUCCESS)
+    goto out;
+  result = eswitch_pipeline_destroy_flood_group(manager->pipeline,
+                                                &vswitch->flood);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t rollback = eswitch_pipeline_attach_port(
+        manager->pipeline, (uint16_t)port_index, vswitch_id);
+    if (rollback != DOCA_SUCCESS)
+      fprintf(stderr,
+              "Failed to restore classifier for DPDK port %u: %s\n",
+              port_id, doca_error_get_descr(rollback));
+    goto out;
+  }
+
+  /* No remaining hardware path references this port after the old flood
+   * group is gone, so it is now safe to advertise the port as available. */
+  manager->port_owner[port_index] = 0;
+  result = eswitch_pipeline_build_flood_group(
+      manager->pipeline, vswitch_id, members, member_count, &replacement);
+  if (result != DOCA_SUCCESS) {
+    if (replacement.paths != NULL) {
+      vswitch->flood = replacement;
+    } else {
+      doca_error_t original_error = result;
+      doca_error_t rollback;
+
+      /* Reconstruct the old membership when the new flood group failed
+       * cleanly. This keeps an ERR response from silently changing state. */
+      manager->port_owner[port_index] = vswitch_id;
+      members[member_count++] = port_id;
+      rollback = eswitch_pipeline_build_flood_group(
+          manager->pipeline, vswitch_id, members, member_count,
+          &vswitch->flood);
+      if (rollback == DOCA_SUCCESS)
+        rollback = eswitch_pipeline_attach_port(
+            manager->pipeline, (uint16_t)port_index, vswitch_id);
+      result = rollback == DOCA_SUCCESS ? original_error : rollback;
+    }
+    goto out;
+  }
+  vswitch->flood = replacement;
+  printf("VSWITCH DETACH: vs=%u dpdk-port=%u\n", vswitch_id, port_id);
+
+out:
+  free(members);
+  return result;
+}
+
 static doca_error_t delete_vswitch(struct eswitch_manager *manager,
                                    uint16_t id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, id);
@@ -314,6 +393,48 @@ static bool parse_u16(const char *text, uint16_t *value) {
   return true;
 }
 
+static bool parse_id_arguments(char **arguments, size_t count,
+                               bool required, uint16_t *id) {
+  if (count == 0) {
+    if (required)
+      return false;
+    *id = 0;
+    return true;
+  }
+  if (count == 1)
+    return parse_u16(arguments[0], id); /* Legacy positional form. */
+  return count == 2 && strcmp(arguments[0], "--id") == 0 &&
+         parse_u16(arguments[1], id);
+}
+
+static bool parse_port_arguments(char **arguments, size_t count,
+                                 uint16_t *id, uint16_t *port_id) {
+  bool found_id = false;
+  bool found_port = false;
+
+  if (count == 2)
+    return parse_u16(arguments[0], id) &&
+           parse_u16(arguments[1], port_id); /* Legacy positional form. */
+  if (count != 4)
+    return false;
+  for (size_t i = 0; i < count; i += 2) {
+    if ((strcmp(arguments[i], "--vs") == 0 ||
+         strcmp(arguments[i], "--id") == 0) &&
+        !found_id) {
+      found_id = parse_u16(arguments[i + 1], id);
+      if (!found_id)
+        return false;
+    } else if (strcmp(arguments[i], "--port") == 0 && !found_port) {
+      found_port = parse_u16(arguments[i + 1], port_id);
+      if (!found_port)
+        return false;
+    } else {
+      return false;
+    }
+  }
+  return found_id && found_port;
+}
+
 static size_t format_status(const struct eswitch_manager *manager,
                             char *response, size_t size) {
   size_t used = 0;
@@ -398,11 +519,12 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
   char command[256];
   char *save = NULL;
   char *verb;
-  char *arg1;
-  char *arg2;
+  char *arguments[8];
+  size_t argument_count = 0;
   uint16_t first;
   uint16_t second;
   doca_error_t result = DOCA_SUCCESS;
+  bool syntax_error = false;
 
   if (request == NULL || response == NULL || response_size == 0 ||
       manager == NULL || !manager->initialized)
@@ -410,44 +532,51 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
   snprintf(command, sizeof(command), "%s", request);
   command[strcspn(command, "\r\n")] = '\0';
   verb = strtok_r(command, " \t", &save);
-  arg1 = strtok_r(NULL, " \t", &save);
-  arg2 = strtok_r(NULL, " \t", &save);
+  while (argument_count < sizeof(arguments) / sizeof(arguments[0])) {
+    char *argument = strtok_r(NULL, " \t", &save);
+    if (argument == NULL)
+      break;
+    arguments[argument_count++] = argument;
+  }
+  if (strtok_r(NULL, " \t", &save) != NULL)
+    verb = NULL;
   if (verb == NULL) {
     result = DOCA_ERROR_INVALID_VALUE;
-  } else if (strcmp(verb, "status") == 0 && arg1 == NULL) {
+  } else if (strcmp(verb, "status") == 0 && argument_count == 0) {
     (void)format_status(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "vs-list") == 0 && arg1 == NULL) {
+  } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
     (void)format_vswitches(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if ((strcmp(verb, "list-port-avaiable") == 0 ||
-              strcmp(verb, "list-port-available") == 0) && arg1 == NULL) {
+              strcmp(verb, "list-port-available") == 0) &&
+             argument_count == 0) {
     (void)format_available_ports(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "show_fdb") == 0 && arg2 == NULL) {
-    if (arg1 == NULL) {
-      first = 0;
-    } else if (!parse_u16(arg1, &first)) {
-      result = DOCA_ERROR_INVALID_VALUE;
-      goto error;
-    }
+  } else if (strcmp(verb, "show_fdb") == 0 &&
+             parse_id_arguments(arguments, argument_count, false, &first)) {
     snprintf(response, response_size, "OK\n");
     eswitch_fdb_format(&manager->fdb, first,
                        response + strlen(response),
                        response_size - strlen(response));
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "vs-create") == 0 && arg2 == NULL &&
-             parse_u16(arg1, &first)) {
+  } else if (strcmp(verb, "vs-create") == 0 &&
+             parse_id_arguments(arguments, argument_count, true, &first)) {
     result = create_vswitch(manager, first);
-  } else if (strcmp(verb, "vs-delete") == 0 && arg2 == NULL &&
-             parse_u16(arg1, &first)) {
+  } else if (strcmp(verb, "vs-delete") == 0 &&
+             parse_id_arguments(arguments, argument_count, true, &first)) {
     result = delete_vswitch(manager, first);
   } else if (strcmp(verb, "vs-port-attach") == 0 &&
-             parse_u16(arg1, &first) && parse_u16(arg2, &second) &&
-             strtok_r(NULL, " \t", &save) == NULL) {
+             parse_port_arguments(arguments, argument_count, &first,
+                                  &second)) {
     result = attach_port(manager, first, second);
+  } else if (strcmp(verb, "vs-port-detach") == 0 &&
+             parse_port_arguments(arguments, argument_count, &first,
+                                  &second)) {
+    result = detach_port(manager, first, second);
   } else {
     result = DOCA_ERROR_INVALID_VALUE;
+    syntax_error = true;
   }
 
   if (result == DOCA_SUCCESS) {
@@ -457,6 +586,28 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
 error:
   snprintf(response, response_size, "ERR code=%d message=%s\n", result,
            doca_error_get_descr(result));
+  if (syntax_error) {
+    size_t used = strlen(response);
+
+    if (verb != NULL && strcmp(verb, "vs-create") == 0)
+      append_text(response, response_size, used,
+                  "Usage: vs-create --id <id>\n");
+    else if (verb != NULL && strcmp(verb, "vs-delete") == 0)
+      append_text(response, response_size, used,
+                  "Usage: vs-delete --id <id>\n");
+    else if (verb != NULL && strcmp(verb, "vs-port-attach") == 0)
+      append_text(response, response_size, used,
+                  "Usage: vs-port-attach --vs <id> --port <port-id>\n");
+    else if (verb != NULL && strcmp(verb, "vs-port-detach") == 0)
+      append_text(response, response_size, used,
+                  "Usage: vs-port-detach --vs <id> --port <port-id>\n");
+    else if (verb != NULL && strcmp(verb, "show_fdb") == 0)
+      append_text(response, response_size, used,
+                  "Usage: show_fdb [--id <id>]\n");
+    else
+      append_text(response, response_size, used,
+                  "Run: eswitchctl --help\n");
+  }
   return result;
 }
 

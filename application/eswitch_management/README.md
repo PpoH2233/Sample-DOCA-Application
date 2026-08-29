@@ -50,12 +50,13 @@ In another shell:
 ```bash
 /tmp/eswitch-management-build/eswitchctl status
 /tmp/eswitch-management-build/eswitchctl list-port-available
-/tmp/eswitch-management-build/eswitchctl vs-create 10
-/tmp/eswitch-management-build/eswitchctl vs-port-attach 10 1
-/tmp/eswitch-management-build/eswitchctl vs-port-attach 10 2
+/tmp/eswitch-management-build/eswitchctl vs-create --id 10
+/tmp/eswitch-management-build/eswitchctl vs-port-attach --vs 10 --port 1
+/tmp/eswitch-management-build/eswitchctl vs-port-attach --vs 10 --port 2
 /tmp/eswitch-management-build/eswitchctl vs-list
 /tmp/eswitch-management-build/eswitchctl show_fdb
-/tmp/eswitch-management-build/eswitchctl vs-delete 10
+/tmp/eswitch-management-build/eswitchctl vs-port-detach --vs 10 --port 2
+/tmp/eswitch-management-build/eswitchctl vs-delete --id 10
 ```
 
 Example output:
@@ -66,6 +67,8 @@ DPDK port 0 (uplink/parent)
 DPDK port 1 (host=1 pf=0 vf=0)
 DPDK port 2 (host=1 pf=0 vf=1)
 ```
+
+See [CLI.md](CLI.md) for the complete CLI and Unix-socket protocol contract.
 
 
 ## systemd
