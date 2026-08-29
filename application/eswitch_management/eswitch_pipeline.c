@@ -438,54 +438,75 @@ static doca_error_t create_flood_path(struct eswitch_pipeline *pipeline,
 
   path->ingress_port_id = ingress_port_id;
   path->member_count = member_count - 1;
-  path->members = calloc(path->member_count, sizeof(*path->members));
-  if (path->members == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-
-  snprintf(name, sizeof(name), "ESW_VS%u_FLOOD_FROM_%u", vswitch_id,
-           ingress_port_id);
-  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
-  if (result != DOCA_SUCCESS)
-    return result;
-  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_HASH, false,
-                             next_power_of_two(path->member_count));
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_hash_map_algorithm(
-        cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, &pipe_fwd, NULL, &path->pipe);
-  doca_flow_pipe_cfg_destroy(cfg);
-  if (result != DOCA_SUCCESS)
-    return result;
-
-  for (uint16_t i = 0; i < member_count; i++) {
-    struct doca_flow_fwd fwd = {0};
-    struct eswitch_rule *rule;
-
-    if (member_port_ids[i] == ingress_port_id)
-      continue;
-    rule = &path->members[cursor];
-    fwd.type = DOCA_FLOW_FWD_PORT;
-    fwd.port_id = member_port_ids[i];
-    flow_entry_cookie_prepare(&rule->cookie, "flood member",
-                              DOCA_FLOW_ENTRY_OP_ADD);
-    result = doca_flow_pipe_hash_add_entry(
-        pipeline->runtime->queue_id, path->pipe, cursor, 0, NULL, NULL, &fwd,
-        batch_flags(cursor, path->member_count), &rule->cookie, &rule->entry);
-    if (result != DOCA_SUCCESS)
-      return result;
-    cursor++;
-  }
-  result = process_rules(pipeline, path->members, path->member_count);
-  if (result != DOCA_SUCCESS)
-    return result;
-
   selector_match.meta.pkt_meta = DOCA_HTOBE32(
       eswitch_metadata_encode(vswitch_id, ingress_port_id));
-  selector_fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
-  selector_fwd.hash_pipe.pipe = path->pipe;
-  selector_fwd.hash_pipe.algorithm =
-      DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
+
+  /* A two-port vSwitch has exactly one peer for each ingress. Forwarding
+   * directly avoids constructing a one-entry flooding hash pipe. Apart from
+   * being cheaper, this follows the ordinary switch-mode PORT-forwarding
+   * path and avoids relying on a capacity-one flooding hash map. */
+  if (path->member_count == 1) {
+    for (uint16_t i = 0; i < member_count; i++) {
+      if (member_port_ids[i] == ingress_port_id)
+        continue;
+      selector_fwd.type = DOCA_FLOW_FWD_PORT;
+      selector_fwd.port_id = member_port_ids[i];
+      printf("FLOOD PATH: vs=%u ingress=%u -> port=%u (direct)\n",
+             vswitch_id, ingress_port_id, member_port_ids[i]);
+      break;
+    }
+  } else {
+    path->members = calloc(path->member_count, sizeof(*path->members));
+    if (path->members == NULL)
+      return DOCA_ERROR_NO_MEMORY;
+
+    snprintf(name, sizeof(name), "ESW_VS%u_FLOOD_FROM_%u", vswitch_id,
+             ingress_port_id);
+    result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+    if (result != DOCA_SUCCESS)
+      return result;
+    result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_HASH, false,
+                               next_power_of_two(path->member_count));
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_cfg_set_hash_map_algorithm(
+          cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING);
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_create(cfg, &pipe_fwd, NULL, &path->pipe);
+    doca_flow_pipe_cfg_destroy(cfg);
+    if (result != DOCA_SUCCESS)
+      return result;
+
+    for (uint16_t i = 0; i < member_count; i++) {
+      struct doca_flow_fwd fwd = {0};
+      struct eswitch_rule *rule;
+
+      if (member_port_ids[i] == ingress_port_id)
+        continue;
+      rule = &path->members[cursor];
+      fwd.type = DOCA_FLOW_FWD_PORT;
+      fwd.port_id = member_port_ids[i];
+      printf("FLOOD PATH: vs=%u ingress=%u -> port=%u (group)\n",
+             vswitch_id, ingress_port_id, member_port_ids[i]);
+      flow_entry_cookie_prepare(&rule->cookie, "flood member",
+                                DOCA_FLOW_ENTRY_OP_ADD);
+      result = doca_flow_pipe_hash_add_entry(
+          pipeline->runtime->queue_id, path->pipe, cursor, 0, NULL, NULL,
+          &fwd, batch_flags(cursor, path->member_count), &rule->cookie,
+          &rule->entry);
+      if (result != DOCA_SUCCESS)
+        return result;
+      cursor++;
+    }
+    result = process_rules(pipeline, path->members, path->member_count);
+    if (result != DOCA_SUCCESS)
+      return result;
+
+    selector_fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
+    selector_fwd.hash_pipe.pipe = path->pipe;
+    selector_fwd.hash_pipe.algorithm =
+        DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
+  }
+
   flow_entry_cookie_prepare(&path->selector.cookie, "flood selector",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
