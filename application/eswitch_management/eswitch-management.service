@@ -1,0 +1,19 @@
+[Unit]
+Description=eSwitch Management for NVIDIA BlueField
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/eswitch-management.conf
+RuntimeDirectory=eswitch-management
+RuntimeDirectoryMode=0755
+ExecStart=/usr/local/bin/eswitch-management $EAL_ARGS -- $DEVICE_PCI
+Restart=on-failure
+RestartSec=2
+LimitMEMLOCK=infinity
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

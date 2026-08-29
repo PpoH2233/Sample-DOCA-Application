@@ -1,0 +1,5 @@
+# DPDK EAL arguments. Reserve a dedicated Arm core for the manager loop.
+EAL_ARGS="-l 0"
+
+# BlueField Arm-side PCI address of the parent network device.
+DEVICE_PCI="03:00.0"
