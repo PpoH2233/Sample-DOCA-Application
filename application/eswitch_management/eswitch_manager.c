@@ -583,7 +583,6 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     snprintf(response, response_size, "OK\n");
     return DOCA_SUCCESS;
   }
-error:
   snprintf(response, response_size, "ERR code=%d message=%s\n", result,
            doca_error_get_descr(result));
   if (syntax_error) {
