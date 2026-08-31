@@ -1,0 +1,13 @@
+.git
+.gitignore
+.clangd
+.deps
+build
+builddir
+**/build
+**/builddir
+**/*.o
+**/*.a
+**/*.so
+**/output.txt
+**/.DS_Store

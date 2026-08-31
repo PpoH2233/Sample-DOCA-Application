@@ -39,6 +39,73 @@ After source-only changes, run only the `meson compile` command. Run
 `meson setup --reconfigure /tmp/eswitch-management-build` after changing
 `meson.build`.
 
+## Multi-stage production container
+
+The container build uses the DOCA 3.4 development image only for compiling.
+The final image is based on `full-rt-3.4.0` and contains the two installed
+binaries, without Meson, the compiler, headers, source tree or debugger.
+
+Build on the BlueField so Docker selects the Arm64 variants of both NGC base
+images. The build context must be the `Sample-DOCA-Application` root because
+the eSwitch Management Meson project reuses source modules from sibling
+directories:
+
+```bash
+cd /mnt/doca-dev/Sample-DOCA-Application
+sudo docker build \
+  -f application/eswitch_management/Dockerfile \
+  -t eswitch-management:3.4.0 .
+```
+
+The base images can be changed without editing the Dockerfile:
+
+```bash
+sudo docker build \
+  --build-arg DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0 \
+  --build-arg DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0 \
+  -f application/eswitch_management/Dockerfile \
+  -t eswitch-management:3.4.0 .
+```
+
+Create the host directories and start the production container without an
+interactive shell:
+
+```bash
+sudo install -d -m 0755 /run/eswitch-management
+
+sudo docker run -d \
+  --name eswitch-management \
+  --restart unless-stopped \
+  --privileged \
+  --network host \
+  --ulimit memlock=-1:-1 \
+  --mount type=bind,src=/dev/hugepages,dst=/dev/hugepages \
+  --mount type=bind,src=/run/eswitch-management,dst=/run/eswitch-management \
+  eswitch-management:3.4.0 \
+  -l 0 -- 03:00.0
+```
+
+The `/run/eswitch-management` bind mount publishes only the Unix control
+socket. It allows a host-side client or another local container to use the
+control plane without sharing ownership of the DPDK/DOCA devices.
+
+Run the CLI already included in the image:
+
+```bash
+sudo docker exec eswitch-management eswitchctl status
+sudo docker exec eswitch-management eswitchctl list-port-available
+```
+
+Inspect startup and health status with:
+
+```bash
+sudo docker logs -f eswitch-management
+sudo docker inspect --format '{{.State.Health.Status}}' eswitch-management
+```
+
+`SIGTERM` is forwarded to the application by Docker, so normal `docker stop`
+executes the existing DOCA Flow, DPDK port and device cleanup path.
+
 ## Run manually
 
 ```bash
