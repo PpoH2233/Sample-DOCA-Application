@@ -34,10 +34,11 @@ doca_error_t eswitch_fdb_init(struct eswitch_pipeline *pipeline,
 doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
                                uint16_t vswitch_id, uint16_t vlan_id,
                                const struct rte_ether_addr *source,
-                               uint16_t ingress_port_id,
-                               const uint16_t *member_port_ids,
-                               uint16_t member_count, uint64_t now_ns);
+                               uint16_t ingress_port_id, uint64_t now_ns);
 doca_error_t eswitch_fdb_age(struct eswitch_fdb *fdb, uint64_t now_ns);
+doca_error_t eswitch_fdb_flush_port(struct eswitch_fdb *fdb,
+                                    uint16_t vswitch_id, uint16_t port_id,
+                                    const char *reason);
 doca_error_t eswitch_fdb_flush_vswitch(struct eswitch_fdb *fdb,
                                        uint16_t vswitch_id,
                                        const char *reason);

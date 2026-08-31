@@ -23,6 +23,10 @@ static struct eswitch_fdb_entry *find_entry(
   return NULL;
 }
 
+static doca_error_t remove_at(struct eswitch_fdb *fdb,
+                              struct eswitch_fdb_entry **cursor,
+                              const char *reason);
+
 static void log_entry(const char *operation,
                       const struct eswitch_fdb_entry *entry,
                       uint16_t old_port) {
@@ -51,14 +55,12 @@ doca_error_t eswitch_fdb_init(struct eswitch_pipeline *pipeline,
 doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
                                uint16_t vswitch_id, uint16_t vlan_id,
                                const struct rte_ether_addr *source,
-                               uint16_t ingress_port_id,
-                               const uint16_t *member_port_ids,
-                               uint16_t member_count, uint64_t now_ns) {
+                               uint16_t ingress_port_id, uint64_t now_ns) {
   struct eswitch_fdb_entry *entry;
   doca_error_t result;
 
   if (fdb == NULL || fdb->pipeline == NULL || vswitch_id == 0 ||
-      source == NULL || member_port_ids == NULL || member_count == 0)
+      source == NULL)
     return DOCA_ERROR_INVALID_VALUE;
   if (!rte_is_valid_assigned_ether_addr(source))
     return DOCA_SUCCESS;
@@ -74,11 +76,12 @@ doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
     rte_ether_addr_copy(source, &entry->mac);
     entry->learned_port_id = ingress_port_id;
     entry->last_seen_ns = now_ns;
-    result = eswitch_pipeline_fdb_add(
-        fdb->pipeline, vswitch_id, source, ingress_port_id, member_port_ids,
-        member_count, &entry->hardware);
+    result = eswitch_pipeline_fdb_add(fdb->pipeline, vswitch_id, source,
+                                      ingress_port_id, &entry->hardware);
     if (result != DOCA_SUCCESS) {
-      if (entry->hardware.destinations == NULL) {
+      if (entry->hardware.destination.entry == NULL &&
+          entry->hardware.sources[0].entry == NULL &&
+          entry->hardware.sources[1].entry == NULL) {
         free(entry);
       } else {
         /* Keep callback cookies alive if rollback itself failed. The daemon
@@ -102,9 +105,9 @@ doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
   }
   {
     uint16_t old_port = entry->learned_port_id;
-    result = eswitch_pipeline_fdb_move(
-        fdb->pipeline, vswitch_id, source, old_port, ingress_port_id,
-        member_port_ids, member_count, &entry->hardware);
+    result = eswitch_pipeline_fdb_move(fdb->pipeline, vswitch_id, source,
+                                       old_port, ingress_port_id,
+                                       &entry->hardware);
     if (result != DOCA_SUCCESS)
       return result;
     entry->learned_port_id = ingress_port_id;
@@ -113,6 +116,34 @@ doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
     log_entry("MOVE", entry, old_port);
   }
   return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_fdb_flush_port(struct eswitch_fdb *fdb,
+                                    uint16_t vswitch_id, uint16_t port_id,
+                                    const char *reason) {
+  struct eswitch_fdb_entry **cursor;
+  doca_error_t first_error = DOCA_SUCCESS;
+
+  if (fdb == NULL || fdb->pipeline == NULL || vswitch_id == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  cursor = &fdb->head;
+  while (*cursor != NULL) {
+    struct eswitch_fdb_entry *entry = *cursor;
+    doca_error_t result;
+
+    if (entry->vswitch_id != vswitch_id ||
+        entry->learned_port_id != port_id) {
+      cursor = &entry->next;
+      continue;
+    }
+    result = remove_at(fdb, cursor, reason == NULL ? "port-flush" : reason);
+    if (result != DOCA_SUCCESS) {
+      if (first_error == DOCA_SUCCESS)
+        first_error = result;
+      cursor = &entry->next;
+    }
+  }
+  return first_error;
 }
 
 static doca_error_t remove_at(struct eswitch_fdb *fdb,

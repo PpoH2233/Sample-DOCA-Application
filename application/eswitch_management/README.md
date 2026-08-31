@@ -18,14 +18,83 @@ endpoint
       -> source guard
          hit  -> destination FDB -> known-unicast egress
          miss -> clone one copy to Arm RSS and continue to destination FDB
-      -> destination miss -> per-vSwitch/per-ingress hardware flood group
+      -> destination miss -> per-vSwitch flood selector
+         -> one flooding HASH pipe containing the vSwitch member ports
+      -> each selected egress gate
+         -> ingress == egress -> DROP
+         -> otherwise         -> physical DPDK port
 root miss -> DROP
 ```
 
 The Arm copy learns `(vswitch_id, untagged VLAN 0, source MAC)`. Membership
-changes flush that vSwitch's FDB and rebuild its flood paths before opening a
-new ingress classifier entry. This deliberately favors safe isolation over a
-hitless topology update in version 1.
+changes update only one HASH member entry and one root classifier entry. A
+learned destination uses one hardware rule keyed by `(vswitch_id, dst_mac)`;
+it is not expanded per ingress port. Detaching a port removes only MACs learned
+on that port, so unrelated FDB entries remain installed.
+
+An egress gate is created lazily once per physical DPDK port and shared by all
+vSwitches. It implements split horizon from the low 16 bits of `pkt_meta`, so
+both known-unicast and flooded traffic can never return to their ingress port.
+The current implementation supports at most 254 members in one vSwitch; this
+limit keeps each flooding HASH pipe within the DOCA Flow flooding fan-out
+range.
+
+## Hardware resource model
+
+For `P` probed ports, `M` attached memberships, `V` non-empty vSwitches and
+`F` learned MAC addresses, the dynamic steering state is approximately:
+
+```text
+root classifier entries       M
+shared egress-gate pipes       <= P       (2 control entries per used port)
+vSwitch flooding HASH pipes   V
+flood member entries          M
+destination FDB entries       F
+source-guard entries/counters F
+```
+
+The important change from the original implementation is that destination FDB
+state is `O(F)`, not `O(F * M)`, and attach/detach changes `O(1)` membership
+rules rather than rebuilding every ingress-specific flood path. Operations are
+serialized in the manager loop. When a multi-step mutation fails, the manager
+attempts to restore the previous classifier, flood membership, and MAC-move
+forwarding state before returning `ERR`.
+
+## Persistent configuration
+
+The desired topology is stored in
+`/var/lib/eswitch-management/eswitch.conf` by default. Override it with
+`ESWITCH_STATE_FILE=/path/to/eswitch.conf`. On the first successful startup,
+the daemon creates an empty versioned file. Every successful `vs-create`,
+`vs-delete`, `vs-port-attach`, and `vs-port-detach` rewrites it atomically:
+
+```text
+write eswitch.conf.tmp.<pid>
+  -> fflush + fsync
+  -> rename over eswitch.conf
+  -> fsync containing directory
+```
+
+The file stores stable port identities rather than transient DPDK port IDs:
+
+```text
+# eSwitch Management persistent state
+version 1
+vswitch 100
+member 100 parent
+member 100 representor 1 0 0
+member 100 representor 1 0 1
+```
+
+At startup the daemon probes current ports first, loads this file, maps
+`parent` or `(host,pf,vf)` to the current DPDK port ID, then recreates the
+vSwitches and attachments. Startup fails instead of silently omitting a
+configured port when an identity cannot be resolved or the file is invalid.
+Learned dynamic FDB entries are not persisted and are relearned from traffic.
+See [eswitch.conf.example](eswitch.conf.example) for a complete example.
+Manual edits are read only during startup; stop the daemon before editing the
+file, then start it again. While the daemon is running, use `eswitchctl` so
+hardware state and the file are committed together.
 
 ## Build on the BlueField DOCA development container
 
@@ -33,6 +102,7 @@ hitless topology update in version 1.
 cd /mnt/doca-dev/Sample-DOCA-Application/application/eswitch_management
 meson setup /tmp/eswitch-management-build
 meson compile -C /tmp/eswitch-management-build
+meson test -C /tmp/eswitch-management-build eswitch-state
 ```
 
 After source-only changes, run only the `meson compile` command. Run
@@ -72,6 +142,7 @@ interactive shell:
 
 ```bash
 sudo install -d -m 0755 /run/eswitch-management
+sudo install -d -m 0750 /var/lib/eswitch-management
 
 sudo docker run -d \
   --name eswitch-management \
@@ -81,13 +152,15 @@ sudo docker run -d \
   --ulimit memlock=-1:-1 \
   --mount type=bind,src=/dev/hugepages,dst=/dev/hugepages \
   --mount type=bind,src=/run/eswitch-management,dst=/run/eswitch-management \
+  --mount type=bind,src=/var/lib/eswitch-management,dst=/var/lib/eswitch-management \
   eswitch-management:3.4.0 \
   -l 0 -- 03:00.0
 ```
 
 The `/run/eswitch-management` bind mount publishes only the Unix control
-socket. It allows a host-side client or another local container to use the
-control plane without sharing ownership of the DPDK/DOCA devices.
+socket. The `/var/lib/eswitch-management` bind mount preserves `eswitch.conf`
+when the container is removed and recreated. It must not be shared with a
+second running eSwitch manager.
 
 Run the CLI already included in the image:
 
@@ -109,6 +182,7 @@ executes the existing DOCA Flow, DPDK port and device cleanup path.
 ## Run manually
 
 ```bash
+sudo install -d -m 0750 /var/lib/eswitch-management
 sudo /tmp/eswitch-management-build/eswitch-management -l 0 -- 03:00.0
 ```
 
@@ -150,5 +224,5 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now eswitch-management
 ```
 
-Runtime vSwitch membership and learned FDB state are intentionally not
-persistent in this first version. A daemon restart returns all ports to DROP.
+vSwitch topology and membership survive daemon/container/BlueField restart.
+Dynamic FDB state remains runtime-only and is learned again after startup.

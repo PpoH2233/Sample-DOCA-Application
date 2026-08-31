@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
   struct eswitch_manager manager = {0};
   struct control_server control = {.listen_fd = -1, .client_fd = -1};
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
+  const char *state_path = getenv("ESWITCH_STATE_FILE");
   doca_error_t result;
   int separator;
   int exit_status = EXIT_FAILURE;
@@ -73,6 +74,8 @@ int main(int argc, char **argv) {
   }
   if (socket_path == NULL || *socket_path == '\0')
     socket_path = ESWITCH_SOCKET_PATH;
+  if (state_path == NULL || *state_path == '\0')
+    state_path = ESWITCH_STATE_PATH;
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -115,7 +118,8 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_flow_ports;
   }
-  result = eswitch_manager_init(&io, &flow_ports, &pipeline, &manager);
+  result = eswitch_manager_init(&io, &flow_ports, &pipeline, state_path,
+                                &manager);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize eSwitch manager: %s\n",
             doca_error_get_descr(result));
@@ -162,8 +166,10 @@ cleanup_manager:
   cleanup_error("Failed to remove managed vSwitch state",
                 eswitch_manager_destroy(&manager), &exit_status);
 cleanup_pipeline:
-  eswitch_pipeline_destroy(&pipeline);
+  /* If graceful manager cleanup failed, destroy its per-vSwitch HASH pipes
+   * before destroying the shared pipes/gates they reference. */
   eswitch_manager_release(&manager);
+  eswitch_pipeline_destroy(&pipeline);
 cleanup_flow_ports:
   cleanup_error("Failed to stop DOCA Flow ports",
                 switch_flow_ports_stop(&flow_ports), &exit_status);

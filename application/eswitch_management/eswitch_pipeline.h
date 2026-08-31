@@ -17,18 +17,25 @@ struct eswitch_rule {
   struct flow_entry_cookie cookie;
 };
 
-struct eswitch_flood_path {
-  uint16_t ingress_port_id;
+struct eswitch_egress_gate {
   struct doca_flow_pipe *pipe;
-  struct eswitch_rule *members;
-  uint16_t member_count;
-  struct eswitch_rule selector;
+  struct eswitch_rule drop_self;
+  struct eswitch_rule forward;
+};
+
+struct eswitch_flood_member {
+  uint16_t port_id;
+  bool active;
+  struct eswitch_rule rule;
 };
 
 struct eswitch_flood_group {
   uint16_t vswitch_id;
-  struct eswitch_flood_path *paths;
-  uint16_t path_count;
+  struct doca_flow_pipe *pipe;
+  struct eswitch_rule selector;
+  struct eswitch_flood_member *members;
+  uint16_t member_count;
+  uint16_t member_capacity;
 };
 
 struct eswitch_pipeline {
@@ -48,13 +55,17 @@ struct eswitch_pipeline {
   struct eswitch_rule learning_clone_rules[2];
   struct eswitch_rule learning_dispatch_rule;
   struct eswitch_rule *classifier_rules; /* indexed like ports->items */
+  struct eswitch_egress_gate *egress_gates; /* indexed like ports->items */
   bool created;
 };
 
 struct eswitch_hw_fdb_entry {
-  struct eswitch_rule source;
-  struct eswitch_rule *destinations;
-  uint16_t destination_count;
+  /* Two stable cookie addresses let MAC move install the new source guard
+   * before removing the old one. DOCA retains usr_ctx for the entry lifetime. */
+  struct eswitch_rule sources[2];
+  uint8_t active_source;
+  struct eswitch_rule destination;
+  uint16_t learned_port_id;
 };
 
 uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
@@ -72,10 +83,12 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index);
 
-/* Replaces all unknown/broadcast flooding paths for one virtual switch. */
-doca_error_t eswitch_pipeline_build_flood_group(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint16_t *member_port_ids, uint16_t member_count,
+/* One flooding hash pipe per vSwitch; membership changes are incremental. */
+doca_error_t eswitch_pipeline_flood_add_port(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id, uint16_t port_id,
+    struct eswitch_flood_group *group);
+doca_error_t eswitch_pipeline_flood_remove_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_id,
     struct eswitch_flood_group *group);
 doca_error_t eswitch_pipeline_destroy_flood_group(
     struct eswitch_pipeline *pipeline, struct eswitch_flood_group *group);
@@ -83,13 +96,11 @@ doca_error_t eswitch_pipeline_destroy_flood_group(
 doca_error_t eswitch_pipeline_fdb_add(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const struct rte_ether_addr *mac, uint16_t learned_port_id,
-    const uint16_t *member_port_ids, uint16_t member_count,
     struct eswitch_hw_fdb_entry *hardware);
 doca_error_t eswitch_pipeline_fdb_move(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const struct rte_ether_addr *mac, uint16_t old_port_id,
-    uint16_t new_port_id, const uint16_t *member_port_ids,
-    uint16_t member_count, struct eswitch_hw_fdb_entry *hardware);
+    uint16_t new_port_id, struct eswitch_hw_fdb_entry *hardware);
 doca_error_t eswitch_pipeline_fdb_remove(
     struct eswitch_pipeline *pipeline,
     struct eswitch_hw_fdb_entry *hardware);

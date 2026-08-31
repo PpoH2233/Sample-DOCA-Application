@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #define ESWITCH_SOCKET_PATH "/run/eswitch-management/control.sock"
+#define ESWITCH_STATE_PATH "/var/lib/eswitch-management/eswitch.conf"
 #define ESWITCH_MAX_VSWITCHES 64U
+#define ESWITCH_MAX_PERSISTED_MEMBERS 4096U
 #define ESWITCH_RESPONSE_SIZE (128U * 1024U)
 
 /* 0 means "not assigned" and is never a valid virtual-switch ID. */

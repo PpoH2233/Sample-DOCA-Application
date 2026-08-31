@@ -14,6 +14,7 @@
 #include <rte_mbuf.h>
 
 #include "../ethernet_switch/switch_config.h"
+#include "eswitch_state.h"
 
 static uint64_t monotonic_ns(void) {
   struct timespec value;
@@ -57,19 +58,6 @@ static int find_port_index(const struct eswitch_manager *manager,
   return -1;
 }
 
-static uint16_t collect_members(const struct eswitch_manager *manager,
-                                uint16_t vswitch_id,
-                                uint16_t extra_port_index,
-                                uint16_t *port_ids) {
-  uint16_t count = 0;
-
-  for (uint16_t i = 0; i < manager->ports->count; i++) {
-    if (manager->port_owner[i] == vswitch_id || i == extra_port_index)
-      port_ids[count++] = manager->ports->items[i].ethernet->port_id;
-  }
-  return count;
-}
-
 static doca_error_t create_vswitch(struct eswitch_manager *manager,
                                    uint16_t id) {
   if (id == 0)
@@ -90,9 +78,6 @@ static doca_error_t create_vswitch(struct eswitch_manager *manager,
 static doca_error_t attach_port(struct eswitch_manager *manager,
                                 uint16_t vswitch_id, uint16_t port_id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
-  struct eswitch_flood_group replacement = {0};
-  uint16_t *members;
-  uint16_t member_count;
   int port_index;
   doca_error_t result;
 
@@ -103,65 +88,31 @@ static doca_error_t attach_port(struct eswitch_manager *manager,
     return DOCA_ERROR_NOT_FOUND;
   if (manager->port_owner[port_index] != 0)
     return DOCA_ERROR_IN_USE;
-  members = calloc(manager->ports->count, sizeof(*members));
-  if (members == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-  member_count = collect_members(manager, vswitch_id, (uint16_t)port_index,
-                                 members);
 
-  /* Membership changes invalidate destination rules expanded per ingress. */
-  result = eswitch_fdb_flush_vswitch(&manager->fdb, vswitch_id,
-                                     "membership-change");
+  /* Prepare the egress membership before opening ingress.  Until the
+   * classifier is committed, packets cannot enter this vSwitch from port_id. */
+  result = eswitch_pipeline_flood_add_port(manager->pipeline, vswitch_id,
+                                           port_id, &vswitch->flood);
   if (result != DOCA_SUCCESS)
-    goto out;
-  result = eswitch_pipeline_destroy_flood_group(manager->pipeline,
-                                                &vswitch->flood);
-  if (result != DOCA_SUCCESS)
-    goto out;
-  result = eswitch_pipeline_build_flood_group(
-      manager->pipeline, vswitch_id, members, member_count, &replacement);
-  if (result != DOCA_SUCCESS) {
-    if (replacement.paths != NULL) {
-      vswitch->flood = replacement;
-      manager->port_owner[port_index] = vswitch_id;
-      goto out;
-    }
-    goto restore_old_flood;
-  }
+    return result;
   result = eswitch_pipeline_attach_port(manager->pipeline,
                                         (uint16_t)port_index, vswitch_id);
   if (result != DOCA_SUCCESS) {
-    doca_error_t cleanup = eswitch_pipeline_destroy_flood_group(
-        manager->pipeline, &replacement);
-    if (cleanup != DOCA_SUCCESS) {
-      vswitch->flood = replacement;
-      manager->port_owner[port_index] = vswitch_id;
-      result = cleanup;
-      goto out;
-    }
-    goto restore_old_flood;
+    doca_error_t cleanup = eswitch_pipeline_flood_remove_port(
+        manager->pipeline, port_id, &vswitch->flood);
+    if (cleanup == DOCA_SUCCESS && vswitch->flood.member_count == 0)
+      cleanup = eswitch_pipeline_destroy_flood_group(manager->pipeline,
+                                                      &vswitch->flood);
+    return cleanup == DOCA_SUCCESS ? result : cleanup;
   }
-  vswitch->flood = replacement;
   manager->port_owner[port_index] = vswitch_id;
   printf("VSWITCH ATTACH: vs=%u dpdk-port=%u\n", vswitch_id, port_id);
-  free(members);
   return DOCA_SUCCESS;
-
-restore_old_flood:
-  member_count = collect_members(manager, vswitch_id, UINT16_MAX, members);
-  (void)eswitch_pipeline_build_flood_group(
-      manager->pipeline, vswitch_id, members, member_count, &vswitch->flood);
-out:
-  free(members);
-  return result;
 }
 
 static doca_error_t detach_port(struct eswitch_manager *manager,
                                 uint16_t vswitch_id, uint16_t port_id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
-  struct eswitch_flood_group replacement = {0};
-  uint16_t *members;
-  uint16_t member_count = 0;
   int port_index;
   doca_error_t result;
 
@@ -172,67 +123,33 @@ static doca_error_t detach_port(struct eswitch_manager *manager,
     return DOCA_ERROR_NOT_FOUND;
   if (manager->port_owner[port_index] != vswitch_id)
     return DOCA_ERROR_INVALID_VALUE;
-  members = calloc(manager->ports->count, sizeof(*members));
-  if (members == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-  for (uint16_t i = 0; i < manager->ports->count; i++) {
-    if (i != (uint16_t)port_index &&
-        manager->port_owner[i] == vswitch_id)
-      members[member_count++] = manager->ports->items[i].ethernet->port_id;
-  }
 
-  result = eswitch_fdb_flush_vswitch(&manager->fdb, vswitch_id,
-                                     "port-detach");
-  if (result != DOCA_SUCCESS)
-    goto out;
+  /* Close ingress first. If a later hardware mutation fails, restore the
+   * classifier and flood member while ownership is still unchanged. */
   result = eswitch_pipeline_detach_port(manager->pipeline,
                                         (uint16_t)port_index);
   if (result != DOCA_SUCCESS)
-    goto out;
-  result = eswitch_pipeline_destroy_flood_group(manager->pipeline,
-                                                &vswitch->flood);
+    return result;
+  result = eswitch_pipeline_flood_remove_port(manager->pipeline, port_id,
+                                              &vswitch->flood);
   if (result != DOCA_SUCCESS) {
     doca_error_t rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id);
-    if (rollback != DOCA_SUCCESS)
-      fprintf(stderr,
-              "Failed to restore classifier for DPDK port %u: %s\n",
-              port_id, doca_error_get_descr(rollback));
-    goto out;
+    return rollback == DOCA_SUCCESS ? result : rollback;
   }
-
-  /* No remaining hardware path references this port after the old flood
-   * group is gone, so it is now safe to advertise the port as available. */
-  manager->port_owner[port_index] = 0;
-  result = eswitch_pipeline_build_flood_group(
-      manager->pipeline, vswitch_id, members, member_count, &replacement);
+  result = eswitch_fdb_flush_port(&manager->fdb, vswitch_id, port_id,
+                                  "port-detach");
   if (result != DOCA_SUCCESS) {
-    if (replacement.paths != NULL) {
-      vswitch->flood = replacement;
-    } else {
-      doca_error_t original_error = result;
-      doca_error_t rollback;
-
-      /* Reconstruct the old membership when the new flood group failed
-       * cleanly. This keeps an ERR response from silently changing state. */
-      manager->port_owner[port_index] = vswitch_id;
-      members[member_count++] = port_id;
-      rollback = eswitch_pipeline_build_flood_group(
-          manager->pipeline, vswitch_id, members, member_count,
-          &vswitch->flood);
-      if (rollback == DOCA_SUCCESS)
-        rollback = eswitch_pipeline_attach_port(
-            manager->pipeline, (uint16_t)port_index, vswitch_id);
-      result = rollback == DOCA_SUCCESS ? original_error : rollback;
-    }
-    goto out;
+    doca_error_t rollback = eswitch_pipeline_flood_add_port(
+        manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    if (rollback == DOCA_SUCCESS)
+      rollback = eswitch_pipeline_attach_port(
+          manager->pipeline, (uint16_t)port_index, vswitch_id);
+    return rollback == DOCA_SUCCESS ? result : rollback;
   }
-  vswitch->flood = replacement;
+  manager->port_owner[port_index] = 0;
   printf("VSWITCH DETACH: vs=%u dpdk-port=%u\n", vswitch_id, port_id);
-
-out:
-  free(members);
-  return result;
+  return DOCA_SUCCESS;
 }
 
 static doca_error_t delete_vswitch(struct eswitch_manager *manager,
@@ -262,13 +179,207 @@ static doca_error_t delete_vswitch(struct eswitch_manager *manager,
   return DOCA_SUCCESS;
 }
 
+static doca_error_t manager_to_state(const struct eswitch_manager *manager,
+                                     struct eswitch_state *state) {
+  doca_error_t result;
+
+  result = eswitch_state_init(manager->ports->count, state);
+  if (result != DOCA_SUCCESS)
+    return result;
+  for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
+    if (!manager->switches[i].exists)
+      continue;
+    result = eswitch_state_add_switch(state, manager->switches[i].id);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    const struct ethernet_port *port = manager->ports->items[i].ethernet;
+    struct eswitch_state_member member = {0};
+
+    if (manager->port_owner[i] == 0)
+      continue;
+    member.vswitch_id = manager->port_owner[i];
+    if (port->role == ETHERNET_PORT_ROLE_PARENT) {
+      member.kind = ESWITCH_STATE_PORT_PARENT;
+    } else {
+      member.kind = ESWITCH_STATE_PORT_REPRESENTOR;
+      member.host_index = port->host_index;
+      member.pf_index = port->pf_index;
+      member.vf_index = port->vf_index;
+    }
+    result = eswitch_state_add_member(state, &member);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  return DOCA_SUCCESS;
+}
+
+static doca_error_t persist_manager(const struct eswitch_manager *manager) {
+  struct eswitch_state state = {0};
+  doca_error_t result;
+
+  result = manager_to_state(manager, &state);
+  if (result == DOCA_SUCCESS)
+    result = eswitch_state_save(manager->state_path, &state);
+  eswitch_state_destroy(&state);
+  if (result == DOCA_SUCCESS)
+    printf("CONFIG SAVE: path=%s\n", manager->state_path);
+  return result;
+}
+
+static int find_state_member_port(const struct eswitch_manager *manager,
+                                  const struct eswitch_state_member *member) {
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    const struct ethernet_port *port = manager->ports->items[i].ethernet;
+
+    if (member->kind == ESWITCH_STATE_PORT_PARENT &&
+        port->role == ETHERNET_PORT_ROLE_PARENT)
+      return i;
+    if (member->kind == ESWITCH_STATE_PORT_REPRESENTOR &&
+        port->role == ETHERNET_PORT_ROLE_REPRESENTOR &&
+        port->host_index == member->host_index &&
+        port->pf_index == member->pf_index &&
+        port->vf_index == member->vf_index)
+      return i;
+  }
+  return -1;
+}
+
+static doca_error_t restore_manager(struct eswitch_manager *manager) {
+  struct eswitch_state state = {0};
+  bool exists = false;
+  doca_error_t result;
+
+  result = eswitch_state_init(ESWITCH_MAX_PERSISTED_MEMBERS, &state);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = eswitch_state_load(manager->state_path, &state, &exists);
+  if (result != DOCA_SUCCESS)
+    goto out;
+  if (!exists) {
+    result = persist_manager(manager);
+    goto out;
+  }
+  for (size_t i = 0; i < state.switch_count; i++) {
+    result = create_vswitch(manager, state.switch_ids[i]);
+    if (result != DOCA_SUCCESS)
+      goto out;
+  }
+  for (size_t i = 0; i < state.member_count; i++) {
+    int port_index = find_state_member_port(manager, &state.members[i]);
+
+    if (port_index < 0) {
+      const struct eswitch_state_member *member = &state.members[i];
+      if (member->kind == ESWITCH_STATE_PORT_PARENT) {
+        fprintf(stderr, "Configured parent port is not available\n");
+      } else {
+        fprintf(stderr,
+                "Configured representor is not available: "
+                "host=%u pf=%u vf=%u\n",
+                member->host_index, member->pf_index, member->vf_index);
+      }
+      result = DOCA_ERROR_NOT_FOUND;
+      goto out;
+    }
+    result = attach_port(
+        manager, state.members[i].vswitch_id,
+        manager->ports->items[port_index].ethernet->port_id);
+    if (result != DOCA_SUCCESS)
+      goto out;
+  }
+  printf("CONFIG RESTORE: path=%s vswitches=%zu members=%zu\n",
+         manager->state_path, state.switch_count, state.member_count);
+
+out:
+  eswitch_state_destroy(&state);
+  return result;
+}
+
+static doca_error_t create_vswitch_persisted(struct eswitch_manager *manager,
+                                             uint16_t id) {
+  doca_error_t result = create_vswitch(manager, id);
+
+  if (result == DOCA_SUCCESS) {
+    doca_error_t save_result = persist_manager(manager);
+    if (save_result != DOCA_SUCCESS) {
+      doca_error_t rollback = delete_vswitch(manager, id);
+      return rollback == DOCA_SUCCESS ? save_result : rollback;
+    }
+  }
+  return result;
+}
+
+static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
+                                          uint16_t vswitch_id,
+                                          uint16_t port_id) {
+  doca_error_t result = attach_port(manager, vswitch_id, port_id);
+
+  if (result == DOCA_SUCCESS) {
+    doca_error_t save_result = persist_manager(manager);
+    if (save_result != DOCA_SUCCESS) {
+      doca_error_t rollback = detach_port(manager, vswitch_id, port_id);
+      return rollback == DOCA_SUCCESS ? save_result : rollback;
+    }
+  }
+  return result;
+}
+
+static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
+                                          uint16_t vswitch_id,
+                                          uint16_t port_id) {
+  doca_error_t result = detach_port(manager, vswitch_id, port_id);
+
+  if (result == DOCA_SUCCESS) {
+    doca_error_t save_result = persist_manager(manager);
+    if (save_result != DOCA_SUCCESS) {
+      doca_error_t rollback = attach_port(manager, vswitch_id, port_id);
+      return rollback == DOCA_SUCCESS ? save_result : rollback;
+    }
+  }
+  return result;
+}
+
+static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
+                                             uint16_t id) {
+  uint16_t *member_ports;
+  uint16_t member_count = 0;
+  doca_error_t result;
+
+  if (find_vswitch(manager, id) == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+  member_ports = calloc(manager->ports->count, sizeof(*member_ports));
+  if (member_ports == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    if (manager->port_owner[i] == id)
+      member_ports[member_count++] =
+          manager->ports->items[i].ethernet->port_id;
+  }
+
+  result = delete_vswitch(manager, id);
+  if (result == DOCA_SUCCESS) {
+    doca_error_t save_result = persist_manager(manager);
+    if (save_result != DOCA_SUCCESS) {
+      doca_error_t rollback = create_vswitch(manager, id);
+      for (uint16_t i = 0; rollback == DOCA_SUCCESS && i < member_count; i++)
+        rollback = attach_port(manager, id, member_ports[i]);
+      result = rollback == DOCA_SUCCESS ? save_result : rollback;
+    }
+  }
+  free(member_ports);
+  return result;
+}
+
 doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct switch_flow_ports *ports,
                                   struct eswitch_pipeline *pipeline,
+                                  const char *state_path,
                                   struct eswitch_manager *manager) {
   doca_error_t result;
 
-  if (io == NULL || ports == NULL || pipeline == NULL || manager == NULL ||
+  if (io == NULL || ports == NULL || pipeline == NULL || state_path == NULL ||
+      *state_path == '\0' || manager == NULL ||
       !io->port_started || !ports->started || !pipeline->created)
     return DOCA_ERROR_INVALID_VALUE;
   if (!rte_flow_dynf_metadata_avail())
@@ -279,6 +390,12 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   manager->io = io;
   manager->ports = ports;
   manager->pipeline = pipeline;
+  if (snprintf(manager->state_path, sizeof(manager->state_path), "%s",
+               state_path) >= (int)sizeof(manager->state_path)) {
+    free(manager->port_owner);
+    manager->port_owner = NULL;
+    return DOCA_ERROR_TOO_BIG;
+  }
   result = eswitch_fdb_init(pipeline, SWITCH_MAX_FDB_ENTRIES,
                             SWITCH_FDB_AGING_SECONDS, &manager->fdb);
   if (result != DOCA_SUCCESS) {
@@ -290,7 +407,11 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   manager->next_aging_ns = manager->started_ns +
       (uint64_t)SWITCH_AGING_SCAN_SECONDS * 1000000000ULL;
   manager->initialized = true;
-  return DOCA_SUCCESS;
+  result = restore_manager(manager);
+  if (result != DOCA_SUCCESS)
+    fprintf(stderr, "Failed to restore eSwitch configuration %s: %s\n",
+            manager->state_path, doca_error_get_descr(result));
+  return result;
 }
 
 static doca_error_t process_packet(struct eswitch_manager *manager,
@@ -300,8 +421,6 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
   const struct rte_ether_hdr *header;
   uint16_t vswitch_id;
   uint16_t port_id;
-  uint16_t *members;
-  uint16_t member_count;
   uint32_t metadata = *RTE_FLOW_DYNF_METADATA(packet);
   int port_index;
   doca_error_t result;
@@ -333,14 +452,8 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
          header->dst_addr.addr_bytes[2], header->dst_addr.addr_bytes[3],
          header->dst_addr.addr_bytes[4], header->dst_addr.addr_bytes[5]);
 
-  members = calloc(manager->ports->count, sizeof(*members));
-  if (members == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-  member_count = collect_members(manager, vswitch_id, UINT16_MAX, members);
   result = eswitch_fdb_learn(&manager->fdb, vswitch_id, 0,
-                             &header->src_addr, port_id, members,
-                             member_count, now_ns);
-  free(members);
+                             &header->src_addr, port_id, now_ns);
   return result;
 }
 
@@ -449,6 +562,8 @@ static size_t format_status(const struct eswitch_manager *manager,
                      "service=eSwitch Management state=running uptime=%" PRIu64
                      "s\n",
                      uptime);
+  used = append_text(response, size, used, "config=%s\n",
+                     manager->state_path);
   used = append_text(response, size, used,
                      "ports=%u assigned=%zu available=%zu vswitches=%zu "
                      "fdb=%zu\n",
@@ -559,18 +674,18 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "vs-create") == 0 &&
              parse_id_arguments(arguments, argument_count, true, &first)) {
-    result = create_vswitch(manager, first);
+    result = create_vswitch_persisted(manager, first);
   } else if (strcmp(verb, "vs-delete") == 0 &&
              parse_id_arguments(arguments, argument_count, true, &first)) {
-    result = delete_vswitch(manager, first);
+    result = delete_vswitch_persisted(manager, first);
   } else if (strcmp(verb, "vs-port-attach") == 0 &&
              parse_port_arguments(arguments, argument_count, &first,
                                   &second)) {
-    result = attach_port(manager, first, second);
+    result = attach_port_persisted(manager, first, second);
   } else if (strcmp(verb, "vs-port-detach") == 0 &&
              parse_port_arguments(arguments, argument_count, &first,
                                   &second)) {
-    result = detach_port(manager, first, second);
+    result = detach_port_persisted(manager, first, second);
   } else {
     result = DOCA_ERROR_INVALID_VALUE;
     syntax_error = true;
@@ -642,17 +757,13 @@ void eswitch_manager_release(struct eswitch_manager *manager) {
     return;
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
     struct eswitch_flood_group *group = &manager->switches[i].flood;
-    for (uint16_t p = 0; p < group->path_count; p++) {
-      if (group->paths[p].pipe != NULL)
-        doca_flow_pipe_destroy(group->paths[p].pipe);
-      free(group->paths[p].members);
-    }
-    free(group->paths);
+    if (group->pipe != NULL)
+      doca_flow_pipe_destroy(group->pipe);
+    free(group->members);
   }
   while (manager->fdb.head != NULL) {
     struct eswitch_fdb_entry *entry = manager->fdb.head;
     manager->fdb.head = entry->next;
-    free(entry->hardware.destinations);
     free(entry);
   }
   free(manager->port_owner);

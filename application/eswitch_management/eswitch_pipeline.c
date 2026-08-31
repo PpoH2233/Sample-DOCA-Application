@@ -7,6 +7,11 @@
 #include <doca_bitfield.h>
 
 #include "../ethernet_switch/switch_config.h"
+#include "eswitch_config.h"
+
+#define ESWITCH_MAX_FLOOD_MEMBERS 254U
+#define ESWITCH_METADATA_VSWITCH_MASK UINT32_C(0xffff0000)
+#define ESWITCH_METADATA_PORT_MASK UINT32_C(0x0000ffff)
 
 static doca_error_t set_pipe_identity(struct doca_flow_pipe_cfg *cfg,
                                       const char *name,
@@ -32,6 +37,21 @@ static uint32_t next_power_of_two(uint32_t value) {
   while (capacity < value)
     capacity <<= 1;
   return capacity;
+}
+
+static uint16_t max_flood_members(const struct eswitch_pipeline *pipeline) {
+  return pipeline->ports->count < ESWITCH_MAX_FLOOD_MEMBERS
+             ? pipeline->ports->count
+             : ESWITCH_MAX_FLOOD_MEMBERS;
+}
+
+static int find_port_index(const struct eswitch_pipeline *pipeline,
+                           uint16_t port_id) {
+  for (uint16_t i = 0; i < pipeline->ports->count; i++) {
+    if (pipeline->ports->items[i].ethernet->port_id == port_id)
+      return i;
+  }
+  return -1;
 }
 
 static uint32_t batch_flags(uint32_t index, uint32_t count) {
@@ -138,12 +158,12 @@ static doca_error_t create_flood_selector(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
-  mask.meta.pkt_meta = UINT32_MAX;
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_FLOOD_SELECTOR", DOCA_FLOW_PIPE_BASIC,
-                             false, pipeline->ports->count);
+                             false, ESWITCH_MAX_VSWITCHES);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
   if (result == DOCA_SUCCESS)
@@ -159,10 +179,9 @@ static doca_error_t create_destination_pipe(struct eswitch_pipeline *pipeline) {
   struct doca_flow_match mask = {0};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
-  uint32_t capacity = SWITCH_MAX_FDB_ENTRIES * pipeline->ports->count;
   doca_error_t result;
 
-  mask.meta.pkt_meta = UINT32_MAX;
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   miss.type = DOCA_FLOW_FWD_PIPE;
   miss.next_pipe = pipeline->flood_selector_pipe;
@@ -170,7 +189,7 @@ static doca_error_t create_destination_pipe(struct eswitch_pipeline *pipeline) {
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_DEST_FDB", DOCA_FLOW_PIPE_BASIC,
-                             false, capacity);
+                             false, SWITCH_MAX_FDB_ENTRIES);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
   if (result == DOCA_SUCCESS)
@@ -319,8 +338,12 @@ static doca_error_t create_ingress_classifier(
 
   pipeline->classifier_rules = calloc(pipeline->ports->count,
                                       sizeof(*pipeline->classifier_rules));
-  return pipeline->classifier_rules == NULL ? DOCA_ERROR_NO_MEMORY
-                                             : DOCA_SUCCESS;
+  if (pipeline->classifier_rules == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  pipeline->egress_gates = calloc(pipeline->ports->count,
+                                  sizeof(*pipeline->egress_gates));
+  return pipeline->egress_gates == NULL ? DOCA_ERROR_NO_MEMORY
+                                         : DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
@@ -379,7 +402,14 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->flood_selector_pipe);
   if (pipeline->rss_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->rss_pipe);
+  if (pipeline->egress_gates != NULL) {
+    for (uint16_t i = 0; i < pipeline->ports->count; i++) {
+      if (pipeline->egress_gates[i].pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->egress_gates[i].pipe);
+    }
+  }
   free(pipeline->classifier_rules);
+  free(pipeline->egress_gates);
   *pipeline = (struct eswitch_pipeline){0};
 }
 
@@ -410,7 +440,14 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
       &rule->entry);
   if (result != DOCA_SUCCESS)
     return result;
-  return process_rules(pipeline, rule, 1);
+  result = process_rules(pipeline, rule, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = remove_rule(pipeline, rule,
+                                       "rollback ingress attach");
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
+  return DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
@@ -422,158 +459,293 @@ doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                      "detach ingress port");
 }
 
-static doca_error_t create_flood_path(struct eswitch_pipeline *pipeline,
-                                      uint16_t vswitch_id,
-                                      uint16_t ingress_port_id,
-                                      const uint16_t *member_port_ids,
-                                      uint16_t member_count,
-                                      struct eswitch_flood_path *path) {
+static doca_error_t create_egress_gate(struct eswitch_pipeline *pipeline,
+                                       uint16_t port_index) {
+  struct eswitch_egress_gate *gate = &pipeline->egress_gates[port_index];
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_fwd fwd = {0};
+  char name[64];
+  uint16_t port_id = pipeline->ports->items[port_index].ethernet->port_id;
+  doca_error_t result;
+
+  if (gate->pipe != NULL)
+    return DOCA_SUCCESS;
+
+  snprintf(name, sizeof(name), "ESW_EGRESS_GATE_%u", port_id);
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_CONTROL, false, 2);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL, &gate->pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  /* pkt_meta keeps the original ingress in its low 16 bits.  The exact
+   * high-priority rule provides split-horizon filtering for this egress. */
+  match.meta.pkt_meta = DOCA_HTOBE32(port_id);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_PORT_MASK);
+  fwd.type = DOCA_FLOW_FWD_DROP;
+  flow_entry_cookie_prepare(&gate->drop_self.cookie, "egress self-drop",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, gate->pipe, &match, &mask, NULL, NULL,
+      NULL, NULL, NULL, 0, &fwd, &gate->drop_self.cookie,
+      &gate->drop_self.entry);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+  result = process_rules(pipeline, &gate->drop_self, 1);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+
+  memset(&match, 0, sizeof(match));
+  memset(&fwd, 0, sizeof(fwd));
+  fwd.type = DOCA_FLOW_FWD_PORT;
+  fwd.port_id = port_id;
+  flow_entry_cookie_prepare(&gate->forward.cookie, "egress forward",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, gate->pipe, &match, NULL, NULL, NULL,
+      NULL, NULL, NULL, 1, &fwd, &gate->forward.cookie,
+      &gate->forward.entry);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+  result = process_rules(pipeline, &gate->forward, 1);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+
+  printf("EGRESS GATE CREATE: port=%u\n", port_id);
+  return DOCA_SUCCESS;
+
+fail:
+  doca_flow_pipe_destroy(gate->pipe);
+  *gate = (struct eswitch_egress_gate){0};
+  return result;
+}
+
+static doca_error_t get_egress_gate(struct eswitch_pipeline *pipeline,
+                                    uint16_t port_id,
+                                    struct doca_flow_pipe **gate_pipe) {
+  int port_index;
+  doca_error_t result;
+
+  if (pipeline == NULL || gate_pipe == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  port_index = find_port_index(pipeline, port_id);
+  if (port_index < 0)
+    return DOCA_ERROR_NOT_FOUND;
+  result = create_egress_gate(pipeline, (uint16_t)port_index);
+  if (result == DOCA_SUCCESS)
+    *gate_pipe = pipeline->egress_gates[port_index].pipe;
+  return result;
+}
+
+static doca_error_t create_flood_group(struct eswitch_pipeline *pipeline,
+                                       uint16_t vswitch_id,
+                                       struct eswitch_flood_group *group) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_fwd pipe_fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_match selector_match = {0};
   struct doca_flow_fwd selector_fwd = {0};
   char name[64];
-  uint16_t cursor = 0;
+  uint16_t member_capacity = max_flood_members(pipeline);
+  uint32_t pipe_capacity = next_power_of_two(member_capacity);
   doca_error_t result;
 
-  path->ingress_port_id = ingress_port_id;
-  path->member_count = member_count - 1;
-  selector_match.meta.pkt_meta = DOCA_HTOBE32(
-      eswitch_metadata_encode(vswitch_id, ingress_port_id));
+  if (pipe_capacity < 2)
+    pipe_capacity = 2;
+  group->members = calloc(member_capacity, sizeof(*group->members));
+  if (group->members == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  group->vswitch_id = vswitch_id;
+  group->member_capacity = member_capacity;
 
-  /* A two-port vSwitch has exactly one peer for each ingress. Forwarding
-   * directly avoids constructing a one-entry flooding hash pipe. Apart from
-   * being cheaper, this follows the ordinary switch-mode PORT-forwarding
-   * path and avoids relying on a capacity-one flooding hash map. */
-  if (path->member_count == 1) {
-    for (uint16_t i = 0; i < member_count; i++) {
-      if (member_port_ids[i] == ingress_port_id)
-        continue;
-      selector_fwd.type = DOCA_FLOW_FWD_PORT;
-      selector_fwd.port_id = member_port_ids[i];
-      printf("FLOOD PATH: vs=%u ingress=%u -> port=%u (direct)\n",
-             vswitch_id, ingress_port_id, member_port_ids[i]);
-      break;
-    }
-  } else {
-    path->members = calloc(path->member_count, sizeof(*path->members));
-    if (path->members == NULL)
-      return DOCA_ERROR_NO_MEMORY;
+  snprintf(name, sizeof(name), "ESW_VS%u_FLOOD", vswitch_id);
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_HASH, false,
+                             pipe_capacity);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_hash_map_algorithm(
+        cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &pipe_fwd, NULL, &group->pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  cfg = NULL;
+  if (result != DOCA_SUCCESS)
+    goto fail;
 
-    snprintf(name, sizeof(name), "ESW_VS%u_FLOOD_FROM_%u", vswitch_id,
-             ingress_port_id);
-    result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
-    if (result != DOCA_SUCCESS)
-      return result;
-    result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_HASH, false,
-                               next_power_of_two(path->member_count));
-    if (result == DOCA_SUCCESS)
-      result = doca_flow_pipe_cfg_set_hash_map_algorithm(
-          cfg, DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING);
-    if (result == DOCA_SUCCESS)
-      result = doca_flow_pipe_create(cfg, &pipe_fwd, NULL, &path->pipe);
-    doca_flow_pipe_cfg_destroy(cfg);
-    if (result != DOCA_SUCCESS)
-      return result;
-
-    for (uint16_t i = 0; i < member_count; i++) {
-      struct doca_flow_fwd fwd = {0};
-      struct eswitch_rule *rule;
-
-      if (member_port_ids[i] == ingress_port_id)
-        continue;
-      rule = &path->members[cursor];
-      fwd.type = DOCA_FLOW_FWD_PORT;
-      fwd.port_id = member_port_ids[i];
-      printf("FLOOD PATH: vs=%u ingress=%u -> port=%u (group)\n",
-             vswitch_id, ingress_port_id, member_port_ids[i]);
-      flow_entry_cookie_prepare(&rule->cookie, "flood member",
-                                DOCA_FLOW_ENTRY_OP_ADD);
-      result = doca_flow_pipe_hash_add_entry(
-          pipeline->runtime->queue_id, path->pipe, cursor, 0, NULL, NULL,
-          &fwd, batch_flags(cursor, path->member_count), &rule->cookie,
-          &rule->entry);
-      if (result != DOCA_SUCCESS)
-        return result;
-      cursor++;
-    }
-    result = process_rules(pipeline, path->members, path->member_count);
-    if (result != DOCA_SUCCESS)
-      return result;
-
-    selector_fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
-    selector_fwd.hash_pipe.pipe = path->pipe;
-    selector_fwd.hash_pipe.algorithm =
-        DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
-  }
-
-  flow_entry_cookie_prepare(&path->selector.cookie, "flood selector",
+  selector_match.meta.pkt_meta = DOCA_HTOBE32((uint32_t)vswitch_id << 16);
+  selector_fwd.type = DOCA_FLOW_FWD_HASH_PIPE;
+  selector_fwd.hash_pipe.pipe = group->pipe;
+  selector_fwd.hash_pipe.algorithm =
+      DOCA_FLOW_PIPE_HASH_MAP_ALGORITHM_FLOODING;
+  flow_entry_cookie_prepare(&group->selector.cookie, "flood selector",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->flood_selector_pipe,
       &selector_match, 0, NULL, NULL, &selector_fwd,
-      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &path->selector.cookie,
-      &path->selector.entry);
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &group->selector.cookie,
+      &group->selector.entry);
   if (result != DOCA_SUCCESS)
-    return result;
-  return process_rules(pipeline, &path->selector, 1);
+    goto fail;
+  result = process_rules(pipeline, &group->selector, 1);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+
+  printf("FLOOD GROUP CREATE: vs=%u capacity=%u\n", vswitch_id,
+         member_capacity);
+  return DOCA_SUCCESS;
+
+fail:
+  if (group->selector.entry != NULL) {
+    doca_error_t cleanup = remove_rule(pipeline, &group->selector,
+                                       "rollback flood selector");
+    if (cleanup != DOCA_SUCCESS)
+      return cleanup;
+  }
+  if (cfg != NULL)
+    doca_flow_pipe_cfg_destroy(cfg);
+  if (group->pipe != NULL)
+    doca_flow_pipe_destroy(group->pipe);
+  free(group->members);
+  *group = (struct eswitch_flood_group){0};
+  return result;
 }
 
-doca_error_t eswitch_pipeline_build_flood_group(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint16_t *member_port_ids, uint16_t member_count,
+doca_error_t eswitch_pipeline_flood_add_port(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id, uint16_t port_id,
     struct eswitch_flood_group *group) {
+  struct doca_flow_pipe *gate_pipe = NULL;
+  struct eswitch_flood_member *member = NULL;
+  struct doca_flow_fwd fwd = {0};
+  uint16_t slot;
+  bool created = false;
   doca_error_t result;
 
   if (pipeline == NULL || group == NULL || !pipeline->created ||
-      vswitch_id == 0 || (member_count != 0 && member_port_ids == NULL))
+      vswitch_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
-  if (group->paths != NULL)
+  if (group->pipe != NULL && group->vswitch_id != vswitch_id)
     return DOCA_ERROR_BAD_STATE;
+  for (slot = 0; slot < group->member_capacity; slot++) {
+    if (group->members[slot].active &&
+        group->members[slot].port_id == port_id)
+      return DOCA_ERROR_ALREADY_EXIST;
+  }
 
-  group->vswitch_id = vswitch_id;
-  if (member_count < 2)
-    return DOCA_SUCCESS;
-  group->paths = calloc(member_count, sizeof(*group->paths));
-  if (group->paths == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-  group->path_count = member_count;
-
-  for (uint16_t i = 0; i < member_count; i++) {
-    result = create_flood_path(pipeline, vswitch_id, member_port_ids[i],
-                               member_port_ids, member_count,
-                               &group->paths[i]);
-    if (result != DOCA_SUCCESS) {
-      doca_error_t cleanup =
-          eswitch_pipeline_destroy_flood_group(pipeline, group);
-      return cleanup == DOCA_SUCCESS ? result : cleanup;
+  result = get_egress_gate(pipeline, port_id, &gate_pipe);
+  if (result != DOCA_SUCCESS)
+    return result;
+  if (group->pipe == NULL) {
+    result = create_flood_group(pipeline, vswitch_id, group);
+    if (result != DOCA_SUCCESS)
+      return result;
+    created = true;
+  }
+  if (group->member_count >= group->member_capacity) {
+    result = DOCA_ERROR_NO_MEMORY;
+    goto fail;
+  }
+  for (slot = 0; slot < group->member_capacity; slot++) {
+    if (!group->members[slot].active &&
+        group->members[slot].rule.entry == NULL) {
+      member = &group->members[slot];
+      break;
     }
   }
+  if (member == NULL) {
+    result = DOCA_ERROR_BAD_STATE;
+    goto fail;
+  }
+
+  fwd.type = DOCA_FLOW_FWD_PIPE;
+  fwd.next_pipe = gate_pipe;
+  flow_entry_cookie_prepare(&member->rule.cookie, "add flood member",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_hash_add_entry(
+      pipeline->runtime->queue_id, group->pipe, slot, 0, NULL, NULL, &fwd,
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &member->rule.cookie,
+      &member->rule.entry);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+  result = process_rules(pipeline, &member->rule, 1);
+  if (result != DOCA_SUCCESS)
+    goto fail;
+
+  member->port_id = port_id;
+  member->active = true;
+  group->member_count++;
+  printf("FLOOD MEMBER ADD: vs=%u port=%u slot=%u\n", vswitch_id, port_id,
+         slot);
+  return DOCA_SUCCESS;
+
+fail:
+  if (member != NULL && member->rule.entry != NULL) {
+    doca_error_t cleanup = remove_rule(pipeline, &member->rule,
+                                       "rollback flood member");
+    if (cleanup != DOCA_SUCCESS)
+      return cleanup;
+  }
+  if (created) {
+    doca_error_t cleanup =
+        eswitch_pipeline_destroy_flood_group(pipeline, group);
+    if (cleanup != DOCA_SUCCESS)
+      return cleanup;
+  }
+  return result;
+}
+
+doca_error_t eswitch_pipeline_flood_remove_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_id,
+    struct eswitch_flood_group *group) {
+  struct eswitch_flood_member *member = NULL;
+  uint16_t slot;
+  doca_error_t result;
+
+  if (pipeline == NULL || group == NULL || !pipeline->created ||
+      group->pipe == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (slot = 0; slot < group->member_capacity; slot++) {
+    if (group->members[slot].active &&
+        group->members[slot].port_id == port_id) {
+      member = &group->members[slot];
+      break;
+    }
+  }
+  if (member == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+
+  result = remove_rule(pipeline, &member->rule, "remove flood member");
+  if (result != DOCA_SUCCESS)
+    return result;
+  *member = (struct eswitch_flood_member){0};
+  group->member_count--;
+  printf("FLOOD MEMBER REMOVE: vs=%u port=%u slot=%u\n", group->vswitch_id,
+         port_id, slot);
   return DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_pipeline_destroy_flood_group(
     struct eswitch_pipeline *pipeline, struct eswitch_flood_group *group) {
-  doca_error_t first_error = DOCA_SUCCESS;
+  doca_error_t result;
 
   if (pipeline == NULL || group == NULL)
     return DOCA_ERROR_INVALID_VALUE;
-  for (uint16_t i = 0; i < group->path_count; i++) {
-    struct eswitch_flood_path *path = &group->paths[i];
-    doca_error_t result = remove_rule(pipeline, &path->selector,
-                                      "remove flood selector");
-    if (first_error == DOCA_SUCCESS && result != DOCA_SUCCESS)
-      first_error = result;
+  if (group->pipe == NULL) {
+    free(group->members);
+    *group = (struct eswitch_flood_group){0};
+    return DOCA_SUCCESS;
   }
-  if (first_error != DOCA_SUCCESS)
-    return first_error;
-
-  for (uint16_t i = 0; i < group->path_count; i++) {
-    if (group->paths[i].pipe != NULL)
-      doca_flow_pipe_destroy(group->paths[i].pipe);
-    free(group->paths[i].members);
-  }
-  free(group->paths);
+  result = remove_rule(pipeline, &group->selector, "remove flood selector");
+  if (result != DOCA_SUCCESS)
+    return result;
+  doca_flow_pipe_destroy(group->pipe);
+  free(group->members);
   *group = (struct eswitch_flood_group){0};
   return DOCA_SUCCESS;
 }
@@ -588,78 +760,77 @@ static void fill_source_match(struct doca_flow_match *match,
 }
 
 static void fill_destination_match(struct doca_flow_match *match,
-                                   uint16_t vswitch_id, uint16_t port_id,
+                                   uint16_t vswitch_id,
                                    const struct rte_ether_addr *mac) {
   memset(match, 0, sizeof(*match));
-  match->meta.pkt_meta = DOCA_HTOBE32(
-      eswitch_metadata_encode(vswitch_id, port_id));
+  match->meta.pkt_meta = DOCA_HTOBE32((uint32_t)vswitch_id << 16);
   memcpy(match->outer.eth.dst_mac, mac->addr_bytes, RTE_ETHER_ADDR_LEN);
 }
 
-static void fill_destination_fwd(uint16_t ingress_port_id,
-                                 uint16_t learned_port_id,
-                                 struct doca_flow_fwd *fwd) {
+static doca_error_t fill_destination_fwd(struct eswitch_pipeline *pipeline,
+                                         uint16_t learned_port_id,
+                                         struct doca_flow_fwd *fwd) {
+  struct doca_flow_pipe *gate_pipe = NULL;
+  doca_error_t result;
+
   memset(fwd, 0, sizeof(*fwd));
-  if (ingress_port_id == learned_port_id) {
-    fwd->type = DOCA_FLOW_FWD_DROP;
-  } else {
-    fwd->type = DOCA_FLOW_FWD_PORT;
-    fwd->port_id = learned_port_id;
-  }
+  result = get_egress_gate(pipeline, learned_port_id, &gate_pipe);
+  if (result != DOCA_SUCCESS)
+    return result;
+  fwd->type = DOCA_FLOW_FWD_PIPE;
+  fwd->next_pipe = gate_pipe;
+  return DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_pipeline_fdb_add(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const struct rte_ether_addr *mac, uint16_t learned_port_id,
-    const uint16_t *member_port_ids, uint16_t member_count,
     struct eswitch_hw_fdb_entry *hardware) {
   struct doca_flow_match match;
+  struct doca_flow_fwd fwd;
+  struct eswitch_rule *source_rule;
   doca_error_t original_error;
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created || vswitch_id == 0 ||
-      mac == NULL || member_port_ids == NULL || member_count == 0 ||
-      hardware == NULL)
+      mac == NULL || hardware == NULL)
     return DOCA_ERROR_INVALID_VALUE;
-  hardware->destination_count = member_count;
-  hardware->destinations =
-      calloc(member_count, sizeof(*hardware->destinations));
-  if (hardware->destinations == NULL)
-    return DOCA_ERROR_NO_MEMORY;
+  if (hardware->destination.entry != NULL ||
+      hardware->sources[0].entry != NULL ||
+      hardware->sources[1].entry != NULL)
+    return DOCA_ERROR_BAD_STATE;
 
-  /* Dynamic learning is not latency-critical. Process one entry at a time so
-   * every successful handle can be rolled back deterministically on error. */
-  for (uint16_t i = 0; i < member_count; i++) {
-    struct doca_flow_fwd fwd;
-    struct eswitch_rule *rule = &hardware->destinations[i];
-
-    fill_destination_match(&match, vswitch_id, member_port_ids[i], mac);
-    fill_destination_fwd(member_port_ids[i], learned_port_id, &fwd);
-    flow_entry_cookie_prepare(&rule->cookie, "add destination FDB",
-                              DOCA_FLOW_ENTRY_OP_ADD);
-    result = doca_flow_pipe_basic_add_entry(
-        pipeline->runtime->queue_id, pipeline->destination_pipe, &match, 0,
-        NULL, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie,
-        &rule->entry);
-    if (result != DOCA_SUCCESS)
-      goto rollback;
-    result = process_rules(pipeline, rule, 1);
-    if (result != DOCA_SUCCESS)
-      goto rollback;
-  }
+  fill_destination_match(&match, vswitch_id, mac);
+  result = fill_destination_fwd(pipeline, learned_port_id, &fwd);
+  if (result != DOCA_SUCCESS)
+    return result;
+  flow_entry_cookie_prepare(&hardware->destination.cookie,
+                            "add destination FDB", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(
+      pipeline->runtime->queue_id, pipeline->destination_pipe, &match, 0,
+      NULL, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &hardware->destination.cookie, &hardware->destination.entry);
+  if (result != DOCA_SUCCESS)
+    goto rollback;
+  result = process_rules(pipeline, &hardware->destination, 1);
+  if (result != DOCA_SUCCESS)
+    goto rollback;
 
   fill_source_match(&match, vswitch_id, learned_port_id, mac);
-  flow_entry_cookie_prepare(&hardware->source.cookie, "add source guard",
+  source_rule = &hardware->sources[0];
+  flow_entry_cookie_prepare(&source_rule->cookie, "add source guard",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->source_guard_pipe, &match, 0,
       NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-      &hardware->source.cookie, &hardware->source.entry);
+      &source_rule->cookie, &source_rule->entry);
   if (result != DOCA_SUCCESS)
     goto rollback;
-  result = process_rules(pipeline, &hardware->source, 1);
+  result = process_rules(pipeline, source_rule, 1);
   if (result != DOCA_SUCCESS)
     goto rollback;
+  hardware->active_source = 0;
+  hardware->learned_port_id = learned_port_id;
   return DOCA_SUCCESS;
 
 rollback:
@@ -671,66 +842,91 @@ rollback:
 doca_error_t eswitch_pipeline_fdb_move(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const struct rte_ether_addr *mac, uint16_t old_port_id,
-    uint16_t new_port_id, const uint16_t *member_port_ids,
-    uint16_t member_count, struct eswitch_hw_fdb_entry *hardware) {
-  struct doca_flow_pipe_entry *old_source;
-  struct doca_flow_pipe_entry *new_source = NULL;
-  struct flow_entry_cookie **cookies;
+    uint16_t new_port_id, struct eswitch_hw_fdb_entry *hardware) {
+  struct eswitch_rule *new_source;
+  struct eswitch_rule *old_source;
+  uint8_t new_source_index;
   struct doca_flow_match match;
+  struct doca_flow_fwd fwd;
+  struct doca_flow_fwd old_fwd;
+  doca_error_t original_error;
   doca_error_t result;
 
-  (void)old_port_id;
   if (pipeline == NULL || hardware == NULL || mac == NULL ||
-      member_port_ids == NULL || member_count != hardware->destination_count)
+      hardware->destination.entry == NULL ||
+      hardware->active_source > 1 ||
+      hardware->learned_port_id != old_port_id)
     return DOCA_ERROR_INVALID_VALUE;
-  cookies = calloc(member_count + 1, sizeof(*cookies));
-  if (cookies == NULL)
-    return DOCA_ERROR_NO_MEMORY;
+  result = fill_destination_fwd(pipeline, new_port_id, &fwd);
+  if (result != DOCA_SUCCESS)
+    return result;
+  old_source = &hardware->sources[hardware->active_source];
+  new_source_index = (uint8_t)(1U - hardware->active_source);
+  new_source = &hardware->sources[new_source_index];
+  if (old_source->entry == NULL || new_source->entry != NULL)
+    return DOCA_ERROR_BAD_STATE;
 
-  for (uint16_t i = 0; i < member_count; i++) {
-    struct doca_flow_fwd fwd;
-    struct eswitch_rule *rule = &hardware->destinations[i];
-
-    fill_destination_fwd(member_port_ids[i], new_port_id, &fwd);
-    flow_entry_cookie_prepare(&rule->cookie, "move destination FDB",
-                              DOCA_FLOW_ENTRY_OP_UPD);
-    cookies[i] = &rule->cookie;
-    result = doca_flow_pipe_basic_update_entry(
-        pipeline->runtime->queue_id, pipeline->destination_pipe, 0, NULL,
-        NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_WAIT_FOR_BATCH, rule->entry);
-    if (result != DOCA_SUCCESS)
-      goto out;
-  }
+  /* Install the new source guard before redirecting known unicast.  Each
+   * hardware operation is completed separately so every failure has a
+   * deterministic rollback path. */
   fill_source_match(&match, vswitch_id, new_port_id, mac);
-  flow_entry_cookie_prepare(&hardware->source.cookie, "move source guard",
+  flow_entry_cookie_prepare(&new_source->cookie, "add moved source guard",
                             DOCA_FLOW_ENTRY_OP_ADD);
-  cookies[member_count] = &hardware->source.cookie;
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->source_guard_pipe, &match, 0,
       NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-      &hardware->source.cookie, &new_source);
+      &new_source->cookie, &new_source->entry);
   if (result != DOCA_SUCCESS)
-    goto out;
-  result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
-                                cookies, member_count + 1);
+    return result;
+  result = process_rules(pipeline, new_source, 1);
   if (result != DOCA_SUCCESS)
-    goto out;
+    goto rollback_new_source;
 
-  old_source = hardware->source.entry;
-  hardware->source.entry = new_source;
-  flow_entry_cookie_prepare(&hardware->source.cookie, "remove moved source",
-                            DOCA_FLOW_ENTRY_OP_DEL);
-  result = doca_flow_pipe_remove_entry(pipeline->runtime->queue_id,
-                                       DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-                                       old_source);
+  flow_entry_cookie_prepare(&hardware->destination.cookie,
+                            "move destination FDB", DOCA_FLOW_ENTRY_OP_UPD);
+  result = doca_flow_pipe_basic_update_entry(
+      pipeline->runtime->queue_id, pipeline->destination_pipe, 0, NULL,
+      NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      hardware->destination.entry);
+  if (result != DOCA_SUCCESS)
+    goto rollback_new_source;
+  result = process_rules(pipeline, &hardware->destination, 1);
+  if (result != DOCA_SUCCESS)
+    goto rollback_destination;
+
+  result = remove_rule(pipeline, old_source, "remove old source guard");
+  if (result != DOCA_SUCCESS)
+    goto rollback_destination;
+
+  hardware->active_source = new_source_index;
+  hardware->learned_port_id = new_port_id;
+  return DOCA_SUCCESS;
+
+rollback_destination:
+  original_error = result;
+  result = fill_destination_fwd(pipeline, old_port_id, &old_fwd);
   if (result == DOCA_SUCCESS) {
-    struct flow_entry_cookie *cookie = &hardware->source.cookie;
-    result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
-                                  &cookie, 1);
+    flow_entry_cookie_prepare(&hardware->destination.cookie,
+                              "rollback destination FDB",
+                              DOCA_FLOW_ENTRY_OP_UPD);
+    result = doca_flow_pipe_basic_update_entry(
+        pipeline->runtime->queue_id, pipeline->destination_pipe, 0, NULL,
+        NULL, &old_fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        hardware->destination.entry);
+    if (result == DOCA_SUCCESS)
+      result = process_rules(pipeline, &hardware->destination, 1);
   }
-out:
-  free(cookies);
-  return result;
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = remove_rule(pipeline, new_source,
+                       "rollback moved source guard");
+  return result == DOCA_SUCCESS ? original_error : result;
+
+rollback_new_source:
+  original_error = result;
+  result = remove_rule(pipeline, new_source,
+                       "rollback moved source guard");
+  return result == DOCA_SUCCESS ? original_error : result;
 }
 
 doca_error_t eswitch_pipeline_fdb_remove(
@@ -740,16 +936,16 @@ doca_error_t eswitch_pipeline_fdb_remove(
 
   if (pipeline == NULL || hardware == NULL)
     return DOCA_ERROR_INVALID_VALUE;
-  result = remove_rule(pipeline, &hardware->source, "remove source guard");
+  result = remove_rule(pipeline, &hardware->destination,
+                       "remove destination FDB");
   if (result != DOCA_SUCCESS)
     return result;
-  for (uint16_t i = 0; i < hardware->destination_count; i++) {
-    result = remove_rule(pipeline, &hardware->destinations[i],
-                         "remove destination FDB");
+  for (uint8_t i = 0; i < 2; i++) {
+    result = remove_rule(pipeline, &hardware->sources[i],
+                         "remove source guard");
     if (result != DOCA_SUCCESS)
       return result;
   }
-  free(hardware->destinations);
   *hardware = (struct eswitch_hw_fdb_entry){0};
   return DOCA_SUCCESS;
 }
@@ -760,9 +956,11 @@ doca_error_t eswitch_pipeline_fdb_query(
   doca_error_t result;
 
   if (hardware == NULL || packet_count == NULL ||
-      hardware->source.entry == NULL)
+      hardware->active_source > 1 ||
+      hardware->sources[hardware->active_source].entry == NULL)
     return DOCA_ERROR_INVALID_VALUE;
-  result = doca_flow_resource_query_entry(hardware->source.entry, &query);
+  result = doca_flow_resource_query_entry(
+      hardware->sources[hardware->active_source].entry, &query);
   if (result == DOCA_SUCCESS)
     *packet_count = query.counter.total_pkts;
   return result;

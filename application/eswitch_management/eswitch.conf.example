@@ -1,0 +1,14 @@
+# eSwitch Management persistent state
+version 1
+
+# Empty vSwitches are valid.
+vswitch 100
+vswitch 200
+
+# DPDK port IDs are intentionally not persisted because they may change after
+# a reboot. The parent and representor identity are resolved after probing.
+member 100 parent
+member 100 representor 1 0 0
+member 100 representor 1 0 1
+member 200 representor 1 0 2
+member 200 representor 1 0 3

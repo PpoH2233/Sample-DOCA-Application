@@ -111,6 +111,7 @@ Example:
 ```text
 OK
 service=eSwitch Management state=running uptime=120s
+config=/var/lib/eswitch-management/eswitch.conf
 ports=7 assigned=3 available=4 vswitches=1 fdb=2
 ```
 
@@ -145,11 +146,13 @@ eswitchctl vs-port-attach --id 100 --port 1
 
 Successful attachment performs:
 
-1. Flush the affected vSwitch FDB.
-2. Rebuild per-ingress hardware flood paths with the new member.
-3. Add the root classifier entry that writes
+1. Add one member entry to the vSwitch flooding HASH pipe. Existing members
+   and learned FDB rules are unchanged.
+2. Add the root classifier entry that writes
    `(vswitch_id << 16) | ingress_port_id` to packet metadata.
-4. Mark the port as owned by the vSwitch.
+3. Mark the port as owned by the vSwitch.
+
+If the classifier operation fails, the newly added flood member is removed.
 
 ### `vs-port-detach --id <vs-id> --port <port-id>`
 
@@ -161,14 +164,14 @@ eswitchctl vs-port-detach --id 100 --port 1
 
 Successful detachment performs:
 
-1. Flush the affected vSwitch FDB.
-2. Remove the port's root classifier entry, stopping new ingress.
-3. Remove the old flood selectors/group so no egress path references it.
-4. Mark the port available.
-5. Rebuild flooding for the remaining members.
+1. Remove the port's root classifier entry, stopping new ingress.
+2. Remove only that port's member entry from the flooding HASH pipe.
+3. Remove only FDB entries whose learned egress is the detached port.
+4. Mark the port available. Other members and their FDB entries are retained.
 
-The vSwitch continues to exist when its last port is detached. With zero or
-one member there is no flood group; unknown traffic is dropped.
+The vSwitch and its empty flood group continue to exist when its last port is
+detached. With zero members unknown traffic is dropped; with one member its
+egress gate drops a packet returning to the same ingress.
 
 ### `vs-list`
 
@@ -249,7 +252,11 @@ eswitchctl vs-port-detach --port 1 --id 100
   representors, Flow ports, pipes, and entries.
 - Commands are executed by the same owner loop as FDB learning; Flow mutations
   are serialized.
-- Learned FDB and vSwitch membership are runtime-only in version 1.
-- Restarting the daemon removes state and returns every port to unassigned
-  root-miss `DROP`.
+- One vSwitch can contain at most 254 ports in this implementation.
+- vSwitch creation and membership are committed atomically to `eswitch.conf`
+  after hardware programming. A save failure triggers a topology rollback and
+  returns `ERR`.
+- Restarting the daemon restores topology using stable parent or host/PF/VF
+  identity; DPDK port IDs are never persisted.
+- Learned FDB entries remain runtime-only and are relearned after restart.
 - The current data plane supports one untagged bridge domain per vSwitch.

@@ -28,9 +28,11 @@ COPY --from=builder /stage/usr/local/bin/eswitchctl /usr/local/bin/eswitchctl
 RUN ldd /usr/local/bin/eswitch-management \
  && ! ldd /usr/local/bin/eswitch-management | grep -q "not found" \
  && /usr/local/bin/eswitchctl --help >/dev/null \
- && install -d -m 0755 /run/eswitch-management
+ && install -d -m 0755 /run/eswitch-management \
+ && install -d -m 0750 /var/lib/eswitch-management
 
 ENV ESWITCH_CONTROL_SOCKET=/run/eswitch-management/control.sock
+ENV ESWITCH_STATE_FILE=/var/lib/eswitch-management/eswitch.conf
 
 STOPSIGNAL SIGTERM
 HEALTHCHECK --start-period=30s --interval=10s --timeout=3s --retries=3 \
