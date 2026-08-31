@@ -84,7 +84,7 @@ A raw socket client also receives command-specific syntax from the daemon:
 
 ```text
 ERR code=2 message=Invalid input
-Usage: vs-port-detach --vs <id> --port <port-id>
+Usage: vs-port-detach --id <id> --port <port-id>
 ```
 
 When the socket path is missing or refuses the connection, `eswitchctl`
@@ -134,13 +134,13 @@ releases all member ports, and deletes the vSwitch.
 eswitchctl vs-delete --id 100
 ```
 
-### `vs-port-attach --vs <vs-id> --port <port-id>`
+### `vs-port-attach --id <vs-id> --port <port-id>`
 
 Attaches one available DPDK port to a vSwitch. A port, including the uplink,
 can belong to only one vSwitch.
 
 ```bash
-eswitchctl vs-port-attach --vs 100 --port 1
+eswitchctl vs-port-attach --id 100 --port 1
 ```
 
 Successful attachment performs:
@@ -151,12 +151,12 @@ Successful attachment performs:
    `(vswitch_id << 16) | ingress_port_id` to packet metadata.
 4. Mark the port as owned by the vSwitch.
 
-### `vs-port-detach --vs <vs-id> --port <port-id>`
+### `vs-port-detach --id <vs-id> --port <port-id>`
 
 Detaches a member DPDK port and returns it to the available pool.
 
 ```bash
-eswitchctl vs-port-detach --vs 100 --port 1
+eswitchctl vs-port-detach --id 100 --port 1
 ```
 
 Successful detachment performs:
@@ -186,14 +186,14 @@ vs=100 ports=[0,1,2]
 vs=200 ports=[3,4]
 ```
 
-### `show_fdb [--id <vs-id>]`
+### `show-fdb [--id <vs-id>]`
 
 Without an ID, shows learned entries from every vSwitch. Supplying an ID
 filters the output.
 
 ```bash
-eswitchctl show_fdb
-eswitchctl show_fdb --id 100
+eswitchctl show-fdb
+eswitchctl show-fdb --id 100
 ```
 
 Example:
@@ -206,8 +206,7 @@ vs=100 mac=02:00:00:00:00:0a port=1 packets=42
 
 ### `list-port-available`
 
-Lists unassigned DPDK ports. The compatibility spelling
-`list-port-avaiable` is also accepted.
+Lists unassigned DPDK ports.
 
 ```bash
 eswitchctl list-port-available
@@ -235,17 +234,14 @@ eswitchctl vs-create 100
 eswitchctl vs-delete 100
 eswitchctl vs-port-attach 100 1
 eswitchctl vs-port-detach 100 1
-eswitchctl show_fdb 100
+eswitchctl show-fdb 100
 ```
 
 For port commands, named options may appear in either order:
 
 ```bash
-eswitchctl vs-port-detach --port 1 --vs 100
+eswitchctl vs-port-detach --port 1 --id 100
 ```
-
-The earlier `--id` spelling for port attach/detach remains accepted as a
-compatibility alias. New clients should send `--vs`.
 
 ## Runtime model
 

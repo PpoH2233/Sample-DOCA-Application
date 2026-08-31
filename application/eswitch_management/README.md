@@ -51,11 +51,11 @@ In another shell:
 /tmp/eswitch-management-build/eswitchctl status
 /tmp/eswitch-management-build/eswitchctl list-port-available
 /tmp/eswitch-management-build/eswitchctl vs-create --id 10
-/tmp/eswitch-management-build/eswitchctl vs-port-attach --vs 10 --port 1
-/tmp/eswitch-management-build/eswitchctl vs-port-attach --vs 10 --port 2
+/tmp/eswitch-management-build/eswitchctl vs-port-attach --id 10 --port 1
+/tmp/eswitch-management-build/eswitchctl vs-port-attach --id 10 --port 2
 /tmp/eswitch-management-build/eswitchctl vs-list
-/tmp/eswitch-management-build/eswitchctl show_fdb
-/tmp/eswitch-management-build/eswitchctl vs-port-detach --vs 10 --port 2
+/tmp/eswitch-management-build/eswitchctl show-fdb
+/tmp/eswitch-management-build/eswitchctl vs-port-detach --id 10 --port 2
 /tmp/eswitch-management-build/eswitchctl vs-delete --id 10
 ```
 

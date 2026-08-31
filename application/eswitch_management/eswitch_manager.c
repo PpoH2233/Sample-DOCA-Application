@@ -418,9 +418,7 @@ static bool parse_port_arguments(char **arguments, size_t count,
   if (count != 4)
     return false;
   for (size_t i = 0; i < count; i += 2) {
-    if ((strcmp(arguments[i], "--vs") == 0 ||
-         strcmp(arguments[i], "--id") == 0) &&
-        !found_id) {
+    if (strcmp(arguments[i], "--id") == 0 && !found_id) {
       found_id = parse_u16(arguments[i + 1], id);
       if (!found_id)
         return false;
@@ -548,12 +546,11 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
   } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
     (void)format_vswitches(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if ((strcmp(verb, "list-port-avaiable") == 0 ||
-              strcmp(verb, "list-port-available") == 0) &&
+  } else if (strcmp(verb, "list-port-available") == 0 &&
              argument_count == 0) {
     (void)format_available_ports(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "show_fdb") == 0 &&
+  } else if (strcmp(verb, "show-fdb") == 0 &&
              parse_id_arguments(arguments, argument_count, false, &first)) {
     snprintf(response, response_size, "OK\n");
     eswitch_fdb_format(&manager->fdb, first,
@@ -596,13 +593,13 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
                   "Usage: vs-delete --id <id>\n");
     else if (verb != NULL && strcmp(verb, "vs-port-attach") == 0)
       append_text(response, response_size, used,
-                  "Usage: vs-port-attach --vs <id> --port <port-id>\n");
+                  "Usage: vs-port-attach --id <id> --port <port-id>\n");
     else if (verb != NULL && strcmp(verb, "vs-port-detach") == 0)
       append_text(response, response_size, used,
-                  "Usage: vs-port-detach --vs <id> --port <port-id>\n");
-    else if (verb != NULL && strcmp(verb, "show_fdb") == 0)
+                  "Usage: vs-port-detach --id <id> --port <port-id>\n");
+    else if (verb != NULL && strcmp(verb, "show-fdb") == 0)
       append_text(response, response_size, used,
-                  "Usage: show_fdb [--id <id>]\n");
+                  "Usage: show-fdb [--id <id>]\n");
     else
       append_text(response, response_size, used,
                   "Run: eswitchctl --help\n");

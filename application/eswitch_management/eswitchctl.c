@@ -17,12 +17,11 @@ static void print_help(FILE *output, const char *program) {
           "  status                              Show daemon status\n"
           "  vs-create --id <id>                 Create a virtual switch\n"
           "  vs-delete --id <id>                 Delete a virtual switch\n"
-          "  vs-port-attach --vs <id> --port <p> Attach an available port\n"
-          "  vs-port-detach --vs <id> --port <p> Detach a member port\n"
+          "  vs-port-attach --id <id> --port <p> Attach an available port\n"
+          "  vs-port-detach --id <id> --port <p> Detach a member port\n"
           "  vs-list                             List virtual switches\n"
-          "  show_fdb [--id <id>]                Show all or one FDB\n"
+          "  show-fdb [--id <id>]                Show all or one FDB\n"
           "  list-port-available                 List unassigned DPDK ports\n"
-          "  list-port-avaiable                  Compatibility spelling\n"
           "  --help, -h                          Show this help\n\n"
           "Control socket: %s\n"
           "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",
@@ -58,9 +57,7 @@ static bool valid_port_arguments(int count, char **arguments) {
   if (count != 4)
     return false;
   for (int i = 0; i < count; i += 2) {
-    if ((strcmp(arguments[i], "--vs") == 0 ||
-         strcmp(arguments[i], "--id") == 0) &&
-        !found_vswitch) {
+    if (strcmp(arguments[i], "--id") == 0 && !found_vswitch) {
       found_vswitch = parse_u16_value(arguments[i + 1]);
       if (!found_vswitch)
         return false;
@@ -81,8 +78,7 @@ static bool valid_command_line(int argc, char **argv) {
   char **arguments = &argv[2];
 
   if (strcmp(command, "status") == 0 || strcmp(command, "vs-list") == 0 ||
-      strcmp(command, "list-port-available") == 0 ||
-      strcmp(command, "list-port-avaiable") == 0)
+      strcmp(command, "list-port-available") == 0)
     return argument_count == 0;
   if (strcmp(command, "vs-create") == 0 ||
       strcmp(command, "vs-delete") == 0)
@@ -90,7 +86,7 @@ static bool valid_command_line(int argc, char **argv) {
   if (strcmp(command, "vs-port-attach") == 0 ||
       strcmp(command, "vs-port-detach") == 0)
     return valid_port_arguments(argument_count, arguments);
-  if (strcmp(command, "show_fdb") == 0)
+  if (strcmp(command, "show-fdb") == 0)
     return valid_id_arguments(argument_count, arguments, true);
   return false;
 }
