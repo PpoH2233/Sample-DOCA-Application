@@ -24,6 +24,15 @@ doca_error_t switch_devices_open(const char *pci_address,
                                  const char *devargs,
                                  struct switch_devices *devices);
 
+/* Open only VF representors selected by vf_scope before probing DPDK.
+ * vf_scope accepts "all" or a comma-separated list of indexes/ranges such as
+ * "0-6,10-20". The VF index is the value reported by DOCA for each
+ * representor. The parent ethdev is always included. */
+doca_error_t switch_devices_open_scoped(const char *pci_address,
+                                        const char *devargs,
+                                        const char *vf_scope,
+                                        struct switch_devices *devices);
+
 /* Close DPDK ports first, then representors, then the parent DOCA device. */
 doca_error_t switch_devices_close(struct switch_devices *devices);
 

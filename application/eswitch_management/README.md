@@ -100,14 +100,20 @@ hardware state and the file are committed together.
 
 ```bash
 cd /mnt/doca-dev/Sample-DOCA-Application/application/eswitch_management
-meson setup /tmp/eswitch-management-build
+meson setup /tmp/eswitch-management-build -Dvf_scope='0-6,10-20'
 meson compile -C /tmp/eswitch-management-build
 meson test -C /tmp/eswitch-management-build eswitch-state
 ```
 
 After source-only changes, run only the `meson compile` command. Run
 `meson setup --reconfigure /tmp/eswitch-management-build` after changing
-`meson.build`.
+`meson.build`. Change an existing build directory's scope without recreating
+it, then compile again:
+
+```bash
+meson configure /tmp/eswitch-management-build -Dvf_scope='10-20'
+meson compile -C /tmp/eswitch-management-build
+```
 
 ## Multi-stage production container
 
@@ -123,9 +129,26 @@ directories:
 ```bash
 cd /mnt/doca-dev/Sample-DOCA-Application
 sudo docker build \
+  --build-arg VF_SCOPE='0-6,10-20' \
   -f application/eswitch_management/Dockerfile \
   -t eswitch-management:3.4.0 .
 ```
+
+`VF_SCOPE` limits which VF representors are opened and passed to
+`doca_dpdk_port_probe_with_representors()`. It accepts `all`, one index such as
+`4`, or comma-separated indexes/ranges such as `0-6,10-20`. The parent DPDK
+port is always probed. The image stores this as its default scope; a deployment
+may override it without rebuilding:
+
+```bash
+sudo docker run ... \
+  --env ESWITCH_VF_SCOPE='10-20' \
+  eswitch-management:3.4.0 -l 0 -- 03:00.0
+```
+
+The persisted `eswitch.conf` must not contain member VFs outside the selected
+scope. Such a configuration is rejected during restore instead of silently
+dropping the missing membership.
 
 The base images can be changed without editing the Dockerfile:
 

@@ -8,6 +8,13 @@ project(
 
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language: 'c')
 
+build_config = configuration_data()
+build_config.set_quoted('ESWITCH_DEFAULT_VF_SCOPE', get_option('vf_scope'))
+configure_file(
+  output: 'eswitch_build_config.h',
+  configuration: build_config,
+)
+
 dependencies = [
   dependency('doca-common', required: true),
   dependency('doca-dpdk-bridge', required: true),

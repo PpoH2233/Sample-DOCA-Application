@@ -1,0 +1,6 @@
+option(
+  'vf_scope',
+  type: 'string',
+  value: 'all',
+  description: 'Default VF indexes opened and probed: all or e.g. 0-6,10-20',
+)

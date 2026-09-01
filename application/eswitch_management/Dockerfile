@@ -2,6 +2,7 @@ ARG DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0
 ARG DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0
 
 FROM ${DOCA_DEVEL_IMAGE} AS builder
+ARG VF_SCOPE=all
 
 WORKDIR /workspace
 COPY . /workspace
@@ -15,6 +16,7 @@ RUN pkg-config --modversion doca-common \
  && meson setup /build application/eswitch_management \
       --buildtype=release \
       --prefix=/usr/local \
+      -Dvf_scope="${VF_SCOPE}" \
  && meson compile -C /build \
  && DESTDIR=/stage meson install --strip -C /build
 

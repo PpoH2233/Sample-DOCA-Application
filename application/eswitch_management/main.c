@@ -13,6 +13,7 @@
 #include "../ethernet_switch/switch_devices.h"
 #include "control_server.h"
 #include "eswitch_config.h"
+#include "eswitch_build_config.h"
 #include "eswitch_manager.h"
 #include "eswitch_pipeline.h"
 
@@ -62,6 +63,7 @@ int main(int argc, char **argv) {
   struct control_server control = {.listen_fd = -1, .client_fd = -1};
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
   const char *state_path = getenv("ESWITCH_STATE_FILE");
+  const char *vf_scope = getenv("ESWITCH_VF_SCOPE");
   doca_error_t result;
   int separator;
   int exit_status = EXIT_FAILURE;
@@ -76,6 +78,8 @@ int main(int argc, char **argv) {
     socket_path = ESWITCH_SOCKET_PATH;
   if (state_path == NULL || *state_path == '\0')
     state_path = ESWITCH_STATE_PATH;
+  if (vf_scope == NULL || *vf_scope == '\0')
+    vf_scope = ESWITCH_DEFAULT_VF_SCOPE;
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -85,11 +89,14 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     return EXIT_FAILURE;
   }
-  result = switch_devices_open(argv[separator + 1], SWITCH_DPDK_DEVARGS,
-                               &devices);
+  printf("VF probe scope: %s\n", vf_scope);
+  result = switch_devices_open_scoped(argv[separator + 1],
+                                      SWITCH_DPDK_DEVARGS, vf_scope,
+                                      &devices);
   if (result != DOCA_SUCCESS) {
-    fprintf(stderr, "Failed to open/probe eSwitch endpoints: %s\n",
-            doca_error_get_descr(result));
+    fprintf(stderr,
+            "Failed to open/probe eSwitch endpoints with VF scope '%s': %s\n",
+            vf_scope, doca_error_get_descr(result));
     goto cleanup_runtime;
   }
   print_inventory(&devices.ethernet_ports);
