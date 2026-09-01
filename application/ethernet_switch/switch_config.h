@@ -19,6 +19,12 @@
 #define SWITCH_MAX_FDB_ENTRIES 1024
 #define SWITCH_FDB_AGING_SECONDS 300
 #define SWITCH_AGING_SCAN_SECONDS 1
+/* If a hardware counter stays busy, allow this extra idle interval before
+ * trying to retire the software FDB entry. A removed active entry is safe but
+ * causes one relearn, so prefer waiting over deleting on the first query
+ * failure. */
+#define SWITCH_FDB_QUERY_FAILURE_GRACE_SECONDS 30
+#define SWITCH_FDB_RETRY_MAX_SECONDS 30
 #define SWITCH_FLOW_TIMEOUT_US 1000000
 #define SWITCH_ACTIONS_MEM_SIZE (64U * 1024U)
 #define SWITCH_FLOW_COUNTER_COUNT (SWITCH_MAX_FDB_ENTRIES + 64U)

@@ -5,10 +5,68 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "../ethernet_switch/switch_config.h"
+
+#define NSEC_PER_SEC UINT64_C(1000000000)
 
 static bool mac_equal(const struct rte_ether_addr *left,
                       const struct rte_ether_addr *right) {
   return rte_is_same_ether_addr(left, right) != 0;
+}
+
+static uint64_t monotonic_ns(void) {
+  struct timespec now;
+
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    return 0;
+  return (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec;
+}
+
+static const char *entry_state_name(enum eswitch_fdb_entry_state state) {
+  switch (state) {
+  case ESWITCH_FDB_ENTRY_ACTIVE:
+    return "ACTIVE";
+  case ESWITCH_FDB_ENTRY_QUERY_RETRY:
+    return "QUERY_RETRY";
+  case ESWITCH_FDB_ENTRY_DELETE_PENDING:
+    return "DELETE_PENDING";
+  }
+  return "UNKNOWN";
+}
+
+static uint64_t retry_delay_ns(uint32_t retries) {
+  uint32_t seconds;
+
+  if (retries == 0)
+    return 0;
+  seconds = retries >= 6 ? SWITCH_FDB_RETRY_MAX_SECONDS
+                         : (UINT32_C(1) << (retries - 1));
+  if (seconds > SWITCH_FDB_RETRY_MAX_SECONDS)
+    seconds = SWITCH_FDB_RETRY_MAX_SECONDS;
+  return (uint64_t)seconds * NSEC_PER_SEC;
+}
+
+/* Log the first failures and then exponentially less often. The retry itself
+ * still follows next_retry_ns; this only controls stderr volume. */
+static bool should_log_retry(uint32_t retries) {
+  return retries <= 3 || (retries & (retries - 1)) == 0;
+}
+
+static void log_retry(const char *operation,
+                      const struct eswitch_fdb_entry *entry,
+                      doca_error_t error, uint32_t retries) {
+  const uint8_t *mac = entry->mac.addr_bytes;
+
+  if (!should_log_retry(retries))
+    return;
+  fprintf(stderr,
+          "FDB RETRY: operation=%s vs=%u "
+          "mac=%02x:%02x:%02x:%02x:%02x:%02x port=%u error=%s retry=%u\n",
+          operation, entry->vswitch_id, mac[0], mac[1], mac[2], mac[3],
+          mac[4], mac[5], entry->learned_port_id,
+          doca_error_get_descr(error), retries);
 }
 
 static struct eswitch_fdb_entry *find_entry(
@@ -76,6 +134,7 @@ doca_error_t eswitch_fdb_learn(struct eswitch_fdb *fdb,
     rte_ether_addr_copy(source, &entry->mac);
     entry->learned_port_id = ingress_port_id;
     entry->last_seen_ns = now_ns;
+    entry->state = ESWITCH_FDB_ENTRY_ACTIVE;
     result = eswitch_pipeline_fdb_add(fdb->pipeline, vswitch_id, source,
                                       ingress_port_id, &entry->hardware);
     if (result != DOCA_SUCCESS) {
@@ -173,14 +232,54 @@ doca_error_t eswitch_fdb_age(struct eswitch_fdb *fdb, uint64_t now_ns) {
   while (*cursor != NULL) {
     struct eswitch_fdb_entry *entry = *cursor;
     uint64_t packets = 0;
-    doca_error_t result = eswitch_pipeline_fdb_query(&entry->hardware,
-                                                     &packets);
-    if (result != DOCA_SUCCESS) {
-      if (first_error == DOCA_SUCCESS)
+    doca_error_t result;
+
+    if (entry->next_retry_ns != 0 && now_ns < entry->next_retry_ns) {
+      cursor = &entry->next;
+      continue;
+    }
+
+    if (entry->state == ESWITCH_FDB_ENTRY_DELETE_PENDING) {
+      result = remove_at(fdb, cursor, "aged-retry");
+      if (result == DOCA_SUCCESS)
+        continue;
+      entry->delete_retries++;
+      entry->next_retry_ns = now_ns + retry_delay_ns(entry->delete_retries);
+      log_retry("remove", entry, result, entry->delete_retries);
+      if (result != DOCA_ERROR_IN_USE && first_error == DOCA_SUCCESS)
         first_error = result;
       cursor = &entry->next;
       continue;
     }
+
+    result = eswitch_pipeline_fdb_query(&entry->hardware, &packets);
+    if (result != DOCA_SUCCESS) {
+      uint64_t failure_grace_ns =
+          (uint64_t)SWITCH_FDB_QUERY_FAILURE_GRACE_SECONDS * NSEC_PER_SEC;
+
+      entry->state = ESWITCH_FDB_ENTRY_QUERY_RETRY;
+      entry->query_retries++;
+      entry->next_retry_ns = now_ns + retry_delay_ns(entry->query_retries);
+      log_retry("query", entry, result, entry->query_retries);
+
+      /* A permanently busy counter must not pin an entry forever. Wait for
+       * the normal aging interval plus a safety grace, then retire it. If it
+       * was still active, its next packet simply takes the learning path. */
+      if (now_ns - entry->last_seen_ns >= fdb->aging_ns + failure_grace_ns) {
+        entry->state = ESWITCH_FDB_ENTRY_DELETE_PENDING;
+        entry->next_retry_ns = now_ns;
+        fprintf(stderr,
+                "FDB DELETE PENDING: vs=%u port=%u reason=query-unavailable\n",
+                entry->vswitch_id, entry->learned_port_id);
+      }
+      if (result != DOCA_ERROR_IN_USE && first_error == DOCA_SUCCESS)
+        first_error = result;
+      cursor = &entry->next;
+      continue;
+    }
+    entry->state = ESWITCH_FDB_ENTRY_ACTIVE;
+    entry->query_retries = 0;
+    entry->next_retry_ns = 0;
     if (packets != entry->last_source_packets) {
       entry->last_source_packets = packets;
       entry->last_seen_ns = now_ns;
@@ -193,7 +292,11 @@ doca_error_t eswitch_fdb_age(struct eswitch_fdb *fdb, uint64_t now_ns) {
     }
     result = remove_at(fdb, cursor, "aged");
     if (result != DOCA_SUCCESS) {
-      if (first_error == DOCA_SUCCESS)
+      entry->state = ESWITCH_FDB_ENTRY_DELETE_PENDING;
+      entry->delete_retries++;
+      entry->next_retry_ns = now_ns + retry_delay_ns(entry->delete_retries);
+      log_retry("remove", entry, result, entry->delete_retries);
+      if (result != DOCA_ERROR_IN_USE && first_error == DOCA_SUCCESS)
         first_error = result;
       cursor = &entry->next;
     }
@@ -269,6 +372,7 @@ size_t eswitch_fdb_format(const struct eswitch_fdb *fdb,
                           size_t buffer_size) {
   size_t used = 0;
   size_t shown = 0;
+  uint64_t now_ns = monotonic_ns();
 
   if (fdb == NULL || buffer == NULL || buffer_size == 0)
     return 0;
@@ -283,9 +387,14 @@ size_t eswitch_fdb_format(const struct eswitch_fdb *fdb,
     used = append_text(
         buffer, buffer_size, used,
         "vs=%u mac=%02x:%02x:%02x:%02x:%02x:%02x port=%u packets=%" PRIu64
-        "\n",
+        " age=%" PRIu64 "s state=%s query-retries=%u delete-retries=%u\n",
         entry->vswitch_id, m[0], m[1], m[2], m[3], m[4], m[5],
-        entry->learned_port_id, entry->last_source_packets);
+        entry->learned_port_id, entry->last_source_packets,
+        now_ns >= entry->last_seen_ns
+            ? (now_ns - entry->last_seen_ns) / NSEC_PER_SEC
+            : 0,
+        entry_state_name(entry->state), entry->query_retries,
+        entry->delete_retries);
     shown++;
   }
   if (shown == 0)

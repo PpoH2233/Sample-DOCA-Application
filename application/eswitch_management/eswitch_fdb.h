@@ -9,6 +9,12 @@
 
 #include "eswitch_pipeline.h"
 
+enum eswitch_fdb_entry_state {
+  ESWITCH_FDB_ENTRY_ACTIVE,
+  ESWITCH_FDB_ENTRY_QUERY_RETRY,
+  ESWITCH_FDB_ENTRY_DELETE_PENDING,
+};
+
 struct eswitch_fdb_entry {
   uint16_t vswitch_id;
   uint16_t vlan_id;
@@ -16,6 +22,10 @@ struct eswitch_fdb_entry {
   uint16_t learned_port_id;
   uint64_t last_seen_ns;
   uint64_t last_source_packets;
+  uint64_t next_retry_ns;
+  uint32_t query_retries;
+  uint32_t delete_retries;
+  enum eswitch_fdb_entry_state state;
   struct eswitch_hw_fdb_entry hardware;
   struct eswitch_fdb_entry *next;
 };
