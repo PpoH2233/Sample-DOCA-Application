@@ -154,8 +154,7 @@ The base images can be changed without editing the Dockerfile:
 
 ```bash
 sudo docker build \
-  --build-arg DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0 \
-  --build-arg DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0 \
+  --build-arg VF_SCOPE='0-6,10-20'
   -f application/eswitch_management/Dockerfile \
   -t eswitch-management:3.4.0 .
 ```
