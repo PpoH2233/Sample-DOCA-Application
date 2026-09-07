@@ -22,6 +22,10 @@ struct flow_entry_cookie {
 
 doca_error_t flow_runtime_init(struct flow_runtime *runtime,
                                uint32_t counter_count);
+/* Explicit mode opt-in; existing switch applications keep their default. */
+doca_error_t flow_runtime_init_with_mode(struct flow_runtime *runtime,
+                                        uint32_t counter_count,
+                                        const char *mode);
 doca_error_t flow_runtime_destroy(struct flow_runtime *runtime);
 
 void flow_entry_cookie_prepare(struct flow_entry_cookie *cookie,

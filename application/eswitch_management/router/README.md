@@ -18,10 +18,20 @@ copies; learning does not disable the responder. Source copies are never TXed.
 
 The Arm handler validates Ethernet/IPv4 ARP request fields and source MAC
 consistency, selects the RIF by ingress vSwitch and exact target IP, and builds
-a 60-byte padded response. Each reply uses a fresh mbuf. In non-expert switch
-mode TX metadata contains only the target DPDK port ID; parent TX sends the
-reply directly to that port, bypassing L2 split horizon. A successful TX owns
-the mbuf; failed TX frees it without blocking/retrying in the manager loop.
+a 60-byte padded response. Each reply uses a fresh mbuf. Management now opts
+into `switch,hws,expert` (the standalone ethernet_switch app keeps its default).
+Parent TX queue 0 injects the reply with host-order metadata
+`0xa7c00000 | target_dpdk_port_id`. `ESW_CONTROL_TX`, an EGRESS root control
+pipe, matches software origin (`parser_meta.port_id == UINT16_MAX` with an
+explicit mask), ARP EtherType and the exact metadata, then forwards to that
+probed VF using `FWD_PORT`. Flow metadata matches use big-endian values.
+This bypasses the DEFAULT-domain ingress classifier and L2 split horizon.
+There are no TX rules targeting the parent; current VS ownership and RIF
+configuration are checked by the Arm handler before generating a reply.
+Other software TX hits a counted DROP rule; hardware traffic retains the
+EGRESS domain's default forwarding behavior. All TX rules must commit before
+the daemon serves commands. A successful TX enqueue transfers mbuf ownership;
+failed TX frees it without blocking/retrying in the manager loop.
 Replies are bounded to 100 attempts/second globally; status exposes reply,
 TX-drop and rate-drop counters. This bounds reply work, not incoming ARP RSS
 load. Hardware policing is not part of this milestone.
@@ -39,12 +49,31 @@ arping -I <vm-interface> -c 3 192.168.0.1
 ```
 
 Expected for VR 101: replies advertise `02:00:00:65:00:01`. Repeat after the
-source is learned; replies must continue. Daemon logs `ARP REPLY: vs=100 ...`
-and `eswitchctl status` increments `arp_replies`. Capture on the VM to confirm
-the frame actually arrives; TX acceptance alone is not delivery proof.
+source is learned; replies must continue. Daemon logs `ARP TX ENQUEUED: vs=100 ...`
+and `eswitchctl status` increments `arp_tx_enqueued`. Status also exposes
+`control_tx port=<DPDK-ID> hw_packets=N` and `control_tx_invalid hw_packets=N`.
+For the current port-2 VM, the port-2 counter must increase and invalid must
+remain zero. Counter query failures are shown as errors, never as zero packets.
+Capture on the VM to confirm delivery; neither TX acceptance nor a forwarding
+rule hit alone proves receipt by the guest:
+
+```sh
+sudo tcpdump -eni ens6 -nn arp
+sudo arping -I ens6 -c 3 192.168.0.1
+ip neigh show dev ens6
+```
+
+If enqueued increases but no TX hardware counter changes, check parent TX and
+metadata/EGRESS entry installation. If invalid increases, inspect the injection
+tag, protocol and port mapping. If the correct forwarding counter increases
+without guest replies, investigate the VF/host/VM receive path next.
 `ping` can populate the neighbor cache but will not receive ICMP Echo Reply yet.
 Also test ordinary ARP between two VMs to verify L2 behavior remains intact,
-and remove the gateway IP to confirm the responder stops.
+and remove the gateway IP to confirm the responder stops. Also test another
+test VF and a different VS to verify replies do not leak. Hardware acceptance
+requires testing on the DPU: portable ARP/router tests do not exercise these
+Flow rules. Keep the production daemon stopped while the test owns the PF;
+different sockets do not isolate eSwitch ownership.
 
 ## Layout
 

@@ -107,7 +107,8 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_devices;
   }
-  result = flow_runtime_init(&runtime, SWITCH_FLOW_COUNTER_COUNT);
+  result = flow_runtime_init_with_mode(&runtime, SWITCH_FLOW_COUNTER_COUNT,
+                                       "switch,hws,expert");
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize DOCA Flow: %s\n",
             doca_error_get_descr(result));

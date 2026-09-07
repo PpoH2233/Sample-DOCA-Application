@@ -375,6 +375,80 @@ static doca_error_t create_ingress_classifier(
                                          : DOCA_SUCCESS;
 }
 
+/* Expert-mode software TX enters EGRESS, not the DEFAULT L2 root. Match
+ * software origin explicitly so RX metadata can never select this path.
+ * One rule per probed VF is sufficient: the manager validates current VS/RIF
+ * ownership before constructing a reply. No rule may target the parent.
+ * Non-software traffic retains the domain's default wire/representor path. */
+static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_monitor monitor = {0};
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_fwd fwd = {0};
+  doca_error_t result;
+
+  pipeline->control_tx_rules = calloc(pipeline->ports->count,
+                                       sizeof(*pipeline->control_tx_rules));
+  if (pipeline->control_tx_rules == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_CONTROL_TX", DOCA_FLOW_PIPE_CONTROL,
+                             true, pipeline->ports->count + 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL, &pipeline->control_tx_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+  match.parser_meta.port_id = UINT16_MAX; /* software TX, not any-port */
+  mask.parser_meta.port_id = UINT16_MAX;
+  match.outer.eth.type = DOCA_HTOBE16(0x0806);
+  mask.outer.eth.type = UINT16_MAX;
+  mask.meta.pkt_meta = UINT32_MAX;
+  fwd.type = DOCA_FLOW_FWD_PORT;
+  for (uint16_t i = 0; i < pipeline->ports->count; i++) {
+    const struct ethernet_port *port = pipeline->ports->items[i].ethernet;
+    struct eswitch_rule *rule = &pipeline->control_tx_rules[i];
+    if (port->role != ETHERNET_PORT_ROLE_REPRESENTOR)
+      continue;
+    match.meta.pkt_meta = DOCA_HTOBE32(eswitch_control_tx_metadata(port->port_id));
+    fwd.port_id = port->port_id;
+    flow_entry_cookie_prepare(&rule->cookie, "control TX to VF",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, pipeline->control_tx_pipe,
+        &match, &mask, NULL, NULL, NULL, NULL, &monitor, 0, &fwd,
+        &rule->cookie, &rule->entry);
+    if (result != DOCA_SUCCESS)
+      return result;
+    result = process_rules(pipeline, rule, 1);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+
+  /* Fail closed for untagged TX, unknown ports, and unsupported protocols. */
+  memset(&match, 0, sizeof(match));
+  memset(&mask, 0, sizeof(mask));
+  memset(&fwd, 0, sizeof(fwd));
+  match.parser_meta.port_id = UINT16_MAX;
+  mask.parser_meta.port_id = UINT16_MAX;
+  fwd.type = DOCA_FLOW_FWD_DROP;
+  flow_entry_cookie_prepare(&pipeline->control_tx_drop.cookie,
+                            "invalid control TX", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->control_tx_pipe,
+      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 1, &fwd,
+      &pipeline->control_tx_drop.cookie, &pipeline->control_tx_drop.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &pipeline->control_tx_drop, 1);
+}
+
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      struct eswitch_pipeline *pipeline) {
@@ -399,6 +473,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   } while (0)
 
   CREATE_STAGE("RSS slow path", create_rss_pipe(pipeline));
+  CREATE_STAGE("control TX egress", create_control_tx(pipeline));
   CREATE_STAGE("flood selector", create_flood_selector(pipeline));
   CREATE_STAGE("destination FDB", create_destination_pipe(pipeline));
   CREATE_STAGE("learning clone", create_learning_clone(pipeline));
@@ -418,6 +493,9 @@ fail:
 void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
   if (pipeline == NULL)
     return;
+  if (pipeline->control_tx_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->control_tx_pipe);
+  free(pipeline->control_tx_rules);
   if (pipeline->ingress_classifier_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
   if (pipeline->arp_dispatch_pipe != NULL)

@@ -320,15 +320,14 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
   void *data = rte_pktmbuf_append(reply, sizeof(response));
   if (!data) {rte_pktmbuf_free(reply); manager->arp_tx_drops++; return;}
   memcpy(data, response, sizeof(response));
-  /* DOCA switch,hws without expert: TX metadata is the destination port,
-   * NOT the RX (vSwitch << 16 | ingress) metadata. See flow_switch_to_wire.
-   * The internal TX steering bypasses the L2 ingress==egress gate. */
-  rte_flow_dynf_metadata_set(reply, ingress);
+  /* Fresh padded Ethernet/ARP frame; expert EGRESS rule selects the VF.
+   * Never reuse RX metadata or re-enter the L2 split-horizon path. */
+  rte_flow_dynf_metadata_set(reply, eswitch_control_tx_metadata(ingress));
   reply->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
-  if (rte_eth_tx_burst(manager->io->parent_port_id, SWITCH_RX_QUEUE_ID,
+  if (rte_eth_tx_burst(manager->io->parent_port_id, SWITCH_TX_QUEUE_ID,
                        &reply, 1) == 1) {
     manager->arp_replies++;
-    printf("ARP REPLY: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
+    printf("ARP TX ENQUEUED: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
            response[28], response[29], response[30], response[31]);
   } else {
     manager->arp_tx_drops++;
@@ -507,9 +506,30 @@ static size_t format_status(const struct eswitch_manager *manager,
                      "routers=%zu router_dataplane=NOT_IMPLEMENTED\n",
                      manager->router ? manager->router->vr_count : 0);
   used = append_text(response, size, used,
-      "private_gateway_arp=enabled arp_replies=%" PRIu64
+      "private_gateway_arp=enabled arp_tx_enqueued=%" PRIu64
       " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",
       manager->arp_replies, manager->arp_tx_drops, manager->arp_rate_drops);
+  for (uint16_t i = 0; i <= manager->ports->count; i++) {
+    bool drop = i == manager->ports->count;
+    const struct eswitch_rule *rule = drop
+        ? &manager->pipeline->control_tx_drop
+        : &manager->pipeline->control_tx_rules[i];
+    struct doca_flow_resource_query query = {0};
+    if (rule->entry == NULL)
+      continue;
+    doca_error_t result = doca_flow_resource_query_entry(rule->entry, &query);
+    if (drop)
+      used = append_text(response, size, used, "control_tx_invalid");
+    else
+      used = append_text(response, size, used, "control_tx port=%u",
+                          manager->ports->items[i].ethernet->port_id);
+    if (result == DOCA_SUCCESS)
+      used = append_text(response, size, used, " hw_packets=%" PRIu64 "\n",
+                          query.counter.total_pkts);
+    else
+      used = append_text(response, size, used, " query_error=%s\n",
+                          doca_error_get_descr(result));
+  }
   return used;
 }
 

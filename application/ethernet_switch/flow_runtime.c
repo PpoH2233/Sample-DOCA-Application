@@ -38,11 +38,17 @@ void flow_entry_cookie_prepare(struct flow_entry_cookie *cookie,
 
 doca_error_t flow_runtime_init(struct flow_runtime *runtime,
                                uint32_t counter_count) {
+  return flow_runtime_init_with_mode(runtime, counter_count, SWITCH_FLOW_MODE_ARGS);
+}
+
+doca_error_t flow_runtime_init_with_mode(struct flow_runtime *runtime,
+                                        uint32_t counter_count,
+                                        const char *mode) {
   struct doca_flow_cfg *cfg = NULL;
   doca_error_t result;
   doca_error_t destroy_result;
 
-  if (runtime == NULL || counter_count == 0)
+  if (runtime == NULL || counter_count == 0 || mode == NULL)
     return DOCA_ERROR_INVALID_VALUE;
   if (runtime->initialized)
     return DOCA_ERROR_BAD_STATE;
@@ -54,7 +60,7 @@ doca_error_t flow_runtime_init(struct flow_runtime *runtime,
   result = doca_flow_cfg_set_pipe_queues(cfg, 1);
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
-  result = doca_flow_cfg_set_mode_args(cfg, SWITCH_FLOW_MODE_ARGS);
+  result = doca_flow_cfg_set_mode_args(cfg, mode);
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
   /*
