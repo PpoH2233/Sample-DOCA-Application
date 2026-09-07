@@ -260,3 +260,10 @@ eswitchctl vs-port-detach --port 1 --id 100
   identity; DPDK port IDs are never persisted.
 - Learned FDB entries remain runtime-only and are relearned after restart.
 - The current data plane supports one untagged bridge domain per vSwitch.
+# Router command group
+
+See [router/README.md](router/README.md) for `eswitchctl vr` commands.
+These stage configuration; router forwarding is not implemented yet.
+Existing L2 commands below retain their syntax. A port reserved by a VR cannot
+be attached to a vSwitch, and a router-linked vSwitch cannot be deleted until
+its logical interface is detached.

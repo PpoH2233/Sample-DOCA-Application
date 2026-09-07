@@ -7,7 +7,7 @@
 #include <doca_error.h>
 #include <rte_ether.h>
 
-#include "eswitch_pipeline.h"
+#include "../pipeline/eswitch_pipeline.h"
 
 enum eswitch_fdb_entry_state {
   ESWITCH_FDB_ENTRY_ACTIVE,

@@ -7,7 +7,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "../ethernet_switch/switch_config.h"
+#include "../../ethernet_switch/switch_config.h"
 
 #define NSEC_PER_SEC UINT64_C(1000000000)
 

@@ -7,3 +7,6 @@ DEVICE_PCI="03:00.0"
 # Persistent desired state. systemd creates the parent directory through
 # StateDirectory=eswitch-management before starting the daemon.
 ESWITCH_STATE_FILE="/var/lib/eswitch-management/eswitch.conf"
+
+# VF indexes, not DPDK port IDs. Limit this integration test to VF 11-15.
+ESWITCH_VF_SCOPE="11-15"

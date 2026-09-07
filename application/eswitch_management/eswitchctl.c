@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "eswitch_config.h"
+#include "router/router.h"
 
 static void print_help(FILE *output, const char *program) {
   fprintf(output,
@@ -22,6 +23,17 @@ static void print_help(FILE *output, const char *program) {
           "  vs-list                             List virtual switches\n"
           "  show-fdb [--id <id>]                Show all or one FDB\n"
           "  list-port-available                 List unassigned DPDK ports\n"
+          "  vr create|delete|show --id <id>     Manage logical routers\n"
+          "  vr show-interface --id <id>        Show named RIFs and readiness\n"
+          "  vr port-attach --id <id> --port <p> --name <name>\n"
+          "  vr switch-attach --id <id> --switch-id <vs> --name <name>\n"
+          "  vr port-detach|switch-detach --id <id> --interface <name>\n"
+          "  vr ip add|del --id <id> --interface <name> --address <ip/prefix>\n"
+          "  vr interface set --id <id> --interface <name> --mac <mac>\n"
+          "  vr route add --id <id> --prefix <cidr> --via <ip> --interface <name>\n"
+          "  vr route del --id <id> --prefix <cidr>\n"
+          "  vr route show --id <id>\n"
+          "  VR commands stage configuration; router dataplane is not yet implemented.\n"
           "  --help, -h                          Show this help\n\n"
           "Control socket: %s\n"
           "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",
@@ -111,7 +123,7 @@ int main(int argc, char **argv) {
     print_help(stdout, argv[0]);
     return EXIT_SUCCESS;
   }
-  if (!valid_command_line(argc, argv)) {
+  if (strcmp(argv[1], "vr") != 0 && !valid_command_line(argc, argv)) {
     fprintf(stderr, "Invalid command or arguments.\n\n");
     print_help(stderr, argv[0]);
     return EXIT_FAILURE;
@@ -134,6 +146,14 @@ int main(int argc, char **argv) {
   }
   request[used++] = '\n';
   request[used] = '\0';
+
+  if (strcmp(argv[1], "vr") == 0) {
+    char error[256];
+    if (!router_command_valid(request, error, sizeof(error))) {
+      fprintf(stderr, "%s", error);
+      return EXIT_FAILURE;
+    }
+  }
 
   fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {

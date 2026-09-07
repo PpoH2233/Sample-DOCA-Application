@@ -33,11 +33,15 @@ executable(
   'eswitch-management',
   [
     'main.c',
-    'control_server.c',
+    'control/control_server.c',
     'eswitch_manager.c',
     'eswitch_state.c',
-    'eswitch_pipeline.c',
-    'eswitch_fdb.c',
+    'pipeline/eswitch_pipeline.c',
+    'l2/eswitch_fdb.c',
+    'l2/l2_switch.c',
+    'router/router.c',
+    'router/router_state.c',
+    'router/router_control.c',
     '../ethernet_switch/switch_devices.c',
     '../ethernet_switch/dpdk_io.c',
     '../ethernet_switch/flow_runtime.c',
@@ -54,7 +58,7 @@ executable(
 
 executable(
   'eswitchctl',
-  'eswitchctl.c',
+  ['eswitchctl.c', 'router/router.c'],
   include_directories: include_dirs,
   install: true,
 )
@@ -69,3 +73,11 @@ state_test = executable(
 )
 
 test('eswitch-state', state_test)
+
+router_test = executable(
+  'eswitch-router-test',
+  ['router/router_test.c', 'router/router.c', 'router/router_state.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router', router_test)

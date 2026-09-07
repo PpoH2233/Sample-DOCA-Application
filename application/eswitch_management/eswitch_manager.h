@@ -10,7 +10,8 @@
 
 #include "../ethernet_switch/dpdk_io.h"
 #include "eswitch_config.h"
-#include "eswitch_fdb.h"
+#include "l2/eswitch_fdb.h"
+#include "router/router.h"
 
 struct managed_vswitch {
   bool exists;
@@ -23,6 +24,7 @@ struct eswitch_manager {
   struct switch_flow_ports *ports;
   struct eswitch_pipeline *pipeline;
   struct eswitch_fdb fdb;
+  struct router_config *router;
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];
   uint16_t *port_owner; /* indexed like ports->items; 0 means available */
   uint64_t started_ns;

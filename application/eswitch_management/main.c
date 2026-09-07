@@ -11,11 +11,11 @@
 #include "../ethernet_switch/flow_runtime.h"
 #include "../ethernet_switch/switch_config.h"
 #include "../ethernet_switch/switch_devices.h"
-#include "control_server.h"
+#include "control/control_server.h"
 #include "eswitch_config.h"
 #include "eswitch_build_config.h"
 #include "eswitch_manager.h"
-#include "eswitch_pipeline.h"
+#include "pipeline/eswitch_pipeline.h"
 
 static volatile sig_atomic_t stop_requested;
 

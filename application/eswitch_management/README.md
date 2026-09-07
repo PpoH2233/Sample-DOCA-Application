@@ -1,5 +1,13 @@
 # eSwitch Management
 
+Router integration is in progress: [router/README.md](router/README.md) records
+implemented control commands, readiness, SDK prerequisites, and the VF 11–15
+test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
+`pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
+Router commands currently stage persistent desired configuration only;
+ARP/LPM/CT/NAT forwarding is **not implemented** and is never reported READY.
+The default VF scope is now `11-15`; explicit settings override that default.
+
 `eswitch-management` is the single owner of the BlueField eSwitch, DOCA Flow
 runtime, parent device and all VF representors. `eswitchctl` sends local control
 commands over `/run/eswitch-management/control.sock`; it never initializes

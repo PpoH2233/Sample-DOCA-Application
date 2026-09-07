@@ -1,0 +1,119 @@
+# Router implementation status
+
+This change introduces the control-plane foundation. It does **not** implement
+router packet forwarding. Interfaces with IPs report `PENDING_DATAPLANE`, and
+daemon status reports `router_dataplane=NOT_IMPLEMENTED`. Public ports are
+reserved but remain root-miss DROP. Private L2 forwarding remains active.
+No API stub returns a fabricated hardware success.
+
+## Layout
+
+```text
+eswitch_management/
+  main.c / eswitch_manager.c   runtime, command dispatch, persistence coordination
+  control/                    existing Unix socket transport
+  l2/                         vSwitch membership and MAC learning/FDB
+  pipeline/                   shared DOCA root, L2 pipes, RSS, flooding and gates
+  router/
+    router.c / router.h       SDK-independent model, validation, CLI parser
+    router_control.c          inventory/ownership integration and transactions
+    router_state.c            versioned persistent desired configuration
+    router_test.c             model/isolation/persistence tests
+```
+
+## Commands implemented
+
+Use actual DPDK IDs from `list-port-available`; VF 11 is **not necessarily** DPDK
+port 11. Choose a public port whose inventory says VF 11–15. Parent is rejected
+as a VR uplink because this topology requires a host VF.
+
+```sh
+eswitchctl vr create --id 100
+eswitchctl vr port-attach --id 100 --port <actual-public-dpdk-id> --name p1
+eswitchctl vr switch-attach --id 100 --switch-id 200 --name p2
+eswitchctl vr interface set --id 100 --interface p1 --mac <public-vf-mac>
+eswitchctl vr ip add --id 100 --interface p2 --address 192.168.0.1/24
+eswitchctl vr ip add --id 100 --interface p1 --address 200.20.0.4/16
+eswitchctl vr route add --id 100 --prefix 0.0.0.0/0 --via 200.20.0.1 --interface p1
+eswitchctl vr show-interface --id 100
+eswitchctl vr route show --id 100
+
+eswitchctl vr route del --id 100 --prefix 0.0.0.0/0
+eswitchctl vr ip del --id 100 --interface p1 --address 200.20.0.4/16
+eswitchctl vr port-detach --id 100 --interface p1
+eswitchctl vr ip del --id 100 --interface p2 --address 192.168.0.1/24
+eswitchctl vr switch-detach --id 100 --interface p2
+eswitchctl vr delete --id 100
+```
+
+vSwitch 200 must already exist. An interface name is scoped to its VR; numeric
+interface IDs are stable and not reused during a configuration's lifetime.
+One public uplink per VR, one router attachment per vSwitch, one IPv4 address
+per interface. Connected routes are derived from addresses. Static routes
+require an on-link next hop. Overlapping interface subnets inside one VR are
+rejected; identical subnets in different VRs are permitted.
+
+The generated RIF MAC is a locally administered placeholder; configure the
+public VF's accepted MAC before enabling a future dataplane. NAT and admin-up
+commands are explicitly rejected until that backend exists.
+
+## Persistence and ownership
+
+Router state is stored alongside the existing L2 state as
+`${ESWITCH_STATE_FILE}.router`. Files use temporary creation, file fsync,
+rename, and directory fsync. Configuration is validated on a candidate and
+published only after persistence succeeds. State uses host/PF/VF identity,
+not runtime DPDK IDs. On startup L2 restores first; router restore then rejects
+missing, out-of-scope or L2-owned public ports and missing vSwitches.
+
+IP removal is blocked by dependent static routes; detach is blocked until IP
+and route dependencies are removed; VR deletion requires no interfaces.
+Deleting a vSwitch still attached to a VR is rejected. Public reservations
+are included in daemon status and excluded from available-port output.
+
+## DOCA 3.4 backend work remaining
+
+The local sample bundle identifies itself as `3.4.0012`. The existing Dockerfile
+targets DOCA `devel-3.4.0` / `full-rt-3.4.0`. SDK headers were not found in this
+Mac workspace or `/opt/mellanox`, and Docker daemon was unavailable during
+implementation. No DPU build or packet test has been performed.
+
+Remaining integration must use the installed 3.4 headers and these sample
+families in `doca-samples/samples/doca_flow/`:
+
+- `flow_lpm` / `flow_lpm_em`: non-root hardware route lookup.
+- `flow_ct_tcp_actions` and CT common code: directional NAT, lifetime, callbacks.
+- `applications/psp_gateway` in the sample bundle: Arm ARP and reinjection.
+
+Required work: reserved gateway dispatch, typed Arm RSS reasons, ARP responder,
+RIF-scoped neighbors, LPM/adjacency programming, trusted control TX, CT/NAT
+initialization and per-VR zones, route invalidation, first-packet handling,
+checksum/TTL/MTU exception paths, and durable config/hardware rollback.
+Do not treat this control-only milestone as the completed router implementation.
+
+## Verification and VF 11–15 build handoff
+
+Portable model tests run without DOCA. Example from this directory's parent:
+
+```sh
+clang -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  router/router_test.c router/router.c router/router_state.c \
+  -o /tmp/eswitch-router-test
+/tmp/eswitch-router-test
+```
+
+In the DOCA 3.4 environment (user-run):
+
+```sh
+meson setup /tmp/eswitch-management-build application/eswitch_management -Dvf_scope=11-15
+meson compile -C /tmp/eswitch-management-build
+meson test -C /tmp/eswitch-management-build --print-errorlogs
+```
+
+The Meson command above runs from `Sample-DOCA-Application`. For container
+builds, use that directory as context and `--build-arg VF_SCOPE=11-15`.
+For runtime set `ESWITCH_VF_SCOPE=11-15` explicitly. Existing build trees retain
+their old option: reconfigure before testing. Check inventory identifies only
+VF indexes 11–15 plus the parent needed by the shared manager. Never infer VF
+index from a DPDK port ID. Use a separate test state/socket path so unrelated
+saved memberships are not replayed. No hardware test was run by this change.

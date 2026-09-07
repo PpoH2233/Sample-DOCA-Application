@@ -9,8 +9,8 @@
 #include <doca_flow.h>
 #include <rte_ether.h>
 
-#include "../ethernet_switch/flow_ports.h"
-#include "../ethernet_switch/flow_runtime.h"
+#include "../../ethernet_switch/flow_ports.h"
+#include "../../ethernet_switch/flow_runtime.h"
 
 struct eswitch_rule {
   struct doca_flow_pipe_entry *entry;

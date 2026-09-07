@@ -6,8 +6,8 @@
 
 #include <doca_bitfield.h>
 
-#include "../ethernet_switch/switch_config.h"
-#include "eswitch_config.h"
+#include "../../ethernet_switch/switch_config.h"
+#include "../eswitch_config.h"
 
 #define ESWITCH_MAX_FLOOD_MEMBERS 254U
 #define ESWITCH_METADATA_VSWITCH_MASK UINT32_C(0xffff0000)
