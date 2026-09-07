@@ -16,6 +16,7 @@
 #include "../ethernet_switch/switch_config.h"
 #include "eswitch_state.h"
 #include "router/router_control.h"
+#include "router/router_arp.h"
 #include "l2/l2_switch.h"
 
 static uint64_t monotonic_ns(void) {
@@ -298,6 +299,43 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   return result;
 }
 
+static void reply_gateway_arp(struct eswitch_manager *manager,
+                              struct rte_mbuf *request, uint16_t vs,
+                              uint16_t ingress, uint64_t now_ns) {
+  uint8_t scratch[42], response[60];
+  const uint8_t *bytes = rte_pktmbuf_read(request, 0, sizeof(scratch), scratch);
+  if (!bytes || !router_arp_reply(manager->router, vs, bytes, sizeof(scratch),
+                                   response, sizeof(response))) return;
+  if (now_ns - manager->arp_window_ns >= 1000000000ULL) {
+    manager->arp_window_ns = now_ns;
+    manager->arp_window_replies = 0;
+  }
+  if (manager->arp_window_replies >= 100) {
+    manager->arp_rate_drops++;
+    return;
+  }
+  manager->arp_window_replies++;
+  struct rte_mbuf *reply = rte_pktmbuf_alloc(manager->io->mbuf_pool);
+  if (!reply) {manager->arp_tx_drops++; return;}
+  void *data = rte_pktmbuf_append(reply, sizeof(response));
+  if (!data) {rte_pktmbuf_free(reply); manager->arp_tx_drops++; return;}
+  memcpy(data, response, sizeof(response));
+  /* DOCA switch,hws without expert: TX metadata is the destination port,
+   * NOT the RX (vSwitch << 16 | ingress) metadata. See flow_switch_to_wire.
+   * The internal TX steering bypasses the L2 ingress==egress gate. */
+  rte_flow_dynf_metadata_set(reply, ingress);
+  reply->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+  if (rte_eth_tx_burst(manager->io->parent_port_id, SWITCH_RX_QUEUE_ID,
+                       &reply, 1) == 1) {
+    manager->arp_replies++;
+    printf("ARP REPLY: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
+           response[28], response[29], response[30], response[31]);
+  } else {
+    manager->arp_tx_drops++;
+    rte_pktmbuf_free(reply); /* Only free when ownership was not transferred. */
+  }
+}
+
 static doca_error_t process_packet(struct eswitch_manager *manager,
                                    struct rte_mbuf *packet,
                                    uint64_t now_ns) {
@@ -325,6 +363,16 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
   if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN) ||
       header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_QINQ))
     return DOCA_SUCCESS; /* v1 is one untagged bridge domain per vSwitch. */
+
+  /* Reserve configured RIF MACs against dynamic source learning. */
+  if (manager->router) for (size_t i = 0; i < manager->router->interface_count; i++) {
+    const struct router_interface *rif = &manager->router->interfaces[i];
+    if (rif->attachment == ROUTER_VSWITCH && rif->vswitch_id == vswitch_id &&
+        memcmp(header->src_addr.addr_bytes, rif->mac, 6) == 0)
+      return DOCA_SUCCESS;
+  }
+  if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP))
+    reply_gateway_arp(manager, packet, vswitch_id, port_id, now_ns);
 
   printf("ARM RX: vs=%u port=%u len=%u src=%02x:%02x:%02x:%02x:%02x:%02x "
          "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -458,6 +506,10 @@ static size_t format_status(const struct eswitch_manager *manager,
   used = append_text(response, size, used,
                      "routers=%zu router_dataplane=NOT_IMPLEMENTED\n",
                      manager->router ? manager->router->vr_count : 0);
+  used = append_text(response, size, used,
+      "private_gateway_arp=enabled arp_replies=%" PRIu64
+      " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",
+      manager->arp_replies, manager->arp_tx_drops, manager->arp_rate_drops);
   return used;
 }
 

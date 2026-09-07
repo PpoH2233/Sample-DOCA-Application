@@ -40,6 +40,7 @@ executable(
     'l2/eswitch_fdb.c',
     'l2/l2_switch.c',
     'router/router.c',
+    'router/router_arp.c',
     'router/router_state.c',
     'router/router_control.c',
     '../ethernet_switch/switch_devices.c',
@@ -81,3 +82,11 @@ router_test = executable(
   install: false,
 )
 test('eswitch-router', router_test)
+
+arp_test = executable(
+  'eswitch-router-arp-test',
+  ['router/router_arp_test.c', 'router/router_arp.c', 'router/router.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-arp', arp_test)

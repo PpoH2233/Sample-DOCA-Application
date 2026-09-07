@@ -212,7 +212,8 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           else used=append(out,size,used,"switch=%u ",r->vswitch_id);
           used=append(out,size,used,"mac=%02x:%02x:%02x:%02x:%02x:%02x ",
             r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
-          if(r->has_address) used=append(out,size,used,"address=%s/%u status=PENDING_DATAPLANE\n",iptext(r->address,ip),r->prefix);
+          if(r->has_address) used=append(out,size,used,"address=%s/%u status=PENDING_DATAPLANE arp=%s\n",iptext(r->address,ip),r->prefix,
+            r->attachment==ROUTER_VSWITCH ? "PRIVATE_GATEWAY_ENABLED" : "NOT_IMPLEMENTED");
           else used=append(out,size,used,"address=- status=NO_ADDRESS\n");
         } else if(r->has_address)
           used=append(out,size,used,"connected %s/%u interface=%s\n",iptext(r->address&mask(r->prefix),ip),r->prefix,r->name);

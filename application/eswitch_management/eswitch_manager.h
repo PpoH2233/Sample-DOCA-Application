@@ -25,6 +25,9 @@ struct eswitch_manager {
   struct eswitch_pipeline *pipeline;
   struct eswitch_fdb fdb;
   struct router_config *router;
+  uint64_t arp_replies, arp_tx_drops, arp_rate_drops;
+  uint64_t arp_window_ns;
+  unsigned arp_window_replies;
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];
   uint16_t *port_owner; /* indexed like ports->items; 0 means available */
   uint64_t started_ns;

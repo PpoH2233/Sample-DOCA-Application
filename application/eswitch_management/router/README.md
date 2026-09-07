@@ -1,10 +1,50 @@
 # Router implementation status
 
-This change introduces the control-plane foundation. It does **not** implement
-router packet forwarding. Interfaces with IPs report `PENDING_DATAPLANE`, and
+This change introduces the control-plane foundation and a private gateway ARP
+responder. It does **not** implement IPv4 router forwarding or ICMP echo replies.
+Interfaces with IPs report `PENDING_DATAPLANE`, and
 daemon status reports `router_dataplane=NOT_IMPLEMENTED`. Public ports are
 reserved but remain root-miss DROP. Private L2 forwarding remains active.
 No API stub returns a fabricated hardware success.
+
+## Private gateway ARP milestone
+
+The root classifier now forwards to `ESW_ARP_DISPATCH`. Untagged ARP goes
+through the existing clone path: exactly one Arm copy plus the normal private
+L2 path. Non-ARP still uses the source guard. This deliberately retains L2
+broadcast behavior, including gateway requests, rather than introducing trap
+and L2 reinjection in this milestone. A known source continues generating ARP
+copies; learning does not disable the responder. Source copies are never TXed.
+
+The Arm handler validates Ethernet/IPv4 ARP request fields and source MAC
+consistency, selects the RIF by ingress vSwitch and exact target IP, and builds
+a 60-byte padded response. Each reply uses a fresh mbuf. In non-expert switch
+mode TX metadata contains only the target DPDK port ID; parent TX sends the
+reply directly to that port, bypassing L2 split horizon. A successful TX owns
+the mbuf; failed TX frees it without blocking/retrying in the manager loop.
+Replies are bounded to 100 attempts/second globally; status exposes reply,
+TX-drop and rate-drop counters. This bounds reply work, not incoming ARP RSS
+load. Hardware policing is not part of this milestone.
+
+Only addressed `vs-link` interfaces respond. Public port-link ARP, VLAN-tagged
+ARP, local ICMP and IPv4 forwarding remain unsupported. Configured gateway
+MACs are excluded from learning on their vSwitch; this is not full hardware
+anti-spoof enforcement. No address/IP config migration is needed.
+
+After rebuilding/restarting the single test daemon with the existing test
+state, run from the VM attached to switch 100:
+
+```sh
+arping -I <vm-interface> -c 3 192.168.0.1
+```
+
+Expected for VR 101: replies advertise `02:00:00:65:00:01`. Repeat after the
+source is learned; replies must continue. Daemon logs `ARP REPLY: vs=100 ...`
+and `eswitchctl status` increments `arp_replies`. Capture on the VM to confirm
+the frame actually arrives; TX acceptance alone is not delivery proof.
+`ping` can populate the neighbor cache but will not receive ICMP Echo Reply yet.
+Also test ordinary ARP between two VMs to verify L2 behavior remains intact,
+and remove the gateway IP to confirm the responder stops.
 
 ## Layout
 
@@ -85,11 +125,11 @@ families in `doca-samples/samples/doca_flow/`:
 - `flow_ct_tcp_actions` and CT common code: directional NAT, lifetime, callbacks.
 - `applications/psp_gateway` in the sample bundle: Arm ARP and reinjection.
 
-Required work: reserved gateway dispatch, typed Arm RSS reasons, ARP responder,
+Required work: reserved L3 gateway dispatch, typed Arm RSS reasons, public ARP,
 RIF-scoped neighbors, LPM/adjacency programming, trusted control TX, CT/NAT
 initialization and per-VR zones, route invalidation, first-packet handling,
 checksum/TTL/MTU exception paths, and durable config/hardware rollback.
-Do not treat this control-only milestone as the completed router implementation.
+Do not treat this private-ARP milestone as the completed router implementation.
 
 ## Verification and VF 11–15 build handoff
 

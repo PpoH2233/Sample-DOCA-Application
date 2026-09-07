@@ -49,6 +49,8 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *learning_clone_pipe;
   struct doca_flow_pipe *learning_dispatch_pipe;
   struct doca_flow_pipe *source_guard_pipe;
+  struct doca_flow_pipe *arp_dispatch_pipe;
+  struct eswitch_rule arp_dispatch_rule;
   struct doca_flow_pipe *ingress_classifier_pipe;
 
   struct eswitch_rule rss_rule;

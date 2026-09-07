@@ -305,6 +305,35 @@ static doca_error_t create_source_guard(struct eswitch_pipeline *pipeline) {
   return result;
 }
 
+/* ARP always produces one learning/control copy, even for known sources.
+ * The original retains existing private L2 forwarding; the copy is never
+ * reinjected. This reuses the existing metadata-preserving clone path. */
+static doca_error_t create_arp_dispatch(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE};
+  struct eswitch_rule *rule = &pipeline->arp_dispatch_rule;
+  doca_error_t result;
+  match.outer.eth.type = DOCA_HTOBE16(0x0806);
+  hit.next_pipe = pipeline->learning_dispatch_pipe;
+  miss.next_pipe = pipeline->source_guard_pipe;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS) return result;
+  result = set_pipe_identity(cfg, "ESW_ARP_DISPATCH", DOCA_FLOW_PIPE_BASIC, false, 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss, &pipeline->arp_dispatch_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS) return result;
+  flow_entry_cookie_prepare(&rule->cookie, "ARP control copy", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(pipeline->runtime->queue_id,
+      pipeline->arp_dispatch_pipe, &match, 0, NULL, NULL, NULL,
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie, &rule->entry);
+  return result == DOCA_SUCCESS ? process_rules(pipeline, rule, 1) : result;
+}
+
 static doca_error_t create_ingress_classifier(
     struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
@@ -318,7 +347,7 @@ static doca_error_t create_ingress_classifier(
   match.parser_meta.port_id = UINT16_MAX;
   actions.meta.pkt_meta = UINT32_MAX;
   fwd.type = DOCA_FLOW_FWD_PIPE;
-  fwd.next_pipe = pipeline->source_guard_pipe;
+  fwd.next_pipe = pipeline->arp_dispatch_pipe;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
@@ -375,6 +404,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   CREATE_STAGE("learning clone", create_learning_clone(pipeline));
   CREATE_STAGE("learning dispatch", create_learning_dispatch(pipeline));
   CREATE_STAGE("source guard", create_source_guard(pipeline));
+  CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
   CREATE_STAGE("ingress classifier", create_ingress_classifier(pipeline));
 #undef CREATE_STAGE
 
@@ -390,6 +420,8 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     return;
   if (pipeline->ingress_classifier_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
+  if (pipeline->arp_dispatch_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->arp_dispatch_pipe);
   if (pipeline->source_guard_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->source_guard_pipe);
   if (pipeline->learning_dispatch_pipe != NULL)
