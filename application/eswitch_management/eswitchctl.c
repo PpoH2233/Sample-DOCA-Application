@@ -21,6 +21,7 @@ static void print_help(FILE *output, const char *program) {
           "  vs-port-attach --id <id> --port <p> Attach an available port\n"
           "  vs-port-detach --id <id> --port <p> Detach a member port\n"
           "  vs-list                             List virtual switches\n"
+          "  tx-debug                            TX status and parent driver dump (may pause polling)\n"
           "  show-fdb [--id <id>]                Show all or one FDB\n"
           "  list-port-available                 List unassigned DPDK ports\n"
           "  vr create|delete|show --id <id>     Manage logical routers\n"
@@ -89,7 +90,8 @@ static bool valid_command_line(int argc, char **argv) {
   int argument_count = argc - 2;
   char **arguments = &argv[2];
 
-  if (strcmp(command, "status") == 0 || strcmp(command, "vs-list") == 0 ||
+  if (strcmp(command, "status") == 0 || strcmp(command, "tx-debug") == 0 ||
+      strcmp(command, "vs-list") == 0 ||
       strcmp(command, "list-port-available") == 0)
     return argument_count == 0;
   if (strcmp(command, "vs-create") == 0 ||

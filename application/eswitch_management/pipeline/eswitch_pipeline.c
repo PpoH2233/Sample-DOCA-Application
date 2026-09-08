@@ -398,6 +398,9 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
                              true, pipeline->ports->count + 2);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+  /* Observe the root boundary without adding a catch-all forwarding rule. */
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL, &pipeline->control_tx_pipe);
   doca_flow_pipe_cfg_destroy(cfg);

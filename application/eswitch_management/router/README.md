@@ -75,6 +75,50 @@ without guest replies, investigate the VF/host/VM receive path next.
 
 ### TX debug output
 
+#### Root-boundary investigation (debug version 2)
+
+`status` and the periodic snapshot now query `control_tx_root_miss` directly
+from the EGRESS pipe. The miss counter is enabled before pipe creation; a
+failure to configure it fails startup, and a read failure is printed as an
+error rather than zero. No catch-all forwarding entry is introduced and the
+existing miss destination is unchanged.
+
+In the test container, after rebuilding and restarting with the same test
+socket/state, collect a baseline and then run guest arping:
+
+```sh
+export ESWITCH_CONTROL_SOCKET=/run/eswitch-router-test/control.sock
+./eswitchctl status
+# On the VM: sudo arping -I ens6 -c 5 192.168.0.1
+# Wait for counter refresh, then:
+./eswitchctl status
+./eswitchctl tx-debug
+```
+
+`tx-debug` reports the runtime DPDK version, parent driver, switch domain/port,
+queue counts, counters, and a driver steering dump. The dump is saved under
+`/tmp/eswitch-tx-steering-XXXXXX` **inside the daemon's container**, using a
+unique mode-0600 file. Copy the exact returned file for analysis. This is an
+on-demand read-only diagnostic, but it runs on the control thread and may
+temporarily pause packet polling; do not run it repeatedly under load. Dumps
+may contain tenant addresses. Files are not automatically deleted. PMD dump
+support/coverage varies: `FAILED` or an empty dump is not evidence of an empty
+DOCA pipeline. This does not claim to replace DOCA Flow Tune.
+
+Interpret deltas, not a single cumulative snapshot:
+
+| Observation during isolated ARP test | Next boundary to investigate |
+| --- | --- |
+| Parent TX and root miss increase, all entries stay flat | EGRESS is seeing unmatched traffic; inspect metadata transport and programmed matches |
+| Parent TX increases, all entry and root miss counters stay flat | Check software TX-to-root binding, driver steering and counter observability; this alone does not prove the exact cause |
+| Correct VF rule increases but no guest reply | Investigate forwarding after the rule: VF/host/VM path |
+| Any counter query fails | Resolve observability first; do not interpret the failure as zero |
+
+The miss counter can include other EGRESS traffic; correlation with the five
+test packets is necessary. Root cause remains unconfirmed until the DPU
+measurements and steering dump identify the failing boundary. Existing logs
+confirm valid reply bytes and parent TX accounting, not guest delivery.
+
 No extra flag is required for the current test build:
 
 - `TX RULE READY`: committed EGRESS rule, exact metadata and host/PF/VF mapping.

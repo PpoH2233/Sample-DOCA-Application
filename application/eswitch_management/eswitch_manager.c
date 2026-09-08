@@ -7,12 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
 #include <rte_errno.h>
 #include <rte_flow.h>
 #include <rte_mbuf.h>
+#include <rte_version.h>
 
 #include "../ethernet_switch/switch_config.h"
 #include "eswitch_state.h"
@@ -616,7 +618,63 @@ static size_t format_status(const struct eswitch_manager *manager,
       used = append_text(response, size, used, " query_error=%s\n",
                           doca_error_get_descr(result));
   }
+  struct doca_flow_resource_query miss = {0};
+  doca_error_t miss_result = doca_flow_resource_query_pipe_miss(
+      manager->pipeline->control_tx_pipe, &miss);
+  if (miss_result == DOCA_SUCCESS)
+    used = append_text(response, size, used,
+        "control_tx_root_miss hw_packets=%" PRIu64 " hw_bytes=%" PRIu64 "\n",
+        miss.counter.total_pkts, miss.counter.total_bytes);
+  else
+    used = append_text(response, size, used, "control_tx_root_miss query_error=%s\n",
+                        doca_error_get_descr(miss_result));
   return used;
+}
+
+/* Explicit operator request only. Driver dump can be large/slow and can
+ * contain tenant addresses. Unique mode-0600 file avoids overwriting data
+ * and avoids truncating the dump to the control socket response limit. */
+static void format_tx_debug(struct eswitch_manager *manager,
+                             char *response, size_t size) {
+  size_t used = format_status(manager, response, size);
+  struct rte_eth_dev_info info = {0};
+  uint16_t parent = manager->io->parent_port_id;
+  int rc = rte_eth_dev_info_get(parent, &info);
+  used = append_text(response, size, used,
+      "tx_debug_version=2 dpdk=%s parent=%u devargs=%s\n",
+      rte_version(), parent, SWITCH_DPDK_DEVARGS);
+  if (rc == 0)
+    used = append_text(response, size, used,
+        "parent_driver=%s switch_domain=%u switch_port=%u rx_queues=%u tx_queues=%u\n",
+        info.driver_name ? info.driver_name : "unknown",
+        info.switch_info.domain_id, info.switch_info.port_id,
+        info.nb_rx_queues, info.nb_tx_queues);
+  else
+    used = append_text(response, size, used, "parent_info_error=%d\n", rc);
+  char path[] = "/tmp/eswitch-tx-steering-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0) {
+    append_text(response, size, used, "steering_dump_error=mkstemp errno=%d\n", errno);
+    return;
+  }
+  FILE *file = fdopen(fd, "w");
+  if (file == NULL) {
+    int saved_errno = errno;
+    close(fd);
+    append_text(response, size, used, "steering_dump_error=fdopen errno=%d file=%s\n",
+                saved_errno, path);
+    return;
+  }
+  struct rte_flow_error error = {0};
+  rc = rte_flow_dev_dump(parent, NULL, file, &error);
+  int close_rc = fclose(file);
+  if (rc == 0 && close_rc == 0)
+    append_text(response, size, used, "steering_dump=OK file=%s scope=parent-driver\n", path);
+  else
+    append_text(response, size, used,
+        "steering_dump=FAILED rc=%d error_type=%d message=%s close_rc=%d file=%s\n",
+        rc, (int)error.type, error.message ? error.message : "unavailable",
+        close_rc, path);
 }
 
 static size_t format_vswitches(const struct eswitch_manager *manager,
@@ -705,6 +763,9 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     result = DOCA_ERROR_INVALID_VALUE;
   } else if (strcmp(verb, "status") == 0 && argument_count == 0) {
     (void)format_status(manager, response, response_size);
+    return DOCA_SUCCESS;
+  } else if (strcmp(verb, "tx-debug") == 0 && argument_count == 0) {
+    format_tx_debug(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
     (void)format_vswitches(manager, response, response_size);
