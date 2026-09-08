@@ -173,14 +173,14 @@ clang -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
 In the DOCA 3.4 environment (user-run):
 
 ```sh
-meson setup /tmp/eswitch-management-build application/eswitch_management -Dvf_scope=11-15
+meson setup /tmp/eswitch-management-build application/eswitch_management -Dvf_scope=7-15
 meson compile -C /tmp/eswitch-management-build
 meson test -C /tmp/eswitch-management-build --print-errorlogs
 ```
 
 The Meson command above runs from `Sample-DOCA-Application`. For container
-builds, use that directory as context and `--build-arg VF_SCOPE=11-15`.
-For runtime set `ESWITCH_VF_SCOPE=11-15` explicitly. Existing build trees retain
+builds, use that directory as context and `--build-arg VF_SCOPE=7-15`.
+For runtime set `ESWITCH_VF_SCOPE=7-15` explicitly. Existing build trees retain
 their old option: reconfigure before testing. Check inventory identifies only
 VF indexes 11–15 plus the parent needed by the shared manager. Never infer VF
 index from a DPDK port ID. Use a separate test state/socket path so unrelated

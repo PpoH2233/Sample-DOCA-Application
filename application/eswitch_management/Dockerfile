@@ -2,7 +2,7 @@ ARG DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0
 ARG DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0
 
 FROM ${DOCA_DEVEL_IMAGE} AS builder
-ARG VF_SCOPE=12-15
+ARG VF_SCOPE=7-15
 
 WORKDIR /workspace
 COPY . /workspace

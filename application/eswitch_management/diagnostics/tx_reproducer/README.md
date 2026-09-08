@@ -1,5 +1,10 @@
 # Minimal software TX reproducer (DOCA 3.4)
 
+To test only **software TX -> EGRESS entry**, use the new
+[`sw-egress` COUNT + DROP experiment](EGRESS_ENTRY_TEST.md). It prints baseline,
+per-packet counter deltas and an explicit `EGRESS RESULT: PASS/FAIL`; it does not
+require VM traffic or guest delivery.
+
 ## Experiment B: hardware ingress versus software TX
 
 ### No VM script: use `TX_PROBE_PATH=hw-arp`

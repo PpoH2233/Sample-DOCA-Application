@@ -38,7 +38,7 @@ sockets and EAL file prefixes do not isolate the eSwitch hardware.
 ```bash
 ESWITCH_CONTROL_SOCKET=/run/eswitch-router-test/control.sock \
 ESWITCH_STATE_FILE=/var/lib/eswitch-router-test/eswitch.conf \
-ESWITCH_VF_SCOPE=10-15 \
+ESWITCH_VF_SCOPE=7-15 \
 ESWITCH_TX_PROBE_VS=100 \
 ESWITCH_TX_PROBE_VM_MAC=7e:83:a5:77:11:06 \
 /build/eswitch-management/eswitch-management \
@@ -46,7 +46,7 @@ ESWITCH_TX_PROBE_VM_MAC=7e:83:a5:77:11:06 \
   > /tmp/eswitch-management-tx.log 2>&1
 ```
 
-The scope excludes VF9; if saved config references an excluded VF, resolve
+The scope includes VF7 through VF15; if saved config references an excluded VF, resolve
 that explicitly rather than widening to production ports. Port IDs can change
 after a scope change: verify inventory by host/PF/VF, not old DPDK numbers.
 No state file is overwritten by these instructions outside normal daemon use.

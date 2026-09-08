@@ -7,7 +7,10 @@ test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
 Router commands stage persistent desired configuration. Addressed private
 vs-link RIFs now respond to gateway ARP; public ARP, local ICMP and LPM/CT/NAT
 forwarding are **not implemented** and are never reported READY.
-The default VF scope is now `11-15`; explicit settings override that default.
+The default VF scope is now `7-15`; explicit settings override that default.
+Existing build directories retain their Meson option: use `meson configure
+/build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported
+`ESWITCH_VF_SCOPE` still overrides the compiled default.
 
 `eswitch-management` is the single owner of the BlueField eSwitch, DOCA Flow
 runtime, parent device and all VF representors. `eswitchctl` sends local control

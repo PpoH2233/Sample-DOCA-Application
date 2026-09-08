@@ -8,5 +8,5 @@ DEVICE_PCI="03:00.0"
 # StateDirectory=eswitch-management before starting the daemon.
 ESWITCH_STATE_FILE="/var/lib/eswitch-management/eswitch.conf"
 
-# VF indexes, not DPDK port IDs. Limit this integration test to VF 11-15.
-ESWITCH_VF_SCOPE="11-15"
+# VF indexes, not DPDK port IDs. Limit this integration test to VF 7-15.
+ESWITCH_VF_SCOPE="7-15"

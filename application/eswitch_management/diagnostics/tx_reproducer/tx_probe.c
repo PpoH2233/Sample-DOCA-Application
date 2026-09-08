@@ -19,6 +19,7 @@ static volatile sig_atomic_t interrupted;
 static uint32_t expected_vf;
 static bool hardware_path;
 static bool hardware_arp;
+static bool egress_only;
 
 static void stop_probe(int sig) { (void)sig; interrupted = 1; }
 
@@ -29,11 +30,13 @@ int tx_probe_validate_config(void)
     const char *vm_ip = getenv("TX_PROBE_VM_IP");
     const char *gw_ip = getenv("TX_PROBE_GATEWAY_IP");
     const char *mode = getenv("TX_PROBE_PATH");
-    if (mode && strcmp(mode, "sw") && strcmp(mode, "hw") && strcmp(mode, "hw-arp")) {
-        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, hw or hw-arp\n");
+    if (mode && strcmp(mode, "sw") && strcmp(mode, "hw") && strcmp(mode, "hw-arp") &&
+        strcmp(mode, "sw-egress")) {
+        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, sw-egress, hw or hw-arp\n");
         return -1;
     }
     hardware_arp = mode && strcmp(mode, "hw-arp") == 0;
+    egress_only = mode && strcmp(mode, "sw-egress") == 0;
     hardware_path = hardware_arp || (mode && strcmp(mode, "hw") == 0);
     /* Explicit test scope, not a default destination. No TX before all gates. */
     if (!vf || strlen(vf) != 2 || vf[0] != '1' || vf[1] < '0' || vf[1] > '5' ||
@@ -108,8 +111,8 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     doca_error_t r;
     mon.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
     miss.type = DOCA_FLOW_FWD_DROP;
-    fwd.type = egress ? DOCA_FLOW_FWD_PORT : DOCA_FLOW_FWD_DROP;
-    if (egress) fwd.port_id = 1; /* Mapping verified before queues/Flow init. */
+    fwd.type = egress && !egress_only ? DOCA_FLOW_FWD_PORT : DOCA_FLOW_FWD_DROP;
+    if (egress && !egress_only) fwd.port_id = 1; /* Mapping verified before queues/Flow init. */
     if (!egress && hardware_path) {
         /* Only selected frames from the verified VF/VM can cross domains.
          * Broadcast dst MAC is changeable (all ones), not a fixed field. */
@@ -161,6 +164,7 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     struct doca_flow_pipe_entry *egress = NULL, *ingress = NULL;
     struct doca_flow_pipe *egress_pipe = NULL;
     struct doca_flow_resource_query q = {0}, iq = {0};
+    struct doca_flow_resource_query egress_before = {0}, ingress_before = {0};
     struct rte_eth_stats before = {0}, after = {0};
     uint64_t accepted = 0;
     doca_error_t r;
@@ -169,8 +173,9 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     resource.nr_counters = 8;
     resource.nr_rss = 1;
     fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=disabled; "
-            "path=%s; EGRESS=match-all->VF\n",
-            hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw"));
+            "path=%s; EGRESS=match-all->%s; revision=egress-entry-v1\n",
+            egress_only ? "sw-egress" : (hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw")),
+            egress_only ? "COUNT+DROP" : "VF");
     r = init_doca_flow(nb_queues, "switch,hws,hairpinq_num=4,expert", &resource, shared);
     if (r != DOCA_SUCCESS) return r;
     r = init_doca_flow_switch_ports(ctx->devs_ctx.devs_manager, ctx->devs_ctx.nb_devs,
@@ -228,10 +233,21 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     if (rte_eth_stats_get(0, &before) != 0) { r = DOCA_ERROR_BAD_STATE; goto out; }
     signal(SIGINT, stop_probe);
     signal(SIGTERM, stop_probe);
-    fprintf(stderr, "PROBE READY: capture on VM now; TX begins in 5 seconds (no ping needed)\nFRAME:");
+    fprintf(stderr, "PROBE READY: %s; TX begins in 5 seconds (no ping needed)\nFRAME:",
+            egress_only ? "EGRESS counter-only test; guest capture not applicable" : "capture on VM now");
     for (unsigned int i = 0; i < sizeof(frame); ++i) fprintf(stderr, " %02x", frame[i]);
     fprintf(stderr, "\n");
     for (int i = 0; i < 5 && !interrupted; ++i) sleep(1);
+    r = doca_flow_resource_query_entry(egress, &egress_before);
+    if (r == DOCA_SUCCESS) r = doca_flow_resource_query_entry(ingress, &ingress_before);
+    if (r != DOCA_SUCCESS) goto out;
+    fprintf(stderr, "BASELINE: egress=%" PRIu64 " ingress=%" PRIu64 "\n",
+            egress_before.counter.total_pkts, ingress_before.counter.total_pkts);
+    if (egress_only && egress_before.counter.total_pkts != 0) {
+        fprintf(stderr, "CHECK FAILED: EGRESS saw traffic before software TX; isolate test\n");
+        r = DOCA_ERROR_BAD_STATE;
+        goto out;
+    }
     for (int i = 0; i < 10 && !interrupted; ++i) {
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
         if (!m) { r = DOCA_ERROR_NO_MEMORY; goto out; }
@@ -251,6 +267,14 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
         if (r != DOCA_SUCCESS) goto out;
         fprintf(stderr, "EGRESS SAMPLE: packets=%" PRIu64 " bytes=%" PRIu64 "\n",
                 q.counter.total_pkts, q.counter.total_bytes);
+        if (egress_only) {
+            r = doca_flow_resource_query_entry(ingress, &iq);
+            if (r != DOCA_SUCCESS) goto out;
+            fprintf(stderr, "PATH SAMPLE: seq=%d accepted=%" PRIu64
+                    " egress_delta=%" PRIu64 " ingress_delta=%" PRIu64 "\n",
+                    i + 1, accepted, q.counter.total_pkts - egress_before.counter.total_pkts,
+                    iq.counter.total_pkts - ingress_before.counter.total_pkts);
+        }
     }
     /* Counter settling, not an entries_process-based counter refresh. */
     for (int i = 0; i < 3; ++i) sleep(1);
@@ -264,6 +288,19 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
             after.oerrors-before.oerrors, q.counter.total_pkts, iq.counter.total_pkts);
     if (interrupted || accepted != 10 || q.counter.total_pkts != accepted)
         r = DOCA_ERROR_BAD_STATE;
+    if (egress_only) {
+        uint64_t hits = q.counter.total_pkts - egress_before.counter.total_pkts;
+        uint64_t ingress_hits = iq.counter.total_pkts - ingress_before.counter.total_pkts;
+        if (hits != 10 || ingress_hits != 0) r = DOCA_ERROR_BAD_STATE;
+        fprintf(stderr, "EGRESS RESULT: %s accepted=%" PRIu64
+                " egress_delta=%" PRIu64 " ingress_delta=%" PRIu64
+                " action=DROP guest_delivery=NOT_APPLICABLE\n",
+                r == DOCA_SUCCESS ? "PASS" : "FAIL", accepted, hits, ingress_hits);
+        if (ingress_hits != 0)
+            fprintf(stderr, "CHECK FAILED: ingress traffic observed; isolate traffic before attributing EGRESS hits to TX\n");
+        else if (hits != accepted)
+            fprintf(stderr, "CHECK FAILED: software TX acceptance does not match EGRESS entry hits\n");
+    }
 out:
     if (r != DOCA_SUCCESS)
         fprintf(stderr, "PROBE ERROR: %s; accepted=%" PRIu64 " processed=%d failure=%d\n",

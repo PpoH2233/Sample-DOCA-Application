@@ -161,7 +161,7 @@ argp_cleanup:
 sample_exit:
 	destroy_doca_flow_devs(&ctx.devs_ctx);
 	if (exit_status == EXIT_SUCCESS)
-		DOCA_LOG_INFO("TX probe finished: see EGRESS counters; guest delivery requires capture");
+		DOCA_LOG_INFO("TX probe finished: see mode-specific counter result; VF delivery, if tested, requires capture");
 	else
 		DOCA_LOG_INFO("Sample finished with errors");
 	return exit_status;
