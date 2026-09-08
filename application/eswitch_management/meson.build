@@ -92,9 +92,9 @@ arp_test = executable(
 test('eswitch-router-arp', arp_test)
 
 tx_metadata_test = executable(
-  'eswitch-tx-metadata-test',
-  'pipeline/control_tx_metadata_test.c',
+  'eswitch-tx-plan-a-test',
+  'pipeline/tx_plan_a_test.c',
   build_by_default: false,
   install: false,
 )
-test('eswitch-tx-metadata', tx_metadata_test)
+test('eswitch-tx-plan-a', tx_metadata_test)

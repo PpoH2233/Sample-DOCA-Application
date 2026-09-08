@@ -21,6 +21,7 @@
 #include "router/router_control.h"
 #include "router/router_arp.h"
 #include "l2/l2_switch.h"
+#include "pipeline/tx_plan_a.h"
 
 static uint64_t monotonic_ns(void) {
   struct timespec value;
@@ -323,12 +324,25 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_built++;
+  /* Plan A is explicitly scoped to one test VS/VM, never first-packet wins. */
+  char vs_text[6], vm_text[18];
+  snprintf(vs_text, sizeof(vs_text), "%u", vs);
+  snprintf(vm_text, sizeof(vm_text), "%02x:%02x:%02x:%02x:%02x:%02x",
+           response[0], response[1], response[2], response[3], response[4], response[5]);
+  const char *selected_vs = getenv("ESWITCH_TX_PROBE_VS");
+  const char *selected_vm = getenv("ESWITCH_TX_PROBE_VM_MAC");
+  if (!tx_plan_a_selected(selected_vs, selected_vm, vs, response)) {
+    manager->arp_target_drops++;
+    manager->arp_tx_drops++;
+    if (debug) printf("TX PLAN A SKIP: select ESWITCH_TX_PROBE_VS=%s "
+                      "ESWITCH_TX_PROBE_VM_MAC=%s to test this tuple\n", vs_text, vm_text);
+    return;
+  }
   int index = find_port_index(manager, ingress);
   if (index < 0 || ingress == UINT16_MAX ||
       manager->port_owner[index] != vs ||
       manager->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR ||
-      !manager->io->port_started || !manager->io->metadata_registered ||
-      manager->pipeline->control_tx_rules[index].entry == NULL) {
+      !manager->io->port_started) {
     manager->arp_target_drops++;
     manager->arp_tx_drops++;
     if (debug)
@@ -346,6 +360,14 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_window_replies++;
+  doca_error_t arm_result = eswitch_pipeline_tx_probe_arm(
+      manager->pipeline, ingress, response + 6, response);
+  if (arm_result != DOCA_SUCCESS) {
+    manager->arp_target_drops++; manager->arp_tx_drops++;
+    if (debug) printf("TX PLAN A ARM FAILED: port=%u error=%s\n",
+                      ingress, doca_error_get_descr(arm_result));
+    return;
+  }
   struct rte_mbuf *reply = rte_pktmbuf_alloc(manager->io->mbuf_pool);
   if (!reply) {
     manager->arp_tx_drops++; manager->arp_alloc_drops++;
@@ -360,18 +382,16 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   memcpy(data, response, sizeof(response));
-  /* Fresh padded Ethernet/ARP frame; expert EGRESS rule selects the VF.
-   * Never reuse RX metadata or re-enter the L2 split-horizon path. */
-  rte_flow_dynf_metadata_set(reply, eswitch_control_tx_metadata(ingress));
-  reply->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+  /* Plan A deliberately sends NO TX metadata. Only Ethernet fields select VF. */
+  reply->ol_flags = 0;
   if (debug) {
     const struct ethernet_port *target = manager->ports->items[index].ethernet;
     printf("ARP TX BUILD: vs=%u parent=%u queue=%u target=%u host=%u pf=%u vf=%u "
-           "len=%u data_len=%u nb_segs=%u metadata=0x%08x flags=0x%016" PRIx64 "\n",
+           "len=%u data_len=%u nb_segs=%u metadata=disabled flags=0x%016" PRIx64 "\n",
            vs, manager->io->parent_port_id, SWITCH_TX_QUEUE_ID, ingress,
            target->host_index, target->pf_index, target->vf_index,
            reply->pkt_len, reply->data_len, reply->nb_segs,
-           *RTE_FLOW_DYNF_METADATA(reply), reply->ol_flags);
+           reply->ol_flags);
     printf("ARP TX FRAME:");
     for (size_t i = 0; i < sizeof(response); i++) printf(" %02x", response[i]);
     printf("\n");
@@ -476,6 +496,24 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   now_ns = monotonic_ns();
   /* Delayed snapshots, not synchronous HW reads per packet. Include one
    * snapshot after traffic stops; keep normal idle operation quiet. */
+  if (now_ns >= manager->next_aging_ns) {
+    const struct eswitch_rule *rules[] = {&manager->pipeline->tx_root_rule,
+        &manager->pipeline->tx_probe_rule, &manager->pipeline->control_tx_drop};
+    for (unsigned i = 0; i < 3; i++) {
+      struct doca_flow_resource_query q = {0};
+      manager->tx_hw_valid[i] = false;
+      if (!rules[i]->entry) {
+        manager->tx_hw_errors[i] = DOCA_ERROR_NOT_FOUND;
+        continue;
+      }
+      manager->tx_hw_errors[i] = doca_flow_resource_query_entry(rules[i]->entry, &q);
+      if (manager->tx_hw_errors[i] == DOCA_SUCCESS) {
+        manager->tx_hw_valid[i] = true;
+        manager->tx_hw_packets[i] = q.counter.total_pkts;
+      }
+    }
+    manager->tx_hw_sample_ns = now_ns;
+  }
   if (manager->arp_seen != manager->tx_snapshot_seen &&
       now_ns - manager->tx_snapshot_ns >= 5000000000ULL) {
     char diagnostic[8192];
@@ -595,86 +633,20 @@ static size_t format_status(const struct eswitch_manager *manager,
   else
     used = append_text(response, size, used, "parent_tx port=%u stats_error=%d\n",
                         manager->io->parent_port_id, stats_result);
-  for (uint32_t i = 0; i < (uint32_t)manager->ports->count + 2; i++) {
-    bool drop = i >= manager->ports->count;
-    const struct eswitch_rule *rule = i == manager->ports->count
-        ? &manager->pipeline->control_tx_drop
-        : (i > manager->ports->count ? &manager->pipeline->control_tx_untagged
-                                     : &manager->pipeline->control_tx_rules[i]);
-    struct doca_flow_resource_query query = {0};
-    if (rule->entry == NULL)
-      continue;
-    doca_error_t result = doca_flow_resource_query_entry(rule->entry, &query);
-    if (drop)
-      used = append_text(response, size, used, "%s",
-          i == manager->ports->count ? "control_tx_invalid" : "control_tx_sw_untagged");
+  const char *names[] = {"egress_enter", "arp_probe_hit", "tx_probe_drop"};
+  for (unsigned i = 0; i < 3; i++) {
+    if (manager->tx_hw_valid[i])
+      used = append_text(response, size, used, "%s hw_packets=%" PRIu64 "\n",
+                          names[i], manager->tx_hw_packets[i]);
     else
-      used = append_text(response, size, used, "control_tx port=%u",
-                          manager->ports->items[i].ethernet->port_id);
-    if (result == DOCA_SUCCESS)
-      used = append_text(response, size, used, " hw_packets=%" PRIu64 "\n",
-                          query.counter.total_pkts);
-    else
-      used = append_text(response, size, used, " query_error=%s\n",
-                          doca_error_get_descr(result));
+      used = append_text(response, size, used, "%s unavailable error=%d\n",
+                          names[i], (int)manager->tx_hw_errors[i]);
   }
-  struct doca_flow_resource_query miss = {0};
-  doca_error_t miss_result = doca_flow_resource_query_pipe_miss(
-      manager->pipeline->control_tx_pipe, &miss);
-  if (miss_result == DOCA_SUCCESS)
-    used = append_text(response, size, used,
-        "control_tx_root_miss hw_packets=%" PRIu64 " hw_bytes=%" PRIu64 "\n",
-        miss.counter.total_pkts, miss.counter.total_bytes);
-  else
-    used = append_text(response, size, used, "control_tx_root_miss query_error=%s\n",
-                        doca_error_get_descr(miss_result));
-  return used;
-}
-
-/* Explicit operator request only. Driver dump can be large/slow and can
- * contain tenant addresses. Unique mode-0600 file avoids overwriting data
- * and avoids truncating the dump to the control socket response limit. */
-static void format_tx_debug(struct eswitch_manager *manager,
-                             char *response, size_t size) {
-  size_t used = format_status(manager, response, size);
-  struct rte_eth_dev_info info = {0};
-  uint16_t parent = manager->io->parent_port_id;
-  int rc = rte_eth_dev_info_get(parent, &info);
   used = append_text(response, size, used,
-      "tx_debug_version=2 dpdk=%s parent=%u devargs=%s\n",
-      rte_version(), parent, SWITCH_DPDK_DEVARGS);
-  if (rc == 0)
-    used = append_text(response, size, used,
-        "parent_driver=%s switch_domain=%u switch_port=%u rx_queues=%u tx_queues=%u\n",
-        info.driver_name ? info.driver_name : "unknown",
-        info.switch_info.domain_id, info.switch_info.port_id,
-        info.nb_rx_queues, info.nb_tx_queues);
-  else
-    used = append_text(response, size, used, "parent_info_error=%d\n", rc);
-  char path[] = "/tmp/eswitch-tx-steering-XXXXXX";
-  int fd = mkstemp(path);
-  if (fd < 0) {
-    append_text(response, size, used, "steering_dump_error=mkstemp errno=%d\n", errno);
-    return;
-  }
-  FILE *file = fdopen(fd, "w");
-  if (file == NULL) {
-    int saved_errno = errno;
-    close(fd);
-    append_text(response, size, used, "steering_dump_error=fdopen errno=%d file=%s\n",
-                saved_errno, path);
-    return;
-  }
-  struct rte_flow_error error = {0};
-  rc = rte_flow_dev_dump(parent, NULL, file, &error);
-  int close_rc = fclose(file);
-  if (rc == 0 && close_rc == 0)
-    append_text(response, size, used, "steering_dump=OK file=%s scope=parent-driver\n", path);
-  else
-    append_text(response, size, used,
-        "steering_dump=FAILED rc=%d error_type=%d message=%s close_rc=%d file=%s\n",
-        rc, (int)error.type, error.message ? error.message : "unavailable",
-        close_rc, path);
+      "tx_plan=A metadata=disabled probe=%s sample_age_ms=%" PRIu64 "\n",
+      manager->pipeline->tx_probe_rule.entry ? "armed" : "unarmed",
+      manager->tx_hw_sample_ns ? (monotonic_ns() - manager->tx_hw_sample_ns) / UINT64_C(1000000) : 0);
+  return used;
 }
 
 static size_t format_vswitches(const struct eswitch_manager *manager,
@@ -765,7 +737,7 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     (void)format_status(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "tx-debug") == 0 && argument_count == 0) {
-    format_tx_debug(manager, response, response_size);
+    (void)format_status(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
     (void)format_vswitches(manager, response, response_size);

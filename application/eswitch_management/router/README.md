@@ -7,149 +7,72 @@ daemon status reports `router_dataplane=NOT_IMPLEMENTED`. Public ports are
 reserved but remain root-miss DROP. Private L2 forwarding remains active.
 No API stub returns a fabricated hardware success.
 
-## Private gateway ARP milestone
+## Private gateway ARP / TX Plan A
 
-The root classifier now forwards to `ESW_ARP_DISPATCH`. Untagged ARP goes
-through the existing clone path: exactly one Arm copy plus the normal private
-L2 path. Non-ARP still uses the source guard. This deliberately retains L2
-broadcast behavior, including gateway requests, rather than introducing trap
-and L2 reinjection in this milestone. A known source continues generating ARP
-copies; learning does not disable the responder. Source copies are never TXed.
+Plan A replaces the old metadata TX implementation. RX ARP dispatch and the
+portable 60-byte ARP response builder are unchanged. DEFAULT-domain L2
+forwarding is unchanged. This is a single-pair diagnostic, not multi-VR TX.
 
-The Arm handler validates Ethernet/IPv4 ARP request fields and source MAC
-consistency, selects the RIF by ingress vSwitch and exact target IP, and builds
-a 60-byte padded response. Each reply uses a fresh mbuf. Management now opts
-into `switch,hws,expert` (the standalone ethernet_switch app keeps its default).
-Parent TX queue 0 injects the reply with host-order metadata
-`(target_dpdk_port_id << 16) | 0xffff`. `ESW_CONTROL_TX`, an EGRESS root control
-pipe, matches ARP EtherType and the exact metadata, then forwards to that
-probed VF using `FWD_PORT`. Flow metadata matches use big-endian values.
-This bypasses the DEFAULT-domain ingress classifier and L2 split horizon.
-There are no TX rules targeting the parent; current VS ownership and RIF
-configuration are checked by the Arm handler before generating a reply.
-The low 16 bits of RX metadata are a valid ingress port, never `0xffff`, so
-this TX namespace cannot collide with L2 metadata for any vSwitch ID. The
-forwarding rule no longer depends on the software-origin parser sentinel.
-Invalid tagged TX hits `control_tx_invalid`; a separate lower-priority
-software-origin DROP rule counts `control_tx_sw_untagged`. Zero on that
-secondary rule alone is not proof that no software TX entered EGRESS.
-Unmatched hardware traffic retains the
-EGRESS domain's default forwarding behavior. All TX rules must commit before
-the daemon serves commands. A successful TX enqueue transfers mbuf ownership;
-failed TX frees it without blocking/retrying in the manager loop.
-Replies are bounded to 100 attempts/second globally; status exposes reply,
-TX-drop and rate-drop counters. This bounds reply work, not incoming ARP RSS
-load. Hardware policing is not part of this milestone.
+Software path:
+1. Validate gateway request and current VS ownership.
+2. Require exact configured test VS and VM MAC selectors.
+3. Resolve the request's ingress endpoint using current inventory (never VF
+   arithmetic). Commit one Ethernet ARP probe rule for gateway MAC -> VM MAC.
+4. Allocate fresh mbuf, copy padded ARP reply, set no TX offload/metadata flag.
+5. Send on the actual parent TX queue; free only on enqueue failure.
 
-Only addressed `vs-link` interfaces respond. Public port-link ARP, VLAN-tagged
-ARP, local ICMP and IPv4 forwarding remain unsupported. Configured gateway
-MACs are excluded from learning on their vSwitch; this is not full hardware
-anti-spoof enforcement. No address/IP config migration is needed.
-
-After rebuilding/restarting the single test daemon with the existing test
-state, run from the VM attached to switch 100:
-
-```sh
-arping -I <vm-interface> -c 3 192.168.0.1
+Hardware path (all BASIC pipes in EGRESS):
+```text
+TX_A_EGRESS_ROOT: match all + entry counter
+  -> TX_A_ARP_PROBE: EtherType ARP + source/destination MAC + counter -> VF
+       miss -> TX_A_DROP: match all + entry counter -> DROP
 ```
 
-Expected for VR 101: replies advertise `02:00:00:65:00:01`. Repeat after the
-source is learned; replies must continue. Daemon logs `ARP TX ENQUEUED: vs=100 ...`
-and `eswitchctl status` increments `arp_tx_enqueued`. Status also exposes
-`control_tx port=<DPDK-ID> hw_packets=N` and `control_tx_invalid hw_packets=N`.
-For the current port-2 VM, the port-2 counter must increase and invalid must
-remain zero. Counter query failures are shown as errors, never as zero packets.
-Capture on the VM to confirm delivery; neither TX acceptance nor a forwarding
-rule hit alone proves receipt by the guest:
+DROP and probe pipes are created before the root. The probe starts empty.
+Its one tuple is locked after successful programming until daemon restart.
+A changed gateway MAC or moved VM therefore requires restarting this test
+daemon; do not modify topology during a measurement. Software validates
+current ownership/address on every reply, including after address removal.
+Other pairs never generate TX; unmatched EGRESS traffic is dropped. Do not
+connect the existing DEFAULT L2 path to this diagnostic EGRESS root.
 
-```sh
-sudo tcpdump -eni ens6 -nn arp
-sudo arping -I ens6 -c 3 192.168.0.1
-ip neigh show dev ens6
-```
-
-If enqueued increases but no TX hardware counter changes, check parent TX and
-metadata/EGRESS entry installation. If invalid increases, inspect the injection
-tag, protocol and port mapping. If the correct forwarding counter increases
-without guest replies, investigate the VF/host/VM receive path next.
-
-### TX debug output
-
-#### Root-boundary investigation (debug version 2)
-
-`status` and the periodic snapshot now query `control_tx_root_miss` directly
-from the EGRESS pipe. The miss counter is enabled before pipe creation; a
-failure to configure it fails startup, and a read failure is printed as an
-error rather than zero. No catch-all forwarding entry is introduced and the
-existing miss destination is unchanged.
-
-In the test container, after rebuilding and restarting with the same test
-socket/state, collect a baseline and then run guest arping:
-
+Launch in doca-dev with the production PF owner stopped:
 ```sh
 export ESWITCH_CONTROL_SOCKET=/run/eswitch-router-test/control.sock
-./eswitchctl status
-# On the VM: sudo arping -I ens6 -c 5 192.168.0.1
-# Wait for counter refresh, then:
-./eswitchctl status
-./eswitchctl tx-debug
+export ESWITCH_STATE_FILE=/var/lib/eswitch-router-test/eswitch.conf
+export ESWITCH_TX_PROBE_VS=100
+export ESWITCH_TX_PROBE_VM_MAC=7e:83:a5:77:11:06
+./eswitch-management -l 0 -- 03:00.0
 ```
+Use canonical decimal VS and lowercase colon-separated MAC. Unset/malformed
+selectors disable replies (fail closed). Keep the established VF scope; the
+selectors never change the set of probed VFs.
 
-`tx-debug` reports the runtime DPDK version, parent driver, switch domain/port,
-queue counts, counters, and a driver steering dump. The dump is saved under
-`/tmp/eswitch-tx-steering-XXXXXX` **inside the daemon's container**, using a
-unique mode-0600 file. Copy the exact returned file for analysis. This is an
-on-demand read-only diagnostic, but it runs on the control thread and may
-temporarily pause packet polling; do not run it repeatedly under load. Dumps
-may contain tenant addresses. Files are not automatically deleted. PMD dump
-support/coverage varies: `FAILED` or an empty dump is not evidence of an empty
-DOCA pipeline. This does not claim to replace DOCA Flow Tune.
+VM: `sudo arping -I ens6 -c 5 192.168.0.1`, alongside
+`sudo tcpdump -eni ens6 -nn arp`. Capture a baseline and another
+`eswitchctl status` after waiting at least two seconds for counter sampling.
 
-Interpret deltas, not a single cumulative snapshot:
+- `egress_enter`: packet reached the root, independent of metadata/header.
+- `arp_probe_hit`: exact Ethernet tuple selected the VF.
+- `tx_probe_drop`: packet missed the probe.
+- `unavailable` is not zero; probe is unarmed until the first selected request.
+- Flow entry counters are sampled by maintenance once per aging interval.
+  `status` and `tx-debug` read that cache; neither performs Flow miss queries
+  or steering dumps. Parent ethdev stats remain read-only on demand.
+- Entry-query behavior still needs hardware validation. Removing miss-query
+  avoids the newly suspected call but does not prove the earlier crash cause.
+- Packet logs are sampled; enqueue and parent statistics are not delivery proof.
 
-| Observation during isolated ARP test | Next boundary to investigate |
-| --- | --- |
-| Parent TX and root miss increase, all entries stay flat | EGRESS is seeing unmatched traffic; inspect metadata transport and programmed matches |
-| Parent TX increases, all entry and root miss counters stay flat | Check software TX-to-root binding, driver steering and counter observability; this alone does not prove the exact cause |
-| Correct VF rule increases but no guest reply | Investigate forwarding after the rule: VF/host/VM path |
-| Any counter query fails | Resolve observability first; do not interpret the failure as zero |
+Acceptance: selected VM gets the RIF MAC in an ARP reply; root and probe
+counters increase, drop stays flat in an otherwise quiet test. Then verify
+ordinary known-unicast and broadcast between the two L2 test VMs, reject other
+VS/VM pairs, remove gateway IP and verify replies stop. ICMP replies and router
+IPv4 forwarding remain outside this milestone.
 
-The miss counter can include other EGRESS traffic; correlation with the five
-test packets is necessary. Root cause remains unconfirmed until the DPU
-measurements and steering dump identify the failing boundary. Existing logs
-confirm valid reply bytes and parent TX accounting, not guest delivery.
-
-No extra flag is required for the current test build:
-
-- `TX RULE READY`: committed EGRESS rule, exact metadata and host/PF/VF mapping.
-- `ARP TX BUILD`: parent/queue/target, packet length, segment count, metadata and
-  mbuf flags. `ARP TX FRAME` dumps the complete 60-byte generated ARP frame.
-  Detailed packet logs cover the first three ARP requests, then at most once
-  per second globally. They include MAC/IP addresses; handle logs accordingly.
-- `ARP TX SKIP`: truncated frame or request rejected by gateway/ARP validation.
-- `ARP TX DROP`: target validation, rate limit, allocation, append or enqueue
-  failure. Status keeps exact cumulative stage counts even when logs suppress
-  repeated events. `arp_built` means response bytes were constructed, not sent.
-- `TX DEBUG SNAPSHOT`: cumulative status at most every five seconds when ARP
-  activity changes, including a trailing snapshot after traffic stops.
-- `parent_tx`: DPDK ethdev `opackets`, `obytes`, `oerrors`, or a query error.
-  These may include other traffic and depend on PMD counter support; neither
-  ethdev counters nor Flow hit counters prove guest receipt. Compare two
-  snapshots and confirm with guest tcpdump. No TX statistics are reset.
-
-For target DPDK port 2 the new host-order TX metadata must be `0x0002ffff`.
-The reply Ethernet destination must be the requester's MAC, source the private
-RIF MAC, EtherType `0806`, and ARP opcode `0002`. Successful enqueue transfers
-ownership; the code never reads or frees the mbuf afterward. No retries or
-extra diagnostic packets are injected. Restart the daemon after rebuilding;
-old and new TX metadata formats must not be mixed.
-`ping` can populate the neighbor cache but will not receive ICMP Echo Reply yet.
-Also test ordinary ARP between two VMs to verify L2 behavior remains intact,
-and remove the gateway IP to confirm the responder stops. Also test another
-test VF and a different VS to verify replies do not leak. Hardware acceptance
-requires testing on the DPU: portable ARP/router tests do not exercise these
-Flow rules. Keep the production daemon stopped while the test owns the PF;
-different sockets do not isolate eSwitch ownership.
+If root stays flat despite parent TX increases, inspect software-TX/root
+binding rather than metadata. If root increases and drop increases, inspect
+Ethernet matching. If probe increases without guest capture, investigate the
+VF/host/VM path. Hardware counters may include other traffic: compare deltas.
 
 ## Layout
 

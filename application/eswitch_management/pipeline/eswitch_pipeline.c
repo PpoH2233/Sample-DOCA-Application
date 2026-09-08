@@ -375,99 +375,109 @@ static doca_error_t create_ingress_classifier(
                                          : DOCA_SUCCESS;
 }
 
-/* Expert-mode software TX enters EGRESS, not the DEFAULT L2 root. Match
- * the reserved TX metadata namespace; no software-origin parser assumption.
- * One rule per probed VF is sufficient: the manager validates current VS/RIF
- * ownership before constructing a reply. No rule may target the parent.
- * Non-software traffic retains the domain's default wire/representor path. */
-static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
+/* Plan A: independent root counter, exact Ethernet probe, counted DROP.
+ * L2 DEFAULT pipes are never connected to this diagnostic EGRESS path. */
+static doca_error_t tx_basic_pipe(struct eswitch_pipeline *p, const char *name,
+                                  bool root, struct doca_flow_match *match,
+                                  struct doca_flow_match *mask,
+                                  struct doca_flow_fwd *fwd,
+                                  struct doca_flow_fwd *miss,
+                                  struct doca_flow_pipe **pipe) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_monitor monitor = {0};
-  struct doca_flow_match match = {0}, mask = {0};
-  struct doca_flow_fwd fwd = {0};
-  doca_error_t result;
-
-  pipeline->control_tx_rules = calloc(pipeline->ports->count,
-                                       sizeof(*pipeline->control_tx_rules));
-  if (pipeline->control_tx_rules == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
-  if (result != DOCA_SUCCESS)
-    return result;
-  result = set_pipe_identity(cfg, "ESW_CONTROL_TX", DOCA_FLOW_PIPE_CONTROL,
-                             true, pipeline->ports->count + 2);
+  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+  doca_error_t result = doca_flow_pipe_cfg_create(&cfg, p->switch_port);
+  if (result != DOCA_SUCCESS) return result;
+  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_BASIC, root, 1);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
-  /* Observe the root boundary without adding a catch-all forwarding rule. */
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
+    result = doca_flow_pipe_cfg_set_match(cfg, match, mask);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, NULL, NULL, &pipeline->control_tx_pipe);
+    result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, fwd, miss, pipe);
   doca_flow_pipe_cfg_destroy(cfg);
-  if (result != DOCA_SUCCESS)
-    return result;
+  return result;
+}
 
+static doca_error_t tx_basic_entry(struct eswitch_pipeline *p,
+                                   struct doca_flow_pipe *pipe,
+                                   struct doca_flow_match *match,
+                                   struct doca_flow_fwd *fwd,
+                                   struct eswitch_rule *rule, const char *name) {
+  struct doca_flow_monitor monitor = {0};
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+  flow_entry_cookie_prepare(&rule->cookie, name, DOCA_FLOW_ENTRY_OP_ADD);
+  doca_error_t result = doca_flow_pipe_basic_add_entry(
+      p->runtime->queue_id, pipe, match, 0, NULL, &monitor, fwd,
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie, &rule->entry);
+  if (result != DOCA_SUCCESS) return result;
+  return process_rules(p, rule, 1);
+}
+
+static doca_error_t create_control_tx(struct eswitch_pipeline *p) {
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_DROP};
+  doca_error_t result = tx_basic_pipe(p, "TX_A_DROP", false, &match, NULL,
+                                      &fwd, NULL, &p->tx_drop_pipe);
+  if (result != DOCA_SUCCESS) return result;
+  result = tx_basic_entry(p, p->tx_drop_pipe, &match, NULL, &p->control_tx_drop,
+                          "TX A drop");
+  if (result != DOCA_SUCCESS) return result;
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = p->tx_drop_pipe};
   match.outer.eth.type = DOCA_HTOBE16(0x0806);
   mask.outer.eth.type = UINT16_MAX;
-  mask.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.src_mac, 0xff, 6);
+  memset(match.outer.eth.dst_mac, 0xff, 6);
+  memset(mask.outer.eth.src_mac, 0xff, 6);
+  memset(mask.outer.eth.dst_mac, 0xff, 6);
   fwd.type = DOCA_FLOW_FWD_PORT;
-  for (uint16_t i = 0; i < pipeline->ports->count; i++) {
-    const struct ethernet_port *port = pipeline->ports->items[i].ethernet;
-    struct eswitch_rule *rule = &pipeline->control_tx_rules[i];
-    if (port->role != ETHERNET_PORT_ROLE_REPRESENTOR)
-      continue;
-    match.meta.pkt_meta = DOCA_HTOBE32(eswitch_control_tx_metadata(port->port_id));
-    fwd.port_id = port->port_id;
-    flow_entry_cookie_prepare(&rule->cookie, "control TX to VF",
-                              DOCA_FLOW_ENTRY_OP_ADD);
-    result = doca_flow_pipe_control_add_entry(
-        pipeline->runtime->queue_id, pipeline->control_tx_pipe,
-        &match, &mask, NULL, NULL, NULL, NULL, &monitor, 0, &fwd,
-        &rule->cookie, &rule->entry);
-    if (result != DOCA_SUCCESS)
-      return result;
-    result = process_rules(pipeline, rule, 1);
-    if (result != DOCA_SUCCESS)
-      return result;
-    printf("TX RULE READY: domain=EGRESS port=%u host=%u pf=%u vf=%u "
-           "metadata=0x%08x ethertype=0x0806 origin=metadata\n",
-           port->port_id, port->host_index, port->pf_index, port->vf_index,
-           eswitch_control_tx_metadata(port->port_id));
-  }
+  fwd.port_id = UINT16_MAX;
+  result = tx_basic_pipe(p, "TX_A_ARP_PROBE", false, &match, &mask,
+                         &fwd, &miss, &p->tx_probe_pipe);
+  if (result != DOCA_SUCCESS) return result;
+  memset(&match, 0, sizeof(match));
+  fwd = (struct doca_flow_fwd){.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = p->tx_probe_pipe};
+  result = tx_basic_pipe(p, "TX_A_EGRESS_ROOT", true, &match, NULL,
+                         &fwd, NULL, &p->control_tx_pipe);
+  if (result != DOCA_SUCCESS) return result;
+  result = tx_basic_entry(p, p->control_tx_pipe, &match, NULL, &p->tx_root_rule,
+                          "TX A root");
+  if (result == DOCA_SUCCESS)
+    printf("TX PLAN A READY: root=all -> probe=unarmed -> DROP; no TX metadata\n");
+  return result;
+}
 
-  /* Count invalid tagged TX independently of parser_meta.port_id. */
-  memset(&match, 0, sizeof(match));
-  memset(&mask, 0, sizeof(mask));
-  memset(&fwd, 0, sizeof(fwd));
-  match.meta.pkt_meta = DOCA_HTOBE32(UINT32_C(0xffff));
-  mask.meta.pkt_meta = DOCA_HTOBE32(UINT32_C(0xffff));
-  fwd.type = DOCA_FLOW_FWD_DROP;
-  flow_entry_cookie_prepare(&pipeline->control_tx_drop.cookie,
-                            "invalid control TX", DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_control_add_entry(
-      pipeline->runtime->queue_id, pipeline->control_tx_pipe,
-      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 1, &fwd,
-      &pipeline->control_tx_drop.cookie, &pipeline->control_tx_drop.entry);
-  if (result != DOCA_SUCCESS)
-    return result;
-  result = process_rules(pipeline, &pipeline->control_tx_drop, 1);
-  if (result != DOCA_SUCCESS)
-    return result;
-  /* Secondary diagnostic only: zero does not prove no EGRESS traffic. */
-  memset(&match, 0, sizeof(match));
-  memset(&mask, 0, sizeof(mask));
-  match.parser_meta.port_id = UINT16_MAX;
-  mask.parser_meta.port_id = UINT16_MAX;
-  flow_entry_cookie_prepare(&pipeline->control_tx_untagged.cookie,
-                            "untagged software TX", DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_control_add_entry(
-      pipeline->runtime->queue_id, pipeline->control_tx_pipe,
-      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 2, &fwd,
-      &pipeline->control_tx_untagged.cookie, &pipeline->control_tx_untagged.entry);
-  if (result != DOCA_SUCCESS)
-    return result;
-  return process_rules(pipeline, &pipeline->control_tx_untagged, 1);
+doca_error_t eswitch_pipeline_tx_probe_arm(struct eswitch_pipeline *p,
+    uint16_t port, const uint8_t *src, const uint8_t *dst) {
+  if (p == NULL || !p->created || src == NULL || dst == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  int index = find_port_index(p, port);
+  if (!p->created || index < 0 ||
+      p->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (p->tx_probe_rule.entry != NULL) {
+    if (p->tx_probe_rule.cookie.last_status != DOCA_FLOW_ENTRY_STATUS_SUCCESS)
+      return DOCA_ERROR_BAD_STATE;
+    return p->tx_probe_port == port && !memcmp(p->tx_probe_src, src, 6) &&
+           !memcmp(p->tx_probe_dst, dst, 6) ? DOCA_SUCCESS : DOCA_ERROR_BAD_STATE;
+  }
+  struct doca_flow_match match = {0};
+  memcpy(match.outer.eth.src_mac, src, 6);
+  memcpy(match.outer.eth.dst_mac, dst, 6);
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = port};
+  doca_error_t result = tx_basic_entry(p, p->tx_probe_pipe, &match, &fwd,
+                                      &p->tx_probe_rule, "TX A ARP probe");
+  if (result == DOCA_SUCCESS) {
+    p->tx_probe_port = port;
+    memcpy(p->tx_probe_src, src, 6);
+    memcpy(p->tx_probe_dst, dst, 6);
+    printf("TX PROBE ARMED: dpdk-port=%u; tuple locked until restart\n", port);
+  }
+  return result;
 }
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
@@ -516,7 +526,10 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     return;
   if (pipeline->control_tx_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->control_tx_pipe);
-  free(pipeline->control_tx_rules);
+  if (pipeline->tx_probe_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->tx_probe_pipe);
+  if (pipeline->tx_drop_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->tx_drop_pipe);
   if (pipeline->ingress_classifier_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
   if (pipeline->arp_dispatch_pipe != NULL)

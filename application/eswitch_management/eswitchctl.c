@@ -21,7 +21,7 @@ static void print_help(FILE *output, const char *program) {
           "  vs-port-attach --id <id> --port <p> Attach an available port\n"
           "  vs-port-detach --id <id> --port <p> Detach a member port\n"
           "  vs-list                             List virtual switches\n"
-          "  tx-debug                            TX status and parent driver dump (may pause polling)\n"
+          "  tx-debug                            Plan A TX status (cached Flow counters)\n"
           "  show-fdb [--id <id>]                Show all or one FDB\n"
           "  list-port-available                 List unassigned DPDK ports\n"
           "  vr create|delete|show --id <id>     Manage logical routers\n"

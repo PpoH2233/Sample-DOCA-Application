@@ -11,7 +11,6 @@
 
 #include "../../ethernet_switch/flow_ports.h"
 #include "../../ethernet_switch/flow_runtime.h"
-#include "control_tx_metadata.h"
 
 struct eswitch_rule {
   struct doca_flow_pipe_entry *entry;
@@ -54,9 +53,11 @@ struct eswitch_pipeline {
   struct eswitch_rule arp_dispatch_rule;
   struct doca_flow_pipe *ingress_classifier_pipe;
   struct doca_flow_pipe *control_tx_pipe;
-  struct eswitch_rule *control_tx_rules; /* probed representors only */
+  struct doca_flow_pipe *tx_probe_pipe, *tx_drop_pipe;
+  struct eswitch_rule tx_root_rule, tx_probe_rule;
+  uint16_t tx_probe_port;
+  uint8_t tx_probe_src[6], tx_probe_dst[6];
   struct eswitch_rule control_tx_drop;
-  struct eswitch_rule control_tx_untagged;
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -76,6 +77,8 @@ struct eswitch_hw_fdb_entry {
 };
 
 uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
+doca_error_t eswitch_pipeline_tx_probe_arm(struct eswitch_pipeline *pipeline,
+    uint16_t port, const uint8_t *src, const uint8_t *dst);
 void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
                             uint16_t *port_id);
 
