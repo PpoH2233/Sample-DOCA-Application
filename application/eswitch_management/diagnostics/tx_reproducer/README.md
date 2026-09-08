@@ -2,6 +2,25 @@
 
 ## Experiment B: hardware ingress versus software TX
 
+### No VM script: use `TX_PROBE_PATH=hw-arp`
+
+Rebuild, then use the HW command below with `TX_PROBE_PATH=hw-arp` instead of
+`hw`. After PROBE READY, run on the VF10 VM:
+
+```bash
+sudo arping -b -c 10 -I ens6 192.168.0.1
+```
+
+This requires the iputils version of arping (`-b` keeps requests broadcast).
+The selector matches verified VF + VM source MAC + broadcast destination MAC +
+ARP EtherType. It does not match the ARP target IP or opcode. Stop other ping/
+arping tests to minimize unrelated ARP; excess counts require a quiet rerun,
+not a conclusion that EGRESS is broken. Existing `hw` mode remains unchanged.
+This forwards requests unchanged, **not** ARP replies; arping can time out even
+when EGRESS counters pass. Only test on an isolated, non-bridging VM interface
+to avoid reflected broadcast traffic. Check HW SUMMARY for selected=10/hit=10.
+No software TX is performed in this mode either.
+
 `TX_PROBE_PATH=sw` (default) retains the original software test.
 `TX_PROBE_PATH=hw` disables software TX completely and uses:
 

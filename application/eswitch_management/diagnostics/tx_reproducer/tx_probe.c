@@ -17,6 +17,7 @@ static struct rte_mempool *pool;
 static volatile sig_atomic_t interrupted;
 static uint32_t expected_vf;
 static bool hardware_path;
+static bool hardware_arp;
 
 static void stop_probe(int sig) { (void)sig; interrupted = 1; }
 
@@ -27,11 +28,12 @@ int tx_probe_validate_config(void)
     const char *vm_ip = getenv("TX_PROBE_VM_IP");
     const char *gw_ip = getenv("TX_PROBE_GATEWAY_IP");
     const char *mode = getenv("TX_PROBE_PATH");
-    if (mode && strcmp(mode, "sw") && strcmp(mode, "hw")) {
-        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw or hw\n");
+    if (mode && strcmp(mode, "sw") && strcmp(mode, "hw") && strcmp(mode, "hw-arp")) {
+        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, hw or hw-arp\n");
         return -1;
     }
-    hardware_path = mode && strcmp(mode, "hw") == 0;
+    hardware_arp = mode && strcmp(mode, "hw-arp") == 0;
+    hardware_path = hardware_arp || (mode && strcmp(mode, "hw") == 0);
     /* Explicit test scope, not a default destination. No TX before all gates. */
     if (!vf || strlen(vf) != 2 || vf[0] != '1' || vf[1] < '0' || vf[1] > '5' ||
         probe_mac(getenv("TX_PROBE_VM_MAC"), vm) != 0 ||
@@ -114,6 +116,10 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
         memcpy(match.outer.eth.src_mac, frame, 6);
         memcpy(match.outer.eth.dst_mac, frame + 6, 6);
         match.outer.eth.type = rte_cpu_to_be_16(0x88b5);
+        if (hardware_arp) {
+            memset(match.outer.eth.dst_mac, 0xff, 6);
+            match.outer.eth.type = rte_cpu_to_be_16(0x0806);
+        }
         fwd.type = DOCA_FLOW_FWD_PIPE;
         fwd.next_pipe = *egress_pipe;
     }
@@ -154,7 +160,8 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     resource.nr_counters = 8;
     resource.nr_rss = 1;
     fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=disabled; "
-            "path=%s; EGRESS=match-all->VF\n", hardware_path ? "hw" : "sw");
+            "path=%s; EGRESS=match-all->VF\n",
+            hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw"));
     r = init_doca_flow(nb_queues, "switch,hws,hairpinq_num=4,expert", &resource, shared);
     if (r != DOCA_SUCCESS) return r;
     r = init_doca_flow_switch_ports(ctx->devs_ctx.devs_manager, ctx->devs_ctx.nb_devs,
@@ -178,8 +185,9 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     if (hardware_path) {
         signal(SIGINT, stop_probe);
         signal(SIGTERM, stop_probe);
-        fprintf(stderr, "PROBE READY: path=hw software_tx=OFF; send 10 synthetic "
-                "0x88b5 frames from VM within 30 seconds; no ping required\n");
+        fprintf(stderr, "PROBE READY: path=%s software_tx=OFF; send 10 %s "
+                "from VM within 30 seconds\n", hardware_arp ? "hw-arp" : "hw",
+                hardware_arp ? "broadcast ARP frames using arping -b -c 10" : "synthetic 0x88b5 frames");
         for (int i = 0; i < 30 && !interrupted; ++i) {
             sleep(1);
             r = doca_flow_resource_query_entry(ingress, &iq);
