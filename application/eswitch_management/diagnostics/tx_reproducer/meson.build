@@ -14,3 +14,6 @@ executable('eswitch-tx-reproducer',
   dependencies: deps, install: false)
 packet_test = executable('probe-packet-test', 'probe_packet_test.c', install: false)
 test('probe-packet', packet_test)
+match_test = executable('probe-match-test', 'probe_match_test.c',
+  dependencies: deps, install: false)
+test('probe-match', match_test)

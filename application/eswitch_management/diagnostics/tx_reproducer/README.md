@@ -4,6 +4,15 @@
 
 ### No VM script: use `TX_PROBE_PATH=hw-arp`
 
+Broadcast selector fix: according to [DOCA 3.4 Implicit Match](https://networking-docs.nvidia.com/doca/archive/3-4-0/doca-flow),
+an all-ones template field is changeable. The entry must therefore also carry
+`ff:ff:ff:ff:ff:ff` as the desired destination, rather than zero. `MATCH DEBUG`
+prints the per-entry value before submission. The SDK-backed `probe-match`
+Meson test checks this helper and verifies other modes keep zero entry fields;
+it needs headers/libraries but no device access. This fixes the HW-ARP diagnostic
+selector, not the original software TX problem. Rebuild and re-run HW-ARP before
+drawing conclusions about ingress-to-egress forwarding.
+
 Rebuild, then use the HW command below with `TX_PROBE_PATH=hw-arp` instead of
 `hw`. After PROBE READY, run on the VF10 VM:
 

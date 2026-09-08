@@ -11,6 +11,7 @@
 #include <flow_common.h>
 #include <flow_switch_common.h>
 #include "probe_packet.h"
+#include "probe_match.h"
 
 static uint8_t frame[60];
 static struct rte_mempool *pool;
@@ -110,8 +111,8 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     fwd.type = egress ? DOCA_FLOW_FWD_PORT : DOCA_FLOW_FWD_DROP;
     if (egress) fwd.port_id = 1; /* Mapping verified before queues/Flow init. */
     if (!egress && hardware_path) {
-        /* Only synthetic frames from the verified VF/VM can cross domains.
-         * All fields are fixed in the template; entry match below is empty. */
+        /* Only selected frames from the verified VF/VM can cross domains.
+         * Broadcast dst MAC is changeable (all ones), not a fixed field. */
         match.parser_meta.port_id = 1;
         memcpy(match.outer.eth.src_mac, frame, 6);
         memcpy(match.outer.eth.dst_mac, frame + 6, 6);
@@ -137,7 +138,15 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     doca_flow_pipe_cfg_destroy(cfg);
     if (r != DOCA_SUCCESS) return r;
     if (egress) *egress_pipe = pipe;
-    memset(&match, 0, sizeof(match));
+    probe_entry_match(&match, egress, hardware_arp);
+    if (!egress && hardware_arp) {
+        fprintf(stderr, "MATCH DEBUG: DOCA-3.4 implicit ingress port=1 "
+                "ethertype=0x0806 dst_template=ff:ff:ff:ff:ff:ff(changeable) "
+                "dst_entry=%02x:%02x:%02x:%02x:%02x:%02x fwd=EGRESS\n",
+                match.outer.eth.dst_mac[0], match.outer.eth.dst_mac[1],
+                match.outer.eth.dst_mac[2], match.outer.eth.dst_mac[3],
+                match.outer.eth.dst_mac[4], match.outer.eth.dst_mac[5]);
+    }
     return doca_flow_pipe_basic_add_entry(0, pipe, &match, 0, NULL, &mon, NULL,
                                           DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, status, entry);
 }
