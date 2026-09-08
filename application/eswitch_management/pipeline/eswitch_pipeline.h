@@ -11,6 +11,7 @@
 
 #include "../../ethernet_switch/flow_ports.h"
 #include "../../ethernet_switch/flow_runtime.h"
+#include "control_tx_metadata.h"
 
 struct eswitch_rule {
   struct doca_flow_pipe_entry *entry;
@@ -55,6 +56,7 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *control_tx_pipe;
   struct eswitch_rule *control_tx_rules; /* probed representors only */
   struct eswitch_rule control_tx_drop;
+  struct eswitch_rule control_tx_untagged;
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -74,10 +76,6 @@ struct eswitch_hw_fdb_entry {
 };
 
 uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
-/* Host-order mbuf TX metadata; Flow match converts this to big endian. */
-static inline uint32_t eswitch_control_tx_metadata(uint16_t port_id) {
-  return UINT32_C(0xa7c00000) | port_id;
-}
 void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
                             uint16_t *port_id);
 

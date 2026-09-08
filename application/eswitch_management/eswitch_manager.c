@@ -10,6 +10,7 @@
 
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
+#include <rte_errno.h>
 #include <rte_flow.h>
 #include <rte_mbuf.h>
 
@@ -303,34 +304,86 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
                               struct rte_mbuf *request, uint16_t vs,
                               uint16_t ingress, uint64_t now_ns) {
   uint8_t scratch[42], response[60];
+  bool debug = manager->arp_seen < 3 || now_ns - manager->tx_log_ns >= 1000000000ULL;
+  if (manager->arp_seen == manager->tx_snapshot_seen)
+    manager->tx_snapshot_ns = now_ns;
+  manager->arp_seen++;
+  if (debug)
+    manager->tx_log_ns = now_ns;
   const uint8_t *bytes = rte_pktmbuf_read(request, 0, sizeof(scratch), scratch);
   if (!bytes || !router_arp_reply(manager->router, vs, bytes, sizeof(scratch),
-                                   response, sizeof(response))) return;
+                                   response, sizeof(response))) {
+    manager->arp_ignored++;
+    if (debug)
+      printf("ARP TX SKIP: vs=%u port=%u reason=%s rx_len=%u\n", vs, ingress,
+             bytes ? "not-local-gateway-request-or-invalid-arp" : "truncated-frame",
+             rte_pktmbuf_pkt_len(request));
+    return;
+  }
+  manager->arp_built++;
+  int index = find_port_index(manager, ingress);
+  if (index < 0 || ingress == UINT16_MAX ||
+      manager->port_owner[index] != vs ||
+      manager->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR ||
+      !manager->io->port_started || !manager->io->metadata_registered ||
+      manager->pipeline->control_tx_rules[index].entry == NULL) {
+    manager->arp_target_drops++;
+    manager->arp_tx_drops++;
+    if (debug)
+      printf("ARP TX DROP: stage=target-validation vs=%u port=%u index=%d\n",
+             vs, ingress, index);
+    return;
+  }
   if (now_ns - manager->arp_window_ns >= 1000000000ULL) {
     manager->arp_window_ns = now_ns;
     manager->arp_window_replies = 0;
   }
   if (manager->arp_window_replies >= 100) {
     manager->arp_rate_drops++;
+    if (debug) printf("ARP TX DROP: stage=rate-limit limit=100/s\n");
     return;
   }
   manager->arp_window_replies++;
   struct rte_mbuf *reply = rte_pktmbuf_alloc(manager->io->mbuf_pool);
-  if (!reply) {manager->arp_tx_drops++; return;}
+  if (!reply) {
+    manager->arp_tx_drops++; manager->arp_alloc_drops++;
+    if (debug) printf("ARP TX DROP: stage=mbuf-alloc errno=%d\n", rte_errno);
+    return;
+  }
   void *data = rte_pktmbuf_append(reply, sizeof(response));
-  if (!data) {rte_pktmbuf_free(reply); manager->arp_tx_drops++; return;}
+  if (!data) {
+    if (debug) printf("ARP TX DROP: stage=append need=%zu tailroom=%u\n",
+                       sizeof(response), rte_pktmbuf_tailroom(reply));
+    rte_pktmbuf_free(reply); manager->arp_tx_drops++; manager->arp_append_drops++;
+    return;
+  }
   memcpy(data, response, sizeof(response));
   /* Fresh padded Ethernet/ARP frame; expert EGRESS rule selects the VF.
    * Never reuse RX metadata or re-enter the L2 split-horizon path. */
   rte_flow_dynf_metadata_set(reply, eswitch_control_tx_metadata(ingress));
   reply->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+  if (debug) {
+    const struct ethernet_port *target = manager->ports->items[index].ethernet;
+    printf("ARP TX BUILD: vs=%u parent=%u queue=%u target=%u host=%u pf=%u vf=%u "
+           "len=%u data_len=%u nb_segs=%u metadata=0x%08x flags=0x%016" PRIx64 "\n",
+           vs, manager->io->parent_port_id, SWITCH_TX_QUEUE_ID, ingress,
+           target->host_index, target->pf_index, target->vf_index,
+           reply->pkt_len, reply->data_len, reply->nb_segs,
+           *RTE_FLOW_DYNF_METADATA(reply), reply->ol_flags);
+    printf("ARP TX FRAME:");
+    for (size_t i = 0; i < sizeof(response); i++) printf(" %02x", response[i]);
+    printf("\n");
+  }
   if (rte_eth_tx_burst(manager->io->parent_port_id, SWITCH_TX_QUEUE_ID,
                        &reply, 1) == 1) {
     manager->arp_replies++;
-    printf("ARP TX ENQUEUED: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
+    if (debug) printf("ARP TX ENQUEUED: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
            response[28], response[29], response[30], response[31]);
   } else {
     manager->arp_tx_drops++;
+    manager->arp_enqueue_drops++;
+    if (debug) printf("ARP TX DROP: stage=enqueue parent=%u queue=%u accepted=0\n",
+                       manager->io->parent_port_id, SWITCH_TX_QUEUE_ID);
     rte_pktmbuf_free(reply); /* Only free when ownership was not transferred. */
   }
 }
@@ -410,12 +463,26 @@ doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
   return DOCA_SUCCESS;
 }
 
+static size_t format_status(const struct eswitch_manager *manager,
+                            char *response, size_t size);
+
 doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   uint64_t now_ns;
 
   if (manager == NULL || !manager->initialized)
     return DOCA_ERROR_INVALID_VALUE;
   now_ns = monotonic_ns();
+  /* Delayed snapshots, not synchronous HW reads per packet. Include one
+   * snapshot after traffic stops; keep normal idle operation quiet. */
+  if (manager->arp_seen != manager->tx_snapshot_seen &&
+      now_ns - manager->tx_snapshot_ns >= 5000000000ULL) {
+    char diagnostic[8192];
+    format_status(manager, diagnostic, sizeof(diagnostic));
+    printf("TX DEBUG SNAPSHOT (cumulative; enqueue/rule hits are not guest receipt):\n%s",
+           diagnostic);
+    manager->tx_snapshot_seen = manager->arp_seen;
+    manager->tx_snapshot_ns = now_ns;
+  }
   if (now_ns < manager->next_aging_ns)
     return DOCA_SUCCESS;
   manager->next_aging_ns = now_ns +
@@ -509,17 +576,36 @@ static size_t format_status(const struct eswitch_manager *manager,
       "private_gateway_arp=enabled arp_tx_enqueued=%" PRIu64
       " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",
       manager->arp_replies, manager->arp_tx_drops, manager->arp_rate_drops);
-  for (uint16_t i = 0; i <= manager->ports->count; i++) {
-    bool drop = i == manager->ports->count;
-    const struct eswitch_rule *rule = drop
+  used = append_text(response, size, used,
+      "arp_seen=%" PRIu64 " arp_ignored=%" PRIu64 " arp_built=%" PRIu64
+      " target_drops=%" PRIu64 " alloc_drops=%" PRIu64 " append_drops=%" PRIu64
+      " enqueue_drops=%" PRIu64 "\n",
+      manager->arp_seen, manager->arp_ignored, manager->arp_built,
+      manager->arp_target_drops, manager->arp_alloc_drops, manager->arp_append_drops,
+      manager->arp_enqueue_drops);
+  struct rte_eth_stats stats = {0};
+  int stats_result = rte_eth_stats_get(manager->io->parent_port_id, &stats);
+  if (stats_result == 0)
+    used = append_text(response, size, used,
+        "parent_tx port=%u opackets=%" PRIu64 " obytes=%" PRIu64
+        " oerrors=%" PRIu64 " (ethdev-counters-not-delivery-proof)\n",
+        manager->io->parent_port_id, stats.opackets, stats.obytes, stats.oerrors);
+  else
+    used = append_text(response, size, used, "parent_tx port=%u stats_error=%d\n",
+                        manager->io->parent_port_id, stats_result);
+  for (uint32_t i = 0; i < (uint32_t)manager->ports->count + 2; i++) {
+    bool drop = i >= manager->ports->count;
+    const struct eswitch_rule *rule = i == manager->ports->count
         ? &manager->pipeline->control_tx_drop
-        : &manager->pipeline->control_tx_rules[i];
+        : (i > manager->ports->count ? &manager->pipeline->control_tx_untagged
+                                     : &manager->pipeline->control_tx_rules[i]);
     struct doca_flow_resource_query query = {0};
     if (rule->entry == NULL)
       continue;
     doca_error_t result = doca_flow_resource_query_entry(rule->entry, &query);
     if (drop)
-      used = append_text(response, size, used, "control_tx_invalid");
+      used = append_text(response, size, used, "%s",
+          i == manager->ports->count ? "control_tx_invalid" : "control_tx_sw_untagged");
     else
       used = append_text(response, size, used, "control_tx port=%u",
                           manager->ports->items[i].ethernet->port_id);

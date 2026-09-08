@@ -376,7 +376,7 @@ static doca_error_t create_ingress_classifier(
 }
 
 /* Expert-mode software TX enters EGRESS, not the DEFAULT L2 root. Match
- * software origin explicitly so RX metadata can never select this path.
+ * the reserved TX metadata namespace; no software-origin parser assumption.
  * One rule per probed VF is sufficient: the manager validates current VS/RIF
  * ownership before constructing a reply. No rule may target the parent.
  * Non-software traffic retains the domain's default wire/representor path. */
@@ -395,7 +395,7 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_CONTROL_TX", DOCA_FLOW_PIPE_CONTROL,
-                             true, pipeline->ports->count + 1);
+                             true, pipeline->ports->count + 2);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
   if (result == DOCA_SUCCESS)
@@ -405,8 +405,6 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
     return result;
 
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-  match.parser_meta.port_id = UINT16_MAX; /* software TX, not any-port */
-  mask.parser_meta.port_id = UINT16_MAX;
   match.outer.eth.type = DOCA_HTOBE16(0x0806);
   mask.outer.eth.type = UINT16_MAX;
   mask.meta.pkt_meta = UINT32_MAX;
@@ -429,14 +427,18 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
     result = process_rules(pipeline, rule, 1);
     if (result != DOCA_SUCCESS)
       return result;
+    printf("TX RULE READY: domain=EGRESS port=%u host=%u pf=%u vf=%u "
+           "metadata=0x%08x ethertype=0x0806 origin=metadata\n",
+           port->port_id, port->host_index, port->pf_index, port->vf_index,
+           eswitch_control_tx_metadata(port->port_id));
   }
 
-  /* Fail closed for untagged TX, unknown ports, and unsupported protocols. */
+  /* Count invalid tagged TX independently of parser_meta.port_id. */
   memset(&match, 0, sizeof(match));
   memset(&mask, 0, sizeof(mask));
   memset(&fwd, 0, sizeof(fwd));
-  match.parser_meta.port_id = UINT16_MAX;
-  mask.parser_meta.port_id = UINT16_MAX;
+  match.meta.pkt_meta = DOCA_HTOBE32(UINT32_C(0xffff));
+  mask.meta.pkt_meta = DOCA_HTOBE32(UINT32_C(0xffff));
   fwd.type = DOCA_FLOW_FWD_DROP;
   flow_entry_cookie_prepare(&pipeline->control_tx_drop.cookie,
                             "invalid control TX", DOCA_FLOW_ENTRY_OP_ADD);
@@ -446,7 +448,23 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *pipeline) {
       &pipeline->control_tx_drop.cookie, &pipeline->control_tx_drop.entry);
   if (result != DOCA_SUCCESS)
     return result;
-  return process_rules(pipeline, &pipeline->control_tx_drop, 1);
+  result = process_rules(pipeline, &pipeline->control_tx_drop, 1);
+  if (result != DOCA_SUCCESS)
+    return result;
+  /* Secondary diagnostic only: zero does not prove no EGRESS traffic. */
+  memset(&match, 0, sizeof(match));
+  memset(&mask, 0, sizeof(mask));
+  match.parser_meta.port_id = UINT16_MAX;
+  mask.parser_meta.port_id = UINT16_MAX;
+  flow_entry_cookie_prepare(&pipeline->control_tx_untagged.cookie,
+                            "untagged software TX", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->control_tx_pipe,
+      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 2, &fwd,
+      &pipeline->control_tx_untagged.cookie, &pipeline->control_tx_untagged.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &pipeline->control_tx_untagged, 1);
 }
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,

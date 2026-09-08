@@ -21,14 +21,19 @@ consistency, selects the RIF by ingress vSwitch and exact target IP, and builds
 a 60-byte padded response. Each reply uses a fresh mbuf. Management now opts
 into `switch,hws,expert` (the standalone ethernet_switch app keeps its default).
 Parent TX queue 0 injects the reply with host-order metadata
-`0xa7c00000 | target_dpdk_port_id`. `ESW_CONTROL_TX`, an EGRESS root control
-pipe, matches software origin (`parser_meta.port_id == UINT16_MAX` with an
-explicit mask), ARP EtherType and the exact metadata, then forwards to that
+`(target_dpdk_port_id << 16) | 0xffff`. `ESW_CONTROL_TX`, an EGRESS root control
+pipe, matches ARP EtherType and the exact metadata, then forwards to that
 probed VF using `FWD_PORT`. Flow metadata matches use big-endian values.
 This bypasses the DEFAULT-domain ingress classifier and L2 split horizon.
 There are no TX rules targeting the parent; current VS ownership and RIF
 configuration are checked by the Arm handler before generating a reply.
-Other software TX hits a counted DROP rule; hardware traffic retains the
+The low 16 bits of RX metadata are a valid ingress port, never `0xffff`, so
+this TX namespace cannot collide with L2 metadata for any vSwitch ID. The
+forwarding rule no longer depends on the software-origin parser sentinel.
+Invalid tagged TX hits `control_tx_invalid`; a separate lower-priority
+software-origin DROP rule counts `control_tx_sw_untagged`. Zero on that
+secondary rule alone is not proof that no software TX entered EGRESS.
+Unmatched hardware traffic retains the
 EGRESS domain's default forwarding behavior. All TX rules must commit before
 the daemon serves commands. A successful TX enqueue transfers mbuf ownership;
 failed TX frees it without blocking/retrying in the manager loop.
@@ -67,6 +72,33 @@ If enqueued increases but no TX hardware counter changes, check parent TX and
 metadata/EGRESS entry installation. If invalid increases, inspect the injection
 tag, protocol and port mapping. If the correct forwarding counter increases
 without guest replies, investigate the VF/host/VM receive path next.
+
+### TX debug output
+
+No extra flag is required for the current test build:
+
+- `TX RULE READY`: committed EGRESS rule, exact metadata and host/PF/VF mapping.
+- `ARP TX BUILD`: parent/queue/target, packet length, segment count, metadata and
+  mbuf flags. `ARP TX FRAME` dumps the complete 60-byte generated ARP frame.
+  Detailed packet logs cover the first three ARP requests, then at most once
+  per second globally. They include MAC/IP addresses; handle logs accordingly.
+- `ARP TX SKIP`: truncated frame or request rejected by gateway/ARP validation.
+- `ARP TX DROP`: target validation, rate limit, allocation, append or enqueue
+  failure. Status keeps exact cumulative stage counts even when logs suppress
+  repeated events. `arp_built` means response bytes were constructed, not sent.
+- `TX DEBUG SNAPSHOT`: cumulative status at most every five seconds when ARP
+  activity changes, including a trailing snapshot after traffic stops.
+- `parent_tx`: DPDK ethdev `opackets`, `obytes`, `oerrors`, or a query error.
+  These may include other traffic and depend on PMD counter support; neither
+  ethdev counters nor Flow hit counters prove guest receipt. Compare two
+  snapshots and confirm with guest tcpdump. No TX statistics are reset.
+
+For target DPDK port 2 the new host-order TX metadata must be `0x0002ffff`.
+The reply Ethernet destination must be the requester's MAC, source the private
+RIF MAC, EtherType `0806`, and ARP opcode `0002`. Successful enqueue transfers
+ownership; the code never reads or frees the mbuf afterward. No retries or
+extra diagnostic packets are injected. Restart the daemon after rebuilding;
+old and new TX metadata formats must not be mixed.
 `ping` can populate the neighbor cache but will not receive ICMP Echo Reply yet.
 Also test ordinary ARP between two VMs to verify L2 behavior remains intact,
 and remove the gateway IP to confirm the responder stops. Also test another
