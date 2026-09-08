@@ -22,6 +22,7 @@
 #include "router/router_arp.h"
 #include "l2/l2_switch.h"
 #include "pipeline/tx_plan_a.h"
+#include "pipeline/tx_build.h"
 
 static uint64_t monotonic_ns(void) {
   struct timespec value;
@@ -603,6 +604,8 @@ static size_t format_status(const struct eswitch_manager *manager,
                      uptime);
   used = append_text(response, size, used, "config=%s\n",
                      manager->state_path);
+  used = append_text(response, size, used,
+      "tx_revision=%s tx_mode=%s\n", ESWITCH_TX_REVISION, ESWITCH_TX_FLOW_MODE);
   used = append_text(response, size, used,
                      "ports=%u assigned=%zu available=%zu vswitches=%zu "
                      "fdb=%zu\n",

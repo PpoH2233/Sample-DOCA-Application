@@ -442,7 +442,7 @@ static doca_error_t create_control_tx(struct eswitch_pipeline *p) {
   fwd = (struct doca_flow_fwd){.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = p->tx_probe_pipe};
   result = tx_basic_pipe(p, "TX_A_EGRESS_ROOT", true, &match, NULL,
-                         &fwd, NULL, &p->control_tx_pipe);
+                         &fwd, &miss, &p->control_tx_pipe);
   if (result != DOCA_SUCCESS) return result;
   result = tx_basic_entry(p, p->control_tx_pipe, &match, NULL, &p->tx_root_rule,
                           "TX A root");
@@ -469,6 +469,12 @@ doca_error_t eswitch_pipeline_tx_probe_arm(struct eswitch_pipeline *p,
   memcpy(match.outer.eth.src_mac, src, 6);
   memcpy(match.outer.eth.dst_mac, dst, 6);
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = port};
+  printf("TX MATCH: domain=EGRESS ethertype=0x0806 "
+         "src=%02x:%02x:%02x:%02x:%02x:%02x "
+         "dst=%02x:%02x:%02x:%02x:%02x:%02x target=%u "
+         "mac_fields=per-entry metadata=disabled\n",
+         src[0], src[1], src[2], src[3], src[4], src[5],
+         dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], port);
   doca_error_t result = tx_basic_entry(p, p->tx_probe_pipe, &match, &fwd,
                                       &p->tx_probe_rule, "TX A ARP probe");
   if (result == DOCA_SUCCESS) {

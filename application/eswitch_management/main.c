@@ -16,6 +16,7 @@
 #include "eswitch_build_config.h"
 #include "eswitch_manager.h"
 #include "pipeline/eswitch_pipeline.h"
+#include "pipeline/tx_build.h"
 
 static volatile sig_atomic_t stop_requested;
 
@@ -107,10 +108,12 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_devices;
   }
-  printf("TX CONFIG: plan=A mode=switch,hws,expert metadata=disabled "
-         "debug=first-3-then-1/s snapshots=5s\n");
+  printf("TX BUILD: revision=%s compiled=%s %s\n",
+         ESWITCH_TX_REVISION, __DATE__, __TIME__);
+  printf("TX CONFIG: plan=A mode=%s metadata=disabled "
+         "debug=first-3-then-1/s snapshots=5s\n", ESWITCH_TX_FLOW_MODE);
   result = flow_runtime_init_with_mode(&runtime, SWITCH_FLOW_COUNTER_COUNT,
-                                       "switch,hws,expert");
+                                       ESWITCH_TX_FLOW_MODE);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize DOCA Flow: %s\n",
             doca_error_get_descr(result));
@@ -122,6 +125,17 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_flow;
   }
+  /* Follow flow_switch_to_wire: obtain switch domain from the actual parent
+   * Flow handle, not the process-global NULL lookup. Parent is item 0,
+   * independent of its dynamically discovered DPDK port ID. */
+  flow_ports.switch_port = doca_flow_port_switch_get(flow_ports.items[0].flow);
+  if (flow_ports.switch_port == NULL) {
+    result = DOCA_ERROR_NOT_FOUND;
+    fprintf(stderr, "TX DOMAIN ERROR: parent switch handle unavailable\n");
+    goto cleanup_flow_ports;
+  }
+  printf("TX DOMAIN: parent=%u lookup=explicit-parent revision=%s\n",
+         flow_ports.items[0].ethernet->port_id, ESWITCH_TX_REVISION);
   result = eswitch_pipeline_create(&runtime, &flow_ports, &pipeline);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to create eSwitch pipeline: %s\n",
