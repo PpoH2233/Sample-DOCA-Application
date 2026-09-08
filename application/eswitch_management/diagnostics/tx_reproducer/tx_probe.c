@@ -16,6 +16,7 @@ static uint8_t frame[60];
 static struct rte_mempool *pool;
 static volatile sig_atomic_t interrupted;
 static uint32_t expected_vf;
+static bool hardware_path;
 
 static void stop_probe(int sig) { (void)sig; interrupted = 1; }
 
@@ -25,6 +26,12 @@ int tx_probe_validate_config(void)
     const char *vf = getenv("TX_PROBE_VF");
     const char *vm_ip = getenv("TX_PROBE_VM_IP");
     const char *gw_ip = getenv("TX_PROBE_GATEWAY_IP");
+    const char *mode = getenv("TX_PROBE_PATH");
+    if (mode && strcmp(mode, "sw") && strcmp(mode, "hw")) {
+        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw or hw\n");
+        return -1;
+    }
+    hardware_path = mode && strcmp(mode, "hw") == 0;
     /* Explicit test scope, not a default destination. No TX before all gates. */
     if (!vf || strlen(vf) != 2 || vf[0] != '1' || vf[1] < '0' || vf[1] > '5' ||
         probe_mac(getenv("TX_PROBE_VM_MAC"), vm) != 0 ||
@@ -87,7 +94,8 @@ void tx_probe_release_pool(void)
 
 static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
                               struct entries_status *status,
-                              struct doca_flow_pipe_entry **entry)
+                              struct doca_flow_pipe_entry **entry,
+                              struct doca_flow_pipe **egress_pipe)
 {
     struct doca_flow_pipe_cfg *cfg = NULL;
     struct doca_flow_pipe *pipe = NULL;
@@ -99,9 +107,20 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     miss.type = DOCA_FLOW_FWD_DROP;
     fwd.type = egress ? DOCA_FLOW_FWD_PORT : DOCA_FLOW_FWD_DROP;
     if (egress) fwd.port_id = 1; /* Mapping verified before queues/Flow init. */
+    if (!egress && hardware_path) {
+        /* Only synthetic frames from the verified VF/VM can cross domains.
+         * All fields are fixed in the template; entry match below is empty. */
+        match.parser_meta.port_id = 1;
+        memcpy(match.outer.eth.src_mac, frame, 6);
+        memcpy(match.outer.eth.dst_mac, frame + 6, 6);
+        match.outer.eth.type = rte_cpu_to_be_16(0x88b5);
+        fwd.type = DOCA_FLOW_FWD_PIPE;
+        fwd.next_pipe = *egress_pipe;
+    }
     r = doca_flow_pipe_cfg_create(&cfg, sw);
     if (r != DOCA_SUCCESS) return r;
-    r = set_flow_pipe_cfg(cfg, egress ? "TX_PROBE_EGRESS" : "TX_PROBE_INGRESS_DROP",
+    r = set_flow_pipe_cfg(cfg, egress ? "TX_PROBE_EGRESS" :
+                          (hardware_path ? "TX_PROBE_INGRESS_TO_EGRESS" : "TX_PROBE_INGRESS_DROP"),
                           DOCA_FLOW_PIPE_BASIC, true);
     if (r == DOCA_SUCCESS) r = doca_flow_pipe_cfg_set_nr_entries(cfg, 1);
     if (r == DOCA_SUCCESS && egress)
@@ -111,6 +130,8 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     if (r == DOCA_SUCCESS) r = doca_flow_pipe_create(cfg, &fwd, &miss, &pipe);
     doca_flow_pipe_cfg_destroy(cfg);
     if (r != DOCA_SUCCESS) return r;
+    if (egress) *egress_pipe = pipe;
+    memset(&match, 0, sizeof(match));
     return doca_flow_pipe_basic_add_entry(0, pipe, &match, 0, NULL, &mon, NULL,
                                           DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, status, entry);
 }
@@ -123,6 +144,7 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     uint32_t actions[2] = {ACTIONS_MEM_SIZE(2), ACTIONS_MEM_SIZE(2)};
     struct entries_status status = {0};
     struct doca_flow_pipe_entry *egress = NULL, *ingress = NULL;
+    struct doca_flow_pipe *egress_pipe = NULL;
     struct doca_flow_resource_query q = {0}, iq = {0};
     struct rte_eth_stats before = {0}, after = {0};
     uint64_t accepted = 0;
@@ -132,7 +154,7 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     resource.nr_counters = 8;
     resource.nr_rss = 1;
     fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=disabled; "
-            "packets=10 interval=1s; DEFAULT=DROP; EGRESS=match-all->VF\n");
+            "path=%s; EGRESS=match-all->VF\n", hardware_path ? "hw" : "sw");
     r = init_doca_flow(nb_queues, "switch,hws,hairpinq_num=4,expert", &resource, shared);
     if (r != DOCA_SUCCESS) return r;
     r = init_doca_flow_switch_ports(ctx->devs_ctx.devs_manager, ctx->devs_ctx.nb_devs,
@@ -140,8 +162,9 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     if (r != DOCA_SUCCESS) { doca_flow_destroy(); return r; }
     sw = doca_flow_port_switch_get(ports[0]);
     if (!sw) { r = DOCA_ERROR_BAD_STATE; goto out; }
-    r = root_pipe(sw, false, &status, &ingress);
-    if (r == DOCA_SUCCESS) r = root_pipe(sw, true, &status, &egress);
+    /* Destination root must exist before cross-domain ingress forwarding. */
+    r = root_pipe(sw, true, &status, &egress, &egress_pipe);
+    if (r == DOCA_SUCCESS) r = root_pipe(sw, false, &status, &ingress, &egress_pipe);
     if (r == DOCA_SUCCESS) r = doca_flow_entries_process(sw, 0, DEFAULT_TIMEOUT_US, 2);
     if (r != DOCA_SUCCESS) goto out;
     if (status.failure || status.nb_processed != 2) {
@@ -151,7 +174,34 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     }
     r = doca_flow_resource_query_entry(egress, &q);
     if (r != DOCA_SUCCESS) goto out;
-    if (q.counter.total_pkts != 0) { r = DOCA_ERROR_BAD_STATE; goto out; }
+    if (!hardware_path && q.counter.total_pkts != 0) { r = DOCA_ERROR_BAD_STATE; goto out; }
+    if (hardware_path) {
+        signal(SIGINT, stop_probe);
+        signal(SIGTERM, stop_probe);
+        fprintf(stderr, "PROBE READY: path=hw software_tx=OFF; send 10 synthetic "
+                "0x88b5 frames from VM within 30 seconds; no ping required\n");
+        for (int i = 0; i < 30 && !interrupted; ++i) {
+            sleep(1);
+            r = doca_flow_resource_query_entry(ingress, &iq);
+            if (r == DOCA_SUCCESS) r = doca_flow_resource_query_entry(egress, &q);
+            if (r != DOCA_SUCCESS) goto out;
+            fprintf(stderr, "HW SAMPLE: ingress_selected=%" PRIu64 " egress_hit=%" PRIu64 "\n",
+                    iq.counter.total_pkts, q.counter.total_pkts);
+        }
+        for (int i = 0; i < 3 && !interrupted; ++i) sleep(1);
+        r = doca_flow_resource_query_entry(ingress, &iq);
+        if (r == DOCA_SUCCESS) r = doca_flow_resource_query_entry(egress, &q);
+        if (r != DOCA_SUCCESS) goto out;
+        fprintf(stderr, "HW SUMMARY: software_tx=0 ingress_selected=%" PRIu64
+                " egress_hit=%" PRIu64 " guest_delivery=UNVERIFIED\n",
+                iq.counter.total_pkts, q.counter.total_pkts);
+        if (interrupted || iq.counter.total_pkts != 10 || q.counter.total_pkts != 10) {
+            fprintf(stderr, "HW CHECK FAILED: expected exactly 10 selected and 10 egress hits; "
+                    "zero selected means this run did not exercise the cross-domain path\n");
+            r = DOCA_ERROR_BAD_STATE;
+        }
+        goto out;
+    }
     pool = rte_pktmbuf_pool_create("tx_probe_fresh", 127, 0, 0,
                                    RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
     if (!pool) {

@@ -1,5 +1,94 @@
 # Minimal software TX reproducer (DOCA 3.4)
 
+## Experiment B: hardware ingress versus software TX
+
+`TX_PROBE_PATH=sw` (default) retains the original software test.
+`TX_PROBE_PATH=hw` disables software TX completely and uses:
+
+```text
+VF10 / VM source MAC / gateway destination MAC / EtherType 0x88b5
+ -> DEFAULT selected entry + counter
+ -> EGRESS root (same match-all/forward definition as SW mode) + counter
+ -> verified VF10
+All other ingress -> DROP
+```
+
+These are separate process runs, not simultaneous paths. EGRESS is now created
+before ingress in BOTH modes so the destination exists before linking it.
+Re-run SW with this build as well; counters refer to newly created entries per
+run. No claim is made that this is the same live entry across restarts.
+
+In `doca-dev`, rebuild, stop the daemon/other PF owners, and set:
+
+```bash
+meson compile -C /build/eswitch-tx-reproducer
+export TX_PROBE_VF=10
+export TX_PROBE_VM_MAC=7e:83:a5:77:11:06
+export TX_PROBE_GATEWAY_MAC=02:00:00:65:00:01
+export TX_PROBE_VM_IP=192.168.0.10
+export TX_PROBE_GATEWAY_IP=192.168.0.1
+TX_PROBE_PATH=hw /build/eswitch-tx-reproducer/eswitch-tx-reproducer \
+  -l 0 --file-prefix=eswitch-tx-reproducer -- \
+  --rep 'pci/03:00.0,c1pf0vf10' --expert-mode \
+  --log-level 60 --sdk-log-level 60 > /tmp/eswitch-tx-hw.log 2>&1
+```
+
+In another container terminal, watch readiness:
+
+```bash
+tail -f /tmp/eswitch-tx-hw.log
+```
+
+Copy `send_hw_probe.py` from this directory to the VM (for example `/tmp`).
+After `PROBE READY: path=hw`, run on the VM within the 30-second window:
+
+```bash
+sudo python3 /tmp/send_hw_probe.py --interface ens6 \
+  --gateway-mac 02:00:00:65:00:01 \
+  --expected-vm-mac 7e:83:a5:77:11:06
+```
+
+Do not run ping as the generator for HW mode: ARP/ICMP do not match this rule.
+The script needs only Python's standard library and sends exactly ten 60-byte
+unicast frames, one per second. The non-IP frames do not solicit kernel replies.
+Use only the isolated VM interface, not a bridge that could reflect frames.
+Optional capture in a second VM terminal (incoming only, to avoid confusing
+locally transmitted frames with returned frames):
+
+```bash
+sudo tcpdump -Q in -eni ens6 -nn 'ether proto 0x88b5'
+```
+
+The destination MAC remains the gateway MAC; the test is EGRESS counter traversal,
+not IP connectivity. Capture uses promiscuous mode but returned-frame visibility
+is not guaranteed by a rule hit. A same-VF return may have additional downstream
+restrictions; it does not invalidate an observed EGRESS counter hit.
+
+After the HW process exits, re-run SW in the same container shell:
+
+```bash
+TX_PROBE_PATH=sw /build/eswitch-tx-reproducer/eswitch-tx-reproducer \
+  -l 0 --file-prefix=eswitch-tx-reproducer -- \
+  --rep 'pci/03:00.0,c1pf0vf10' --expert-mode \
+  --log-level 60 --sdk-log-level 60 > /tmp/eswitch-tx-sw.log 2>&1
+rg -n 'PROBE CONFIG|PROBE READY|HW SUMMARY|PROBE SUMMARY|CHECK FAILED|PROBE ERROR' \
+  /tmp/eswitch-tx-hw.log /tmp/eswitch-tx-sw.log
+```
+
+HW success requires `ingress_selected=10 egress_hit=10`, with software TX off.
+SW success still requires `accepted=10 egress_hit=10`. HW selected=0 is an
+unexercised test (check generator timing/MAC/VF), not evidence about EGRESS.
+HW selected=10 / EGRESS=0 isolates a cross-domain/EGRESS issue. HW 10/10 with
+SW 10/0 focuses investigation on software injection. Counter success in either
+run is not proof of guest delivery. Missing, excess or mismatched counts exit
+nonzero with an explicit message. There is no automatic retry on hardware errors.
+
+Negative traffic control: use a different *unicast* `--gateway-mac` in a separate
+HW run; it should select zero frames and exit nonzero. This verifies the selector
+is narrow, without opening another VF. Do not mix negative and positive runs.
+
+The sections below describe the default **SW mode** unless otherwise noted.
+
 Separate executable; does not link the management daemon, router, FDB or old TX
 pipeline. `main.c` is adapted from NVIDIA's `flow_switch_to_wire_main.c`, with
 its license retained. Build uses the installed SDK's `flow_common.c`,
