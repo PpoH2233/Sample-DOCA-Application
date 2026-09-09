@@ -117,5 +117,58 @@ isolates the missing flag in the fresh ARP mbuf path. All four zero means mbuf
 attributes do not explain the failure; the next control must re-transmit an
 actual RSS-received mbuf exactly as the shipped `flow_switch_to_wire` sample does.
 
+## Actual RX mbuf reinjection control
+
+Use this after every fresh-mbuf matrix variant reports zero. The DEFAULT root
+selects only broadcast ARP from the verified VF10 and VM MAC, sends it to parent
+RSS queue 0, and the application re-transmits that same received mbuf. The first
+five packets retain their received state; the next five additionally get TX
+metadata value 1 and `RTE_MBUF_DYNFLAG_TX_METADATA`. Both groups enter the same
+EGRESS COUNT + DROP entry.
+
+Start the test in doca-dev:
+
+```bash
+TX_PROBE_PATH=rx-reinject \
+TX_PROBE_VF=10 \
+TX_PROBE_VM_MAC=7e:83:a5:77:11:06 \
+TX_PROBE_GATEWAY_MAC=02:00:00:65:00:01 \
+TX_PROBE_VM_IP=192.168.0.10 \
+TX_PROBE_GATEWAY_IP=192.168.0.1 \
+/build/eswitch-tx-reproducer/eswitch-tx-reproducer \
+  -l 0 --file-prefix=eswitch-tx-reproducer -- \
+  --rep 'pci/03:00.0,c1pf0vf10' --expert-mode \
+  --log-level 50 --sdk-log-level 50 \
+  > /tmp/eswitch-rx-reinject.log 2>&1
+```
+
+After `REINJECT READY`, send exactly ten requests from VF10:
+
+```bash
+sudo arping -b -c 10 -I ens6 192.168.0.1
+```
+
+Then inspect:
+
+```bash
+rg -n 'PROBE CONFIG|BASELINE|REINJECT READY|REINJECT BUILD|REINJECT SAMPLE|REINJECT RESULT|CHECK FAILED|PROBE ERROR' \
+  /tmp/eswitch-rx-reinject.log
+```
+
+Interpret `REINJECT RESULT`:
+
+- `original_hits=5`: the parent/EGRESS path works for an actual RX mbuf, while
+  the prior fresh allocations fail. Root cause is RX-origin context absent from
+  the newly allocated ARP reply mbuf; modify the received mbuf in place or copy
+  all required context established by the installed sample/driver.
+- `original_hits=0 metadata_hits=5`: TX reinjection specifically needs the TX
+  metadata flag on the received mbuf in this configuration.
+- both zero with `received=10 accepted=10`: even the shipped-sample-shaped
+  reinjection cannot enter EGRESS. Run the unmodified installed
+  `flow_switch_to_wire` sample as the final environment control and collect
+  driver/firmware versions; the ARP builder is outside the failing boundary.
+- `received<10`: the input did not fully exercise RSS; do not attribute the
+  EGRESS result.
+
 Source has been reviewed locally; SDK compilation and the hardware result must
 be verified in doca-dev. The authoring machine has no DOCA SDK/DPU.

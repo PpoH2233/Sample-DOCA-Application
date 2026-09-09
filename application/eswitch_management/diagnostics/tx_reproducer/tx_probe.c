@@ -22,6 +22,7 @@ static bool hardware_path;
 static bool hardware_arp;
 static bool egress_only;
 static bool egress_matrix;
+static bool rx_reinject;
 
 static void stop_probe(int sig) { (void)sig; interrupted = 1; }
 
@@ -33,14 +34,16 @@ int tx_probe_validate_config(void)
     const char *gw_ip = getenv("TX_PROBE_GATEWAY_IP");
     const char *mode = getenv("TX_PROBE_PATH");
     if (mode && strcmp(mode, "sw") && strcmp(mode, "hw") && strcmp(mode, "hw-arp") &&
-        strcmp(mode, "sw-egress") && strcmp(mode, "sw-egress-matrix")) {
+        strcmp(mode, "sw-egress") && strcmp(mode, "sw-egress-matrix") &&
+        strcmp(mode, "rx-reinject")) {
         fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, sw-egress, "
-                "sw-egress-matrix, hw or hw-arp\n");
+                "sw-egress-matrix, rx-reinject, hw or hw-arp\n");
         return -1;
     }
     hardware_arp = mode && strcmp(mode, "hw-arp") == 0;
     egress_matrix = mode && strcmp(mode, "sw-egress-matrix") == 0;
-    egress_only = egress_matrix || (mode && strcmp(mode, "sw-egress") == 0);
+    rx_reinject = mode && strcmp(mode, "rx-reinject") == 0;
+    egress_only = egress_matrix || rx_reinject || (mode && strcmp(mode, "sw-egress") == 0);
     hardware_path = hardware_arp || (mode && strcmp(mode, "hw") == 0);
     /* Explicit test scope, not a default destination. No TX before all gates. */
     if (!vf || strlen(vf) != 2 || vf[0] != '1' || vf[1] < '0' || vf[1] > '5' ||
@@ -112,29 +115,39 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     struct doca_flow_match match = {0}; /* Deliberate match-all test. */
     struct doca_flow_monitor mon = {0};
     struct doca_flow_fwd fwd = {0}, miss = {0};
+    uint16_t rss_queue = 0;
     doca_error_t r;
     mon.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
     miss.type = DOCA_FLOW_FWD_DROP;
     fwd.type = egress && !egress_only ? DOCA_FLOW_FWD_PORT : DOCA_FLOW_FWD_DROP;
     if (egress && !egress_only) fwd.port_id = 1; /* Mapping verified before queues/Flow init. */
-    if (!egress && hardware_path) {
+    if (!egress && (hardware_path || rx_reinject)) {
         /* Only selected frames from the verified VF/VM can cross domains.
          * Broadcast dst MAC is changeable (all ones), not a fixed field. */
         match.parser_meta.port_id = 1;
         memcpy(match.outer.eth.src_mac, frame, 6);
         memcpy(match.outer.eth.dst_mac, frame + 6, 6);
         match.outer.eth.type = rte_cpu_to_be_16(0x88b5);
-        if (hardware_arp) {
+        if (hardware_arp || rx_reinject) {
             memset(match.outer.eth.dst_mac, 0xff, 6);
             match.outer.eth.type = rte_cpu_to_be_16(0x0806);
         }
-        fwd.type = DOCA_FLOW_FWD_PIPE;
-        fwd.next_pipe = *egress_pipe;
+        if (rx_reinject) {
+            fwd.type = DOCA_FLOW_FWD_RSS;
+            fwd.rss_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+            fwd.rss.queues_array = &rss_queue;
+            fwd.rss.nr_queues = 1;
+            fwd.rss.inner_flags = DOCA_FLOW_RSS_AUTO;
+        } else {
+            fwd.type = DOCA_FLOW_FWD_PIPE;
+            fwd.next_pipe = *egress_pipe;
+        }
     }
     r = doca_flow_pipe_cfg_create(&cfg, sw);
     if (r != DOCA_SUCCESS) return r;
     r = set_flow_pipe_cfg(cfg, egress ? "TX_PROBE_EGRESS" :
-                          (hardware_path ? "TX_PROBE_INGRESS_TO_EGRESS" : "TX_PROBE_INGRESS_DROP"),
+                          (rx_reinject ? "TX_PROBE_INGRESS_RSS" :
+                           (hardware_path ? "TX_PROBE_INGRESS_TO_EGRESS" : "TX_PROBE_INGRESS_DROP")),
                           DOCA_FLOW_PIPE_BASIC, true);
     if (r == DOCA_SUCCESS) r = doca_flow_pipe_cfg_set_nr_entries(cfg, 1);
     if (r == DOCA_SUCCESS && egress)
@@ -145,8 +158,8 @@ static doca_error_t root_pipe(struct doca_flow_port *sw, bool egress,
     doca_flow_pipe_cfg_destroy(cfg);
     if (r != DOCA_SUCCESS) return r;
     if (egress) *egress_pipe = pipe;
-    probe_entry_match(&match, egress, hardware_arp);
-    if (!egress && hardware_arp) {
+    probe_entry_match(&match, egress, hardware_arp || rx_reinject);
+    if (!egress && (hardware_arp || rx_reinject)) {
         fprintf(stderr, "MATCH DEBUG: DOCA-3.4 implicit ingress port=1 "
                 "ethertype=0x0806 dst_template=ff:ff:ff:ff:ff:ff(changeable) "
                 "dst_entry=%02x:%02x:%02x:%02x:%02x:%02x fwd=EGRESS\n",
@@ -176,10 +189,13 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     resource.mode = DOCA_FLOW_RESOURCE_MODE_PORT;
     resource.nr_counters = 8;
     resource.nr_rss = 1;
-    fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=disabled; "
+    fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=%s; "
             "path=%s; EGRESS=match-all->%s; revision=egress-entry-v1\n",
-            egress_matrix ? "sw-egress-matrix" :
-              (egress_only ? "sw-egress" : (hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw"))),
+            (egress_matrix || rx_reinject) ? "matrix" : "disabled",
+            rx_reinject ? "rx-reinject" :
+              (egress_matrix ? "sw-egress-matrix" :
+               (egress_only ? "sw-egress" :
+                (hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw")))),
             egress_only ? "COUNT+DROP" : "VF");
     r = init_doca_flow(nb_queues, "switch,hws,hairpinq_num=4,expert", &resource, shared);
     if (r != DOCA_SUCCESS) return r;
@@ -225,6 +241,76 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
         if (interrupted || iq.counter.total_pkts != 10 || q.counter.total_pkts != 10) {
             fprintf(stderr, "HW CHECK FAILED: expected exactly 10 selected and 10 egress hits; "
                     "zero selected means this run did not exercise the cross-domain path\n");
+            r = DOCA_ERROR_BAD_STATE;
+        }
+        goto out;
+    }
+    if (rx_reinject) {
+        uint64_t group_hits[3] = {0};
+        uint64_t rx_count = 0;
+        signal(SIGINT, stop_probe);
+        signal(SIGTERM, stop_probe);
+        r = doca_flow_resource_query_entry(egress, &egress_before);
+        if (r == DOCA_SUCCESS) r = doca_flow_resource_query_entry(ingress, &ingress_before);
+        if (r != DOCA_SUCCESS) goto out;
+        fprintf(stderr, "BASELINE: egress=%" PRIu64 " ingress=%" PRIu64 "\n",
+                egress_before.counter.total_pkts, ingress_before.counter.total_pkts);
+        fprintf(stderr, "REINJECT READY: run exactly `arping -b -c 10 -I <vf-interface> "
+                "192.168.0.1` on VF10 within 30 seconds\n");
+        for (int second = 0; second < 30 && accepted < 10 && !interrupted; ++second) {
+            struct rte_mbuf *packets[16];
+            uint16_t received = rte_eth_rx_burst(0, 0, packets, 16);
+            for (uint16_t j = 0; j < received; ++j) {
+                struct rte_mbuf *m = packets[j];
+                rx_count++;
+                if (accepted >= 10) {
+                    rte_pktmbuf_free(m);
+                    continue;
+                }
+                const bool add_meta = accepted >= 5;
+                uint64_t rx_flags = m->ol_flags;
+                uint16_t rx_port = m->port;
+                uint32_t rx_fdir = m->hash.fdir.hi;
+                if (add_meta) {
+                    rte_flow_dynf_metadata_set(m, 1);
+                    m->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+                }
+                fprintf(stderr, "REINJECT BUILD: seq=%" PRIu64 " variant=%s rx_port=%u "
+                        "rx_flags=0x%016" PRIx64 " rx_fdir=%u tx_flags=0x%016" PRIx64 "\n",
+                        accepted + 1, add_meta ? "rx-mbuf+meta1" : "rx-mbuf-original",
+                        rx_port, rx_flags, rx_fdir, (uint64_t)m->ol_flags);
+                uint16_t sent = rte_eth_tx_burst(0, 0, &m, 1);
+                if (sent == 0) rte_pktmbuf_free(m);
+                accepted += sent;
+                sleep(1);
+                r = doca_flow_resource_query_entry(egress, &q);
+                if (r != DOCA_SUCCESS) goto out;
+                fprintf(stderr, "REINJECT SAMPLE: accepted=%" PRIu64 " egress_delta=%" PRIu64 "\n",
+                        accepted, q.counter.total_pkts - egress_before.counter.total_pkts);
+                if (accepted == 5) group_hits[1] = q.counter.total_pkts - egress_before.counter.total_pkts;
+                if (accepted == 10) group_hits[2] = q.counter.total_pkts - egress_before.counter.total_pkts;
+            }
+            if (received == 0) sleep(1);
+        }
+        for (int i = 0; i < 3 && !interrupted; ++i) sleep(1);
+        r = doca_flow_resource_query_entry(egress, &q);
+        if (r == DOCA_SUCCESS) r = doca_flow_resource_query_entry(ingress, &iq);
+        if (r != DOCA_SUCCESS) goto out;
+        group_hits[2] = q.counter.total_pkts - egress_before.counter.total_pkts;
+        uint64_t original_hits = group_hits[1] - group_hits[0];
+        uint64_t metadata_hits = group_hits[2] - group_hits[1];
+        const char *diagnosis = "actual-rx-mbuf-also-misses-egress";
+        if (original_hits == 5)
+            diagnosis = "fresh-mbuf-lacks-rx-origin-context";
+        else if (original_hits == 0 && metadata_hits == 5)
+            diagnosis = "rx-reinjection-requires-tx-metadata-flag";
+        fprintf(stderr, "REINJECT RESULT: received=%" PRIu64 " accepted=%" PRIu64
+                " original_hits=%" PRIu64 " metadata_hits=%" PRIu64
+                " ingress_delta=%" PRIu64 " diagnosis=%s\n",
+                rx_count, accepted, original_hits, metadata_hits,
+                iq.counter.total_pkts - ingress_before.counter.total_pkts, diagnosis);
+        if (accepted != 10 || (original_hits != 5 && metadata_hits != 5)) {
+            fprintf(stderr, "CHECK FAILED: exact sample-style RX mbuf reinjection did not establish EGRESS entry\n");
             r = DOCA_ERROR_BAD_STATE;
         }
         goto out;
