@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <rte_ethdev.h>
+#include <rte_flow.h>
 #include <rte_mbuf.h>
 #include <rte_errno.h>
 #include <doca_dpdk.h>
@@ -20,6 +21,7 @@ static uint32_t expected_vf;
 static bool hardware_path;
 static bool hardware_arp;
 static bool egress_only;
+static bool egress_matrix;
 
 static void stop_probe(int sig) { (void)sig; interrupted = 1; }
 
@@ -31,12 +33,14 @@ int tx_probe_validate_config(void)
     const char *gw_ip = getenv("TX_PROBE_GATEWAY_IP");
     const char *mode = getenv("TX_PROBE_PATH");
     if (mode && strcmp(mode, "sw") && strcmp(mode, "hw") && strcmp(mode, "hw-arp") &&
-        strcmp(mode, "sw-egress")) {
-        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, sw-egress, hw or hw-arp\n");
+        strcmp(mode, "sw-egress") && strcmp(mode, "sw-egress-matrix")) {
+        fprintf(stderr, "CONFIG ERROR: TX_PROBE_PATH must be sw, sw-egress, "
+                "sw-egress-matrix, hw or hw-arp\n");
         return -1;
     }
     hardware_arp = mode && strcmp(mode, "hw-arp") == 0;
-    egress_only = mode && strcmp(mode, "sw-egress") == 0;
+    egress_matrix = mode && strcmp(mode, "sw-egress-matrix") == 0;
+    egress_only = egress_matrix || (mode && strcmp(mode, "sw-egress") == 0);
     hardware_path = hardware_arp || (mode && strcmp(mode, "hw") == 0);
     /* Explicit test scope, not a default destination. No TX before all gates. */
     if (!vf || strlen(vf) != 2 || vf[0] != '1' || vf[1] < '0' || vf[1] > '5' ||
@@ -174,7 +178,8 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
     resource.nr_rss = 1;
     fprintf(stderr, "PROBE CONFIG: switch,hws,hairpinq_num=4,expert; metadata=disabled; "
             "path=%s; EGRESS=match-all->%s; revision=egress-entry-v1\n",
-            egress_only ? "sw-egress" : (hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw")),
+            egress_matrix ? "sw-egress-matrix" :
+              (egress_only ? "sw-egress" : (hardware_arp ? "hw-arp" : (hardware_path ? "hw" : "sw"))),
             egress_only ? "COUNT+DROP" : "VF");
     r = init_doca_flow(nb_queues, "switch,hws,hairpinq_num=4,expert", &resource, shared);
     if (r != DOCA_SUCCESS) return r;
@@ -248,15 +253,35 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
         r = DOCA_ERROR_BAD_STATE;
         goto out;
     }
-    for (int i = 0; i < 10 && !interrupted; ++i) {
+    const int tx_count = egress_matrix ? 12 : 10;
+    uint64_t matrix_hits[5] = {0};
+    for (int i = 0; i < tx_count && !interrupted; ++i) {
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
         if (!m) { r = DOCA_ERROR_NO_MEMORY; goto out; }
         void *bytes = rte_pktmbuf_append(m, sizeof(frame));
         if (!bytes) { rte_pktmbuf_free(m); r = DOCA_ERROR_NO_MEMORY; goto out; }
         memcpy(bytes, frame, sizeof(frame));
         m->ol_flags = 0;
-        fprintf(stderr, "TX BUILD: seq=%d parent=0 queue=0 target=1 len=%u segments=%u flags=0\n",
-                i + 1, m->pkt_len, m->nb_segs);
+        const char *variant = "plain";
+        unsigned group = 0;
+        uint32_t metadata = 0;
+        if (egress_matrix) {
+            group = (unsigned)i / 3;
+            if (group >= 1) {
+                m->port = 0;
+                variant = "port0";
+            }
+            if (group >= 2) {
+                metadata = group == 2 ? 0 : 1;
+                rte_flow_dynf_metadata_set(m, metadata);
+                m->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+                variant = group == 2 ? "port0+meta0" : "port0+meta1";
+            }
+        }
+        fprintf(stderr, "TX BUILD: seq=%d variant=%s parent=0 queue=0 mbuf_port=%u "
+                "metadata=%u len=%u segments=%u flags=0x%016" PRIx64 "\n",
+                i + 1, variant, m->port, metadata, m->pkt_len, m->nb_segs,
+                (uint64_t)m->ol_flags);
         uint16_t n = rte_eth_tx_burst(0, 0, &m, 1);
         /* Never read, free or retry an accepted mbuf. */
         if (n == 0) rte_pktmbuf_free(m);
@@ -274,6 +299,11 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
                     " egress_delta=%" PRIu64 " ingress_delta=%" PRIu64 "\n",
                     i + 1, accepted, q.counter.total_pkts - egress_before.counter.total_pkts,
                     iq.counter.total_pkts - ingress_before.counter.total_pkts);
+            if (egress_matrix && (i % 3) == 2) {
+                matrix_hits[group + 1] = q.counter.total_pkts - egress_before.counter.total_pkts;
+                fprintf(stderr, "MATRIX GROUP: variant=%s accepted=3 egress_group_delta=%" PRIu64 "\n",
+                        variant, matrix_hits[group + 1] - matrix_hits[group]);
+            }
         }
     }
     /* Counter settling, not an entries_process-based counter refresh. */
@@ -286,12 +316,12 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
             " parent_oerrors_delta=%" PRIu64 " egress_hit=%" PRIu64 " ingress_drop=%" PRIu64
             " guest_delivery=UNVERIFIED\n", accepted, after.opackets-before.opackets,
             after.oerrors-before.oerrors, q.counter.total_pkts, iq.counter.total_pkts);
-    if (interrupted || accepted != 10 || q.counter.total_pkts != accepted)
+    if (interrupted || accepted != (uint64_t)tx_count || q.counter.total_pkts != accepted)
         r = DOCA_ERROR_BAD_STATE;
     if (egress_only) {
         uint64_t hits = q.counter.total_pkts - egress_before.counter.total_pkts;
         uint64_t ingress_hits = iq.counter.total_pkts - ingress_before.counter.total_pkts;
-        if (hits != 10 || ingress_hits != 0) r = DOCA_ERROR_BAD_STATE;
+        if (hits != (uint64_t)tx_count || ingress_hits != 0) r = DOCA_ERROR_BAD_STATE;
         fprintf(stderr, "EGRESS RESULT: %s accepted=%" PRIu64
                 " egress_delta=%" PRIu64 " ingress_delta=%" PRIu64
                 " action=DROP guest_delivery=NOT_APPLICABLE\n",
@@ -300,6 +330,20 @@ doca_error_t flow_switch_to_wire(int nb_queues, int nb_ports, struct flow_switch
             fprintf(stderr, "CHECK FAILED: ingress traffic observed; isolate traffic before attributing EGRESS hits to TX\n");
         else if (hits != accepted)
             fprintf(stderr, "CHECK FAILED: software TX acceptance does not match EGRESS entry hits\n");
+        if (egress_matrix) {
+            uint64_t plain = matrix_hits[1] - matrix_hits[0];
+            uint64_t port0 = matrix_hits[2] - matrix_hits[1];
+            uint64_t meta0 = matrix_hits[3] - matrix_hits[2];
+            uint64_t meta1 = matrix_hits[4] - matrix_hits[3];
+            const char *cause = "none-of-the-mbuf-variants-entered-egress";
+            if (plain) cause = "plain-fresh-mbuf-works";
+            else if (port0) cause = "fresh-mbuf-needs-valid-ingress-port";
+            else if (meta0) cause = "missing-tx-metadata-flag";
+            else if (meta1) cause = "missing-tx-metadata-flag-and-destination-value";
+            fprintf(stderr, "ROOT-CAUSE MATRIX: plain=%" PRIu64 " port0=%" PRIu64
+                    " meta0=%" PRIu64 " meta1=%" PRIu64 " diagnosis=%s\n",
+                    plain, port0, meta0, meta1, cause);
+        }
     }
 out:
     if (r != DOCA_SUCCESS)

@@ -80,5 +80,42 @@ The counter is hardware evidence for entry hits, not packet capture. Attribution
 requires the isolated environment and no other transmitter on the parent. Guest
 silence is expected because the successful EGRESS action is DROP.
 
+## Root-cause mbuf matrix
+
+If `sw-egress` reports ten accepted packets and zero EGRESS hits, run the same
+COUNT + DROP pipe with four three-packet variants. This changes only mbuf TX
+attributes; Flow initialization, parent queue and the EGRESS entry stay fixed.
+
+```bash
+TX_PROBE_PATH=sw-egress-matrix \
+TX_PROBE_VF=10 \
+TX_PROBE_VM_MAC=7e:83:a5:77:11:06 \
+TX_PROBE_GATEWAY_MAC=02:00:00:65:00:01 \
+TX_PROBE_VM_IP=192.168.0.10 \
+TX_PROBE_GATEWAY_IP=192.168.0.1 \
+/build/eswitch-tx-reproducer/eswitch-tx-reproducer \
+  -l 0 --file-prefix=eswitch-tx-reproducer -- \
+  --rep 'pci/03:00.0,c1pf0vf10' --expert-mode \
+  --log-level 50 --sdk-log-level 50 \
+  > /tmp/eswitch-egress-matrix.log 2>&1
+
+rg -n 'PROBE CONFIG|BASELINE|TX BUILD|MATRIX GROUP|ROOT-CAUSE MATRIX|EGRESS RESULT|PROBE ERROR' \
+  /tmp/eswitch-egress-matrix.log
+```
+
+The variants are sent in this order:
+
+1. `plain`: fresh mbuf as used by the failed ARP sender.
+2. `port0`: set `mbuf->port` to the verified parent port.
+3. `port0+meta0`: additionally set TX metadata to zero and enable
+   `RTE_MBUF_DYNFLAG_TX_METADATA`.
+4. `port0+meta1`: set TX metadata to one and enable the same flag.
+
+`ROOT-CAUSE MATRIX` attributes the first variant that hits EGRESS. A result of
+`plain=0 port0=0 meta0=3 meta1=3 diagnosis=missing-tx-metadata-flag`, for example,
+isolates the missing flag in the fresh ARP mbuf path. All four zero means mbuf
+attributes do not explain the failure; the next control must re-transmit an
+actual RSS-received mbuf exactly as the shipped `flow_switch_to_wire` sample does.
+
 Source has been reviewed locally; SDK compilation and the hardware result must
 be verified in doca-dev. The authoring machine has no DOCA SDK/DPU.
