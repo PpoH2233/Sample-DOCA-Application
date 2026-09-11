@@ -168,7 +168,7 @@ doca_error_t vf10_tx_validate_ports(struct flow_switch_ctx *ctx)
 
 static void build_frame(struct rte_mbuf *packet, uint64_t sequence)
 {
-	uint8_t *frame = rte_pktmbuf_append(packet, FRAME_SIZE);
+	uint8_t *frame = (uint8_t *)rte_pktmbuf_append(packet, FRAME_SIZE);
 	uint64_t sequence_be = rte_cpu_to_be_64(sequence);
 	struct timespec now;
 	uint64_t timestamp_be;
