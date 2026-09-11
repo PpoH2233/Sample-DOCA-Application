@@ -1,5 +1,46 @@
 # Minimal software TX reproducer (DOCA 3.4)
 
+## VF10 quick PoC
+
+This repository includes `run_vf10_poc.sh`, a guarded wrapper for the default
+software-injection experiment:
+
+```text
+fresh Arm-generated ARP reply
+  -> parent/proxy DPDK TX queue
+  -> DOCA Flow EGRESS root in the eSwitch
+  -> verified c1pf0vf10 representor
+  -> VF10-backed VM
+```
+
+This path deliberately uses the DOCA Flow switch-manager proxy port rather than
+a DOCA ETH SF. An SF is the application endpoint for the alternative DOCA ETH
+TXQ datapath; it is not required for DOCA Flow software TX reinjection.
+
+Build the reproducer as described in `Build in doca-dev`. Start an ingress-only
+capture in the VF10 VM, stop all other owners of the parent PF, then run on the
+DPU Arm:
+
+```bash
+sudo ./run_vf10_poc.sh \
+  --vm-mac 7e:83:a5:77:11:06 \
+  --gateway-mac 02:00:00:65:00:01 \
+  --vm-ip 192.168.0.10 \
+  --gateway-ip 192.168.0.1 \
+  --confirm-exclusive-owner
+```
+
+Replace all addresses with the actual isolated test tuple. The wrapper verifies
+root access, installed DOCA Common/Flow packages, executable availability and
+`switchdev` state. The binary itself verifies that the supplied representor
+resolves to `host=1 pf=0 vf=10` before TX. Neither component changes firmware,
+creates a VF, changes eSwitch mode, or stops services.
+
+Success has two independent proofs: `accepted=10 egress_hit=10` in the DPU log
+proves software TX traversed the eSwitch EGRESS entry, while ten matching frames
+in the VM capture prove delivery through VF10. A zero VM capture must not be
+reported as delivery even if the hardware counter passes.
+
 To test only **software TX -> EGRESS entry**, use the new
 [`sw-egress` COUNT + DROP experiment](EGRESS_ENTRY_TEST.md). It prints baseline,
 per-packet counter deltas and an explicit `EGRESS RESULT: PASS/FAIL`; it does not
