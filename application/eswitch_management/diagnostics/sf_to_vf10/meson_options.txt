@@ -1,0 +1,1 @@
+option('sdk_root', type: 'string', value: '/opt/mellanox/doca', description: 'Installed DOCA SDK with samples and applications/common')
