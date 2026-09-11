@@ -43,6 +43,12 @@ static uint32_t interval_ms = DEFAULT_INTERVAL_MS;
 static uint64_t packet_limit;
 static bool context_matrix;
 
+struct xstats_snapshot {
+	struct rte_eth_xstat_name *names;
+	struct rte_eth_xstat *values;
+	int count;
+};
+
 static void stop_generator(int signal_number)
 {
 	(void)signal_number;
@@ -215,6 +221,75 @@ static void sleep_interval(void)
 		;
 }
 
+static void xstats_snapshot_release(struct xstats_snapshot *snapshot)
+{
+	free(snapshot->names);
+	free(snapshot->values);
+	*snapshot = (struct xstats_snapshot){0};
+}
+
+static int xstats_snapshot_take(uint16_t port_id,
+				struct xstats_snapshot *snapshot)
+{
+	int count = rte_eth_xstats_get_names(port_id, NULL, 0);
+
+	if (count <= 0)
+		return -1;
+	snapshot->names = calloc((size_t)count, sizeof(*snapshot->names));
+	snapshot->values = calloc((size_t)count, sizeof(*snapshot->values));
+	if (snapshot->names == NULL || snapshot->values == NULL)
+		goto fail;
+	if (rte_eth_xstats_get_names(port_id, snapshot->names,
+	                             (unsigned int)count) != count)
+		goto fail;
+	if (rte_eth_xstats_get(port_id, snapshot->values,
+	                       (unsigned int)count) != count)
+		goto fail;
+	snapshot->count = count;
+	return 0;
+
+fail:
+	xstats_snapshot_release(snapshot);
+	return -1;
+}
+
+static void xstats_print_deltas(uint16_t port_id,
+				const struct xstats_snapshot *before)
+{
+	struct rte_eth_xstat *after;
+	int count;
+
+	if (before->count <= 0)
+		return;
+	after = calloc((size_t)before->count, sizeof(*after));
+	if (after == NULL)
+		return;
+	count = rte_eth_xstats_get(port_id, after, (unsigned int)before->count);
+	if (count != before->count) {
+		fprintf(stderr, "XSTAT WARNING: before=%d after=%d\n",
+		        before->count, count);
+		free(after);
+		return;
+	}
+	for (int i = 0; i < count; ++i) {
+		uint64_t id = after[i].id;
+		uint64_t previous = 0;
+
+		if (id >= (uint64_t)before->count)
+			continue;
+		for (int j = 0; j < before->count; ++j) {
+			if (before->values[j].id == id) {
+				previous = before->values[j].value;
+				break;
+			}
+		}
+		if (after[i].value > previous)
+			fprintf(stderr, "XSTAT DELTA: %s=%" PRIu64 "\n",
+			        before->names[id].name, after[i].value - previous);
+	}
+	free(after);
+}
+
 void vf10_tx_release_pool(void)
 {
 	if (packet_pool != NULL)
@@ -230,6 +305,7 @@ doca_error_t vf10_tx_run(int nb_queues, int nb_ports,
 	uint32_t actions[2] = {ACTIONS_MEM_SIZE(1), ACTIONS_MEM_SIZE(1)};
 	struct doca_flow_port *ports[2] = {0};
 	struct rte_eth_stats before = {0}, after = {0};
+	struct xstats_snapshot xstats_before = {0};
 	uint64_t attempted = 0, accepted = 0;
 	doca_error_t result;
 
@@ -259,6 +335,8 @@ doca_error_t vf10_tx_run(int nb_queues, int nb_ports,
 		result = DOCA_ERROR_BAD_STATE;
 		goto stop_ports;
 	}
+	if (xstats_snapshot_take(PARENT_PORT_ID, &xstats_before) != 0)
+		fprintf(stderr, "XSTAT WARNING: unable to capture parent baseline\n");
 
 	signal(SIGINT, stop_generator);
 	signal(SIGTERM, stop_generator);
@@ -330,9 +408,11 @@ doca_error_t vf10_tx_run(int nb_queues, int nb_ports,
 	        " interrupted=%d guest_delivery=VERIFY_WITH_TCPDUMP\n",
 	        attempted, accepted, after.opackets - before.opackets,
 	        after.oerrors - before.oerrors, interrupted != 0);
+	xstats_print_deltas(PARENT_PORT_ID, &xstats_before);
 	result = accepted == 0 ? DOCA_ERROR_BAD_STATE : DOCA_SUCCESS;
 
 stop_ports: {
+	xstats_snapshot_release(&xstats_before);
 	doca_error_t stop_result = stop_doca_flow_ports(nb_ports, ports);
 	if (result == DOCA_SUCCESS)
 		result = stop_result;

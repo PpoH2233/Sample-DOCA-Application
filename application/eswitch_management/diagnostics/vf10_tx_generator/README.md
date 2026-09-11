@@ -82,6 +82,13 @@ application that creates a fresh reply. This matrix intentionally tests a PMD
 behavior and is not a production recommendation to put RX flags on generated
 TX packets.
 
+The generator also prints every parent mlx5 extended statistic whose value
+increased during the run. `XSTAT DELTA` names containing `phy`/`wire` indicate
+that the supposedly VF-directed packet escaped through the physical port;
+names containing `vport`/`representor` indicate progress toward the VF. Treat
+the actual names reported by the installed PMD as authoritative because the
+available xstats differ between driver releases.
+
 Expected startup:
 
 ```text
