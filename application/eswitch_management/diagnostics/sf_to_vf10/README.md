@@ -7,7 +7,7 @@ to external-host VF10:
 
 ```text
 AF_PACKET generator -> enp3s0f0s0 (SF endpoint)
-  -> pf0sf1 representor -> DOCA Flow SF_TO_VF10 -> c1pf0vf10 -> VM
+  -> pf0sf0 representor -> DOCA Flow SF_TO_VF10 -> c1pf0vf10 -> VM
 ```
 
 The Linux socket is only the packet source. Steering is performed by
@@ -25,7 +25,7 @@ Confirm that both the SF endpoint and its representor exist:
 ```bash
 ip -d link show enp3s0f0s0
 doca_caps --list-rep-devs --pci-addr 03:00.0
-sudo devlink port show | grep -E 'flavour pcisf|sfnum 1|vfnum 10'
+sudo devlink port show | grep -E 'flavour pcisf|sfnum 0|vfnum 10'
 ```
 
 The application does not create or modify an SF. Bring the existing endpoint
@@ -52,10 +52,15 @@ sudo tcpdump -Q in -eni enp5s0 -nn -vv -XX 'ether proto 0x88b5'
 
 ## Run on the DPU
 
-The two representor arguments open local SF1 and external-host VF10 under the
+The two representor arguments open local SF0 and external-host VF10 under the
 same eSwitch parent. Confirm both identities with `doca_caps --list-rep-devs`
 before running. The program reverse-maps the resulting DPDK ports and refuses
 to run unless it finds exactly one SF and host 1/PF 0/VF 10.
+
+Do not derive the representor index from the auxiliary device suffix. On this
+system `parentdev mlx5_core.sf.1` is the auxiliary-device index, while
+`doca_caps` and `devlink` report the eSwitch identity as `sf_index 0` / `sfnum
+0`; therefore the correct representor identifier is `pf0sf0`.
 
 ```bash
 SF_TX_IFACE=enp3s0f0s0 \
@@ -64,7 +69,7 @@ SF_TX_PACKET_COUNT=10 \
 SF_TX_INTERVAL_MS=500 \
 /build/sf-to-vf10/sf-to-vf10 \
   -l 0 --file-prefix=sf-to-vf10 -- \
-  --rep 'pci/03:00.0,pf0sf1' \
+  --rep 'pci/03:00.0,pf0sf0' \
   --rep 'pci/03:00.0,c1pf0vf10' \
   --no-wire2wire --expert-mode \
   --log-level 60 --sdk-log-level 60
