@@ -55,6 +55,33 @@ The destination MAC in the example is taken from the successful VF10 RX
 capture. Confirm it is still the VM interface MAC before running. By default the
 generator sends until Ctrl-C. Set `VF10_TX_PACKET_LIMIT=10` for a bounded test.
 
+### RX-context diagnostic matrix
+
+The installed `flow_switch_to_wire` sample only re-transmits mbufs for which an
+RX CQE supplied `RTE_MBUF_F_RX_FDIR_ID`; it does not demonstrate a completely
+fresh mbuf. To isolate that difference, run exactly ten packets with:
+
+```bash
+VF10_TX_DEST_MAC=A6:94:27:FB:6C:38 \
+VF10_TX_SOURCE_MAC=02:00:00:65:00:01 \
+VF10_TX_INTERVAL_MS=500 \
+VF10_TX_PACKET_LIMIT=10 \
+VF10_TX_CONTEXT_MATRIX=1 \
+/build/vf10-tx-generator/vf10-tx-generator \
+  -l 0 --file-prefix=vf10-tx-generator -- \
+  --rep 'pci/03:00.0,c1pf0vf10' \
+  --log-level 60 --sdk-log-level 60
+```
+
+Packets 1-5 use destination metadata only. Packets 6-10 additionally reproduce
+the RX-visible FDIR flag and value from logical port 1. If only sequences 6-10
+reach the VM, the missing RX-origin context is the isolated cause. If neither
+group arrives, the result rules out that observable mbuf difference and the
+next comparator must use a real non-expert RX mbuf or an installed NVIDIA
+application that creates a fresh reply. This matrix intentionally tests a PMD
+behavior and is not a production recommendation to put RX flags on generated
+TX packets.
+
 Expected startup:
 
 ```text

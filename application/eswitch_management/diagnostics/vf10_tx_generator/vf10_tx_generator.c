@@ -41,6 +41,7 @@ static uint8_t destination_mac[RTE_ETHER_ADDR_LEN];
 static uint8_t source_mac[RTE_ETHER_ADDR_LEN];
 static uint32_t interval_ms = DEFAULT_INTERVAL_MS;
 static uint64_t packet_limit;
+static bool context_matrix;
 
 static void stop_generator(int signal_number)
 {
@@ -107,6 +108,22 @@ static int parse_u64_limit(const char *name, uint64_t *value)
 	return 0;
 }
 
+static int parse_bool(const char *name, bool *value)
+{
+	const char *text = getenv(name);
+
+	if (text == NULL || *text == '\0' || strcmp(text, "0") == 0) {
+		*value = false;
+		return 0;
+	}
+	if (strcmp(text, "1") == 0) {
+		*value = true;
+		return 0;
+	}
+	fprintf(stderr, "CONFIG ERROR: %s must be 0 or 1\n", name);
+	return -1;
+}
+
 int vf10_tx_validate_environment(void)
 {
 	if (parse_mac(getenv("VF10_TX_DEST_MAC"), destination_mac) != 0 ||
@@ -117,7 +134,9 @@ int vf10_tx_validate_environment(void)
 	if (parse_u32("VF10_TX_INTERVAL_MS", DEFAULT_INTERVAL_MS,
 	              MAX_INTERVAL_MS, &interval_ms) != 0)
 		return -1;
-	return parse_u64_limit("VF10_TX_PACKET_LIMIT", &packet_limit);
+	if (parse_u64_limit("VF10_TX_PACKET_LIMIT", &packet_limit) != 0)
+		return -1;
+	return parse_bool("VF10_TX_CONTEXT_MATRIX", &context_matrix);
 }
 
 doca_error_t vf10_tx_validate_ports(struct flow_switch_ctx *ctx)
@@ -245,11 +264,15 @@ doca_error_t vf10_tx_run(int nb_queues, int nb_ports,
 	signal(SIGTERM, stop_generator);
 	fprintf(stderr,
 	        "GENERATOR READY: path=non-expert-tx-metadata parent_tx=0/0 "
-	        "destination_port=1 vf=10 ethertype=0x%04x interval_ms=%u limit=%" PRIu64 "\n",
-	        PROBE_ETHERTYPE, interval_ms, packet_limit);
+	        "destination_port=1 vf=10 ethertype=0x%04x interval_ms=%u limit=%" PRIu64
+	        " context_matrix=%s\n",
+	        PROBE_ETHERTYPE, interval_ms, packet_limit,
+	        context_matrix ? "enabled" : "disabled");
 
 	while (!interrupted && (packet_limit == 0 || attempted < packet_limit)) {
 		struct rte_mbuf *packet = rte_pktmbuf_alloc(packet_pool);
+		bool add_rx_context;
+		uint64_t tx_flags;
 		uint16_t sent;
 
 		if (packet == NULL) {
@@ -265,14 +288,31 @@ doca_error_t vf10_tx_run(int nb_queues, int nb_ports,
 		packet->port = PARENT_PORT_ID;
 		rte_flow_dynf_metadata_set(packet, REPRESENTOR_PORT_ID);
 		packet->ol_flags |= RTE_MBUF_DYNFLAG_TX_METADATA;
+		/*
+		 * The installed flow_switch_to_wire sample only transmits packets
+		 * whose RX CQE supplied RTE_MBUF_F_RX_FDIR_ID.  The second half of
+		 * each ten-packet diagnostic matrix preserves the normal destination
+		 * metadata and additionally reproduces that observable RX context.
+		 * This is a diagnostic discriminator, not a production TX contract.
+		 */
+		add_rx_context = context_matrix && ((attempted % 10U) >= 5U);
+		if (add_rx_context) {
+			packet->hash.fdir.hi = REPRESENTOR_PORT_ID;
+			packet->ol_flags |= RTE_MBUF_F_RX_FDIR_ID;
+		}
+		tx_flags = packet->ol_flags;
 		++attempted;
 		sent = rte_eth_tx_burst(PARENT_PORT_ID, TX_QUEUE_ID, &packet, 1);
 		if (sent == 0)
 			rte_pktmbuf_free(packet);
 		else
 			++accepted;
-		fprintf(stdout, "TX seq=%" PRIu64 " accepted=%u destination_port=1\n",
-		        attempted, sent);
+		fprintf(stdout,
+		        "TX seq=%" PRIu64 " accepted=%u destination_port=1 variant=%s "
+		        "fdir=%u flags=0x%016" PRIx64 "\n",
+		        attempted, sent, add_rx_context ? "rx-context" : "metadata-only",
+		        add_rx_context ? REPRESENTOR_PORT_ID : UINT32_MAX,
+		        tx_flags);
 		fflush(stdout);
 		sleep_interval();
 	}
