@@ -545,6 +545,9 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t assigned_count = 0;
   size_t assignable_port_count = 0;
   size_t sf_return_count = 0;
+  uint64_t sf_ingress_hits = 0;
+  uint64_t sf_context_hits = 0;
+  doca_error_t sf_counter_result;
   uint64_t uptime = (monotonic_ns() - manager->started_ns) / 1000000000ULL;
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
@@ -559,6 +562,8 @@ static size_t format_status(const struct eswitch_manager *manager,
   }
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
     sf_return_count += manager->pipeline->sf_return_contexts[i].active ? 1U : 0U;
+  sf_counter_result = eswitch_pipeline_sf_query_counters(
+      manager->pipeline, &sf_ingress_hits, &sf_context_hits);
   used = append_text(response, size, used, "OK\n");
   used = append_text(response, size, used,
                      "service=eSwitch Management state=running uptime=%" PRIu64
@@ -592,6 +597,15 @@ static size_t format_status(const struct eswitch_manager *manager,
   used = append_text(response, size, used,
       "sf_return_contexts=%zu source_identity=rif-mac destination=vs-fdb\n",
       sf_return_count);
+  if (sf_counter_result == DOCA_SUCCESS)
+    used = append_text(response, size, used,
+        "sf_counter_state=ready sf_ingress_hits=%" PRIu64
+        " sf_context_hits=%" PRIu64 "\n",
+        sf_ingress_hits, sf_context_hits);
+  else
+    used = append_text(response, size, used,
+        "sf_counter_state=error error=%s\n",
+        doca_error_get_descr(sf_counter_result));
   return used;
 }
 

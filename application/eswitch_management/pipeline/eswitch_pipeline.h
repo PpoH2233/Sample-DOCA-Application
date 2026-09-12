@@ -98,6 +98,11 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id);
 
+/* Query cumulative SF root and active context-entry hits. */
+doca_error_t eswitch_pipeline_sf_query_counters(
+    const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
+    uint64_t *context_packets);
+
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      struct eswitch_pipeline *pipeline);

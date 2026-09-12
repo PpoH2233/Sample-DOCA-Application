@@ -340,12 +340,14 @@ static doca_error_t create_ingress_classifier(
   struct doca_flow_match match = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_monitor monitor = {0};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
   match.parser_meta.port_id = UINT16_MAX;
   actions.meta.pkt_meta = UINT32_MAX;
+  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
@@ -356,6 +358,8 @@ static doca_error_t create_ingress_classifier(
     result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, &fwd, &miss,
                                    &pipeline->ingress_classifier_pipe);
@@ -410,6 +414,7 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_match mask = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_monitor monitor = {0};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->destination_pipe};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
@@ -417,6 +422,7 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
 
   memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   actions.meta.pkt_meta = UINT32_MAX;
+  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
@@ -426,6 +432,8 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
     result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, &fwd, &miss,
                                    &pipeline->sf_return_pipe);
@@ -507,6 +515,38 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
     printf("SF RETURN UNBIND: vs=%u\n", vswitch_id);
     *context = (struct eswitch_sf_return_context){0};
     return DOCA_SUCCESS;
+  }
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_sf_query_counters(
+    const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
+    uint64_t *context_packets) {
+  struct doca_flow_resource_query query = {0};
+  doca_error_t result;
+
+  if (pipeline == NULL || ingress_packets == NULL ||
+      context_packets == NULL || pipeline->sf_root_rule.entry == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+
+  result = doca_flow_resource_query_entry(pipeline->sf_root_rule.entry,
+                                          &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *ingress_packets = query.counter.total_pkts;
+  *context_packets = 0;
+
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    const struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+
+    if (!context->active)
+      continue;
+    memset(&query, 0, sizeof(query));
+    result = doca_flow_resource_query_entry(context->rule.entry, &query);
+    if (result != DOCA_SUCCESS)
+      return result;
+    *context_packets += query.counter.total_pkts;
   }
   return DOCA_SUCCESS;
 }

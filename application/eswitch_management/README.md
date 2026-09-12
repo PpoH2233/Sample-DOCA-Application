@@ -233,6 +233,13 @@ sudo docker exec eswitch-management eswitchctl status
 sudo docker exec eswitch-management eswitchctl list-port-available
 ```
 
+The status response includes cumulative SF return diagnostics. A zero
+`sf_ingress_hits` means the packet did not match the system-SF root entry. If
+that value increases while `sf_context_hits` remains zero, the packet reached
+the SF root but did not match an active RIF source-MAC context. These counters
+measure hardware Flow entries; `arp_sf_tx_sent` only measures successful
+submission to the Arm raw socket.
+
 Inspect startup and health status with:
 
 ```bash
