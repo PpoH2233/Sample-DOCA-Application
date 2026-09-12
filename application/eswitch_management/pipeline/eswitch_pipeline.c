@@ -158,6 +158,10 @@ static doca_error_t create_flood_selector(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
+  /* With an explicit mask, an all-ones pipe value marks this field as
+   * changeable. A zero value would program a constant-zero VS selector and
+   * ignore the values supplied by selector entries. */
+  match.meta.pkt_meta = UINT32_MAX;
   mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
@@ -181,6 +185,8 @@ static doca_error_t create_destination_pipe(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {0};
   doca_error_t result;
 
+  match.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   miss.type = DOCA_FLOW_FWD_PIPE;
@@ -282,6 +288,8 @@ static doca_error_t create_source_guard(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {0};
   doca_error_t result;
 
+  match.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.meta.pkt_meta = UINT32_MAX;
   memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
@@ -420,6 +428,9 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
+  /* Explicit matching requires both an all-ones pipe value and a non-zero
+   * mask to defer the source MAC value to each context entry. */
+  memset(match.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   actions.meta.pkt_meta = UINT32_MAX;
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
