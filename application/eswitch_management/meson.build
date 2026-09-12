@@ -41,6 +41,7 @@ executable(
     'l2/l2_switch.c',
     'router/router.c',
     'router/router_arp.c',
+    'router/router_icmp.c',
     'router/router_state.c',
     'router/router_control.c',
     'router/sf_packet_io.c',
@@ -91,3 +92,11 @@ arp_test = executable(
   install: false,
 )
 test('eswitch-router-arp', arp_test)
+
+icmp_test = executable(
+  'eswitch-router-icmp-test',
+  ['router/router_icmp_test.c', 'router/router_icmp.c', 'router/router.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-icmp', icmp_test)

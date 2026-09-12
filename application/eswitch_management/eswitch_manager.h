@@ -32,6 +32,8 @@ struct eswitch_manager {
   unsigned arp_window_replies;
   uint64_t arp_seen, arp_ignored, arp_built;
   uint64_t arp_target_drops, arp_sf_send_drops;
+  uint64_t icmp_seen, icmp_ignored, icmp_built, icmp_replies;
+  uint64_t icmp_tx_drops;
   uint64_t tx_log_ns, tx_snapshot_ns, tx_snapshot_seen;
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];
   uint16_t *port_owner; /* indexed like ports->items; 0 means available */

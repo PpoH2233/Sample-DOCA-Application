@@ -43,7 +43,8 @@ struct eswitch_flood_group {
 struct eswitch_sf_return_context {
   uint16_t vswitch_id;
   uint8_t rif_mac[6];
-  struct eswitch_rule rule;
+  struct eswitch_rule return_rule;
+  struct eswitch_rule local_ip_rule;
   bool active;
 };
 
@@ -62,6 +63,7 @@ struct eswitch_pipeline {
   struct eswitch_rule arp_dispatch_rule;
   struct doca_flow_pipe *ingress_classifier_pipe;
   struct doca_flow_pipe *sf_return_pipe;
+  struct doca_flow_pipe *local_ip_pipe;
   struct eswitch_rule sf_root_rule;
   uint16_t sf_port_id;
   struct eswitch_sf_return_context
@@ -101,7 +103,7 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
 /* Query cumulative SF root and active context-entry hits. */
 doca_error_t eswitch_pipeline_sf_query_counters(
     const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
-    uint64_t *context_packets);
+    uint64_t *context_packets, uint64_t *local_ip_packets);
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,

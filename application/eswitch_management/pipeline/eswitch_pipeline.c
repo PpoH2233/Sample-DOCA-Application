@@ -325,7 +325,7 @@ static doca_error_t create_arp_dispatch(struct eswitch_pipeline *pipeline) {
   doca_error_t result;
   match.outer.eth.type = DOCA_HTOBE16(0x0806);
   hit.next_pipe = pipeline->learning_dispatch_pipe;
-  miss.next_pipe = pipeline->source_guard_pipe;
+  miss.next_pipe = pipeline->local_ip_pipe;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS) return result;
   result = set_pipe_identity(cfg, "ESW_ARP_DISPATCH", DOCA_FLOW_PIPE_BASIC, false, 1);
@@ -340,6 +340,44 @@ static doca_error_t create_arp_dispatch(struct eswitch_pipeline *pipeline) {
       pipeline->arp_dispatch_pipe, &match, 0, NULL, NULL, NULL,
       DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie, &rule->entry);
   return result == DOCA_SUCCESS ? process_rules(pipeline, rule, 1) : result;
+}
+
+/* IPv4 addressed to an owned RIF is local control traffic. The per-RIF entry
+ * restores VR isolation with the VS metadata and delivers only that traffic
+ * to Arm; every miss continues through the normal L2 source guard. */
+static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_monitor monitor = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->rss_pipe};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = pipeline->source_guard_pipe};
+  doca_error_t result;
+
+  match.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  mask.outer.eth.type = UINT16_MAX;
+  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_LOCAL_IP", DOCA_FLOW_PIPE_BASIC,
+                             false, ESWITCH_MAX_SF_RETURN_CONTEXTS);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss,
+                                   &pipeline->local_ip_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
 }
 
 static doca_error_t create_ingress_classifier(
@@ -456,7 +494,8 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const uint8_t rif_mac[6]) {
   struct eswitch_sf_return_context *free_context = NULL;
-  struct doca_flow_match match = {0};
+  struct doca_flow_match return_match = {0};
+  struct doca_flow_match local_match = {0};
   struct doca_flow_actions actions = {0};
   doca_error_t result;
 
@@ -481,24 +520,47 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
   if (free_context == NULL)
     return DOCA_ERROR_NO_MEMORY;
 
-  memcpy(match.outer.eth.src_mac, rif_mac, 6);
+  memcpy(return_match.outer.eth.src_mac, rif_mac, 6);
   actions.meta.pkt_meta = DOCA_HTOBE32(
       eswitch_metadata_encode(vswitch_id, pipeline->sf_port_id));
-  flow_entry_cookie_prepare(&free_context->rule.cookie, "bind SF RIF context",
-                            DOCA_FLOW_ENTRY_OP_ADD);
+  flow_entry_cookie_prepare(&free_context->return_rule.cookie,
+                            "bind SF return context", DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
-      pipeline->runtime->queue_id, pipeline->sf_return_pipe, &match, 0,
+      pipeline->runtime->queue_id, pipeline->sf_return_pipe, &return_match, 0,
       &actions, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-      &free_context->rule.cookie, &free_context->rule.entry);
+      &free_context->return_rule.cookie, &free_context->return_rule.entry);
   if (result != DOCA_SUCCESS)
     return result;
-  result = process_rules(pipeline, &free_context->rule, 1);
+  result = process_rules(pipeline, &free_context->return_rule, 1);
   if (result != DOCA_SUCCESS) {
     doca_error_t original_error = result;
-    doca_error_t cleanup = remove_rule(pipeline, &free_context->rule,
-                                       "rollback SF RIF context");
+    doca_error_t cleanup = remove_rule(pipeline, &free_context->return_rule,
+                                       "rollback SF return context");
     return cleanup == DOCA_SUCCESS ? original_error : cleanup;
   }
+
+  local_match.meta.pkt_meta =
+      DOCA_HTOBE32((uint32_t)vswitch_id << 16);
+  memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
+  flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
+                            "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(
+      pipeline->runtime->queue_id, pipeline->local_ip_pipe, &local_match, 0,
+      NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &free_context->local_ip_rule.cookie,
+      &free_context->local_ip_rule.entry);
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, &free_context->local_ip_rule, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
+                                       "rollback local RIF IPv4");
+    if (cleanup == DOCA_SUCCESS)
+      cleanup = remove_rule(pipeline, &free_context->return_rule,
+                            "rollback SF return context");
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
+
   free_context->vswitch_id = vswitch_id;
   memcpy(free_context->rif_mac, rif_mac, 6);
   free_context->active = true;
@@ -520,7 +582,12 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
 
     if (!context->active || context->vswitch_id != vswitch_id)
       continue;
-    result = remove_rule(pipeline, &context->rule, "unbind SF RIF context");
+    result = remove_rule(pipeline, &context->local_ip_rule,
+                         "unbind local RIF IPv4");
+    if (result != DOCA_SUCCESS)
+      return result;
+    result = remove_rule(pipeline, &context->return_rule,
+                         "unbind SF return context");
     if (result != DOCA_SUCCESS)
       return result;
     printf("SF RETURN UNBIND: vs=%u\n", vswitch_id);
@@ -532,12 +599,13 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
 
 doca_error_t eswitch_pipeline_sf_query_counters(
     const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
-    uint64_t *context_packets) {
+    uint64_t *context_packets, uint64_t *local_ip_packets) {
   struct doca_flow_resource_query query = {0};
   doca_error_t result;
 
   if (pipeline == NULL || ingress_packets == NULL ||
-      context_packets == NULL || pipeline->sf_root_rule.entry == NULL)
+      context_packets == NULL || local_ip_packets == NULL ||
+      pipeline->sf_root_rule.entry == NULL)
     return DOCA_ERROR_INVALID_VALUE;
 
   result = doca_flow_resource_query_entry(pipeline->sf_root_rule.entry,
@@ -546,6 +614,7 @@ doca_error_t eswitch_pipeline_sf_query_counters(
     return result;
   *ingress_packets = query.counter.total_pkts;
   *context_packets = 0;
+  *local_ip_packets = 0;
 
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     const struct eswitch_sf_return_context *context =
@@ -554,10 +623,17 @@ doca_error_t eswitch_pipeline_sf_query_counters(
     if (!context->active)
       continue;
     memset(&query, 0, sizeof(query));
-    result = doca_flow_resource_query_entry(context->rule.entry, &query);
+    result = doca_flow_resource_query_entry(context->return_rule.entry,
+                                            &query);
     if (result != DOCA_SUCCESS)
       return result;
     *context_packets += query.counter.total_pkts;
+    memset(&query, 0, sizeof(query));
+    result = doca_flow_resource_query_entry(context->local_ip_rule.entry,
+                                            &query);
+    if (result != DOCA_SUCCESS)
+      return result;
+    *local_ip_packets += query.counter.total_pkts;
   }
   return DOCA_SUCCESS;
 }
@@ -592,6 +668,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   CREATE_STAGE("learning clone", create_learning_clone(pipeline));
   CREATE_STAGE("learning dispatch", create_learning_dispatch(pipeline));
   CREATE_STAGE("source guard", create_source_guard(pipeline));
+  CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
   CREATE_STAGE("ingress classifier", create_ingress_classifier(pipeline));
 #undef CREATE_STAGE
@@ -612,6 +689,8 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->sf_return_pipe);
   if (pipeline->arp_dispatch_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->arp_dispatch_pipe);
+  if (pipeline->local_ip_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->local_ip_pipe);
   if (pipeline->source_guard_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->source_guard_pipe);
   if (pipeline->learning_dispatch_pipe != NULL)

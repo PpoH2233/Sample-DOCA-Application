@@ -19,6 +19,7 @@
 #include "eswitch_state.h"
 #include "router/router_control.h"
 #include "router/router_arp.h"
+#include "router/router_icmp.h"
 #include "l2/l2_switch.h"
 #include "pipeline/tx_build.h"
 
@@ -381,6 +382,71 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
   }
 }
 
+static void reply_gateway_icmp(struct eswitch_manager *manager,
+                               struct rte_mbuf *request, uint16_t vs,
+                               uint16_t ingress) {
+  size_t request_length = rte_pktmbuf_pkt_len(request);
+  size_t capacity = request_length < 60 ? 60 : request_length;
+  uint8_t *scratch = NULL;
+  uint8_t *response = NULL;
+  const uint8_t *bytes;
+  size_t response_length;
+  int index;
+  doca_error_t result;
+
+  manager->icmp_seen++;
+  if (request_length < 42 || request_length > UINT16_MAX)
+    goto ignored;
+  scratch = malloc(request_length);
+  response = malloc(capacity);
+  if (scratch == NULL || response == NULL) {
+    manager->icmp_tx_drops++;
+    goto out;
+  }
+  bytes = rte_pktmbuf_read(request, 0, request_length, scratch);
+  if (bytes == NULL)
+    goto ignored;
+  response_length = router_icmp_echo_reply(
+      manager->router, vs, bytes, request_length, response, capacity);
+  if (response_length == 0)
+    goto ignored;
+  manager->icmp_built++;
+
+  index = find_port_index(manager, ingress);
+  if (index < 0 || manager->port_owner[index] != vs ||
+      manager->ports->items[index].ethernet->role !=
+          ETHERNET_PORT_ROLE_REPRESENTOR ||
+      manager->sf_io == NULL || !manager->sf_io->started) {
+    manager->icmp_tx_drops++;
+    goto out;
+  }
+  result = eswitch_pipeline_sf_bind_vswitch(manager->pipeline, vs,
+                                             response + 6);
+  if (result != DOCA_SUCCESS) {
+    manager->icmp_tx_drops++;
+    fprintf(stderr, "ICMP SF RETURN BIND FAILED: vs=%u error=%s\n", vs,
+            doca_error_get_descr(result));
+    goto out;
+  }
+  result = sf_packet_io_send(manager->sf_io, response, response_length);
+  if (result != DOCA_SUCCESS) {
+    manager->icmp_tx_drops++;
+    fprintf(stderr, "ICMP TX DROP: stage=sf-send vs=%u port=%u\n", vs,
+            ingress);
+    goto out;
+  }
+  manager->icmp_replies++;
+  printf("ICMP ECHO SF TX SENT: vs=%u port=%u len=%zu\n", vs, ingress,
+         response_length);
+  goto out;
+
+ignored:
+  manager->icmp_ignored++;
+out:
+  free(scratch);
+  free(response);
+}
+
 static doca_error_t process_packet(struct eswitch_manager *manager,
                                    struct rte_mbuf *packet,
                                    uint64_t now_ns) {
@@ -434,6 +500,8 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
    * destination rule before transmitting the reply. */
   if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP))
     reply_gateway_arp(manager, packet, vswitch_id, port_id, now_ns);
+  else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
+    reply_gateway_icmp(manager, packet, vswitch_id, port_id);
   return DOCA_SUCCESS;
 }
 
@@ -547,6 +615,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t sf_return_count = 0;
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
+  uint64_t local_ip_hits = 0;
   doca_error_t sf_counter_result;
   uint64_t uptime = (monotonic_ns() - manager->started_ns) / 1000000000ULL;
 
@@ -563,7 +632,8 @@ static size_t format_status(const struct eswitch_manager *manager,
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
     sf_return_count += manager->pipeline->sf_return_contexts[i].active ? 1U : 0U;
   sf_counter_result = eswitch_pipeline_sf_query_counters(
-      manager->pipeline, &sf_ingress_hits, &sf_context_hits);
+      manager->pipeline, &sf_ingress_hits, &sf_context_hits,
+      &local_ip_hits);
   used = append_text(response, size, used, "OK\n");
   used = append_text(response, size, used,
                      "service=eSwitch Management state=running uptime=%" PRIu64
@@ -583,7 +653,7 @@ static size_t format_status(const struct eswitch_manager *manager,
                      switch_count,
                      manager->fdb.count);
   used = append_text(response, size, used,
-                     "routers=%zu router_dataplane=GATEWAY_ARP_ONLY\n",
+                     "routers=%zu router_dataplane=GATEWAY_ARP_ICMP\n",
                      manager->router ? manager->router->vr_count : 0);
   used = append_text(response, size, used,
       "private_gateway_arp=enabled arp_sf_tx_sent=%" PRIu64
@@ -595,13 +665,19 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->arp_seen, manager->arp_ignored, manager->arp_built,
       manager->arp_target_drops, manager->arp_sf_send_drops);
   used = append_text(response, size, used,
+      "gateway_icmp=enabled icmp_seen=%" PRIu64
+      " icmp_ignored=%" PRIu64 " icmp_built=%" PRIu64
+      " icmp_sf_tx_sent=%" PRIu64 " icmp_tx_drops=%" PRIu64 "\n",
+      manager->icmp_seen, manager->icmp_ignored, manager->icmp_built,
+      manager->icmp_replies, manager->icmp_tx_drops);
+  used = append_text(response, size, used,
       "sf_return_contexts=%zu source_identity=rif-mac destination=vs-fdb\n",
       sf_return_count);
   if (sf_counter_result == DOCA_SUCCESS)
     used = append_text(response, size, used,
         "sf_counter_state=ready sf_ingress_hits=%" PRIu64
-        " sf_context_hits=%" PRIu64 "\n",
-        sf_ingress_hits, sf_context_hits);
+        " sf_context_hits=%" PRIu64 " local_ip_hits=%" PRIu64 "\n",
+        sf_ingress_hits, sf_context_hits, local_ip_hits);
   else
     used = append_text(response, size, used,
         "sf_counter_state=error error=%s\n",

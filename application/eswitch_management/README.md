@@ -238,7 +238,9 @@ The status response includes cumulative SF return diagnostics. A zero
 that value increases while `sf_context_hits` remains zero, the packet reached
 the SF root but did not match an active RIF source-MAC context. These counters
 measure hardware Flow entries; `arp_sf_tx_sent` only measures successful
-submission to the Arm raw socket.
+submission to the Arm raw socket. `local_ip_hits` counts IPv4 packets addressed
+to a private RIF and delivered to the Arm handler; `icmp_sf_tx_sent` confirms
+that a validated echo reply was submitted through the SF return path.
 
 Inspect startup and health status with:
 

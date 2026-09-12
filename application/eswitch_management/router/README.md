@@ -1,9 +1,10 @@
 # Router implementation status
 
-This change introduces the control-plane foundation and a private gateway ARP
-responder. It does **not** implement IPv4 router forwarding or ICMP echo replies.
+This change introduces the control-plane foundation, a private gateway ARP
+responder and local IPv4 ICMP echo replies. It does **not** implement IPv4
+router forwarding.
 Interfaces with IPs still report `PENDING_DATAPLANE`, while daemon status
-reports `router_dataplane=GATEWAY_ARP_ONLY`. Public ports are reserved but
+reports `router_dataplane=GATEWAY_ARP_ICMP`. Public ports are reserved but
 remain root-miss DROP. Private L2 forwarding remains active.
 No API stub returns a fabricated hardware success.
 
@@ -49,18 +50,20 @@ The process needs `CAP_NET_RAW` (or root). In a container use host networking so
 the actual SF netdev is visible. Keep the established VF scope; it never changes
 which system SF is selected.
 
-VM: `sudo arping -I ens6 -c 5 192.168.0.1`, alongside
-`sudo tcpdump -eni ens6 -nn arp`. Acceptance: the VM receives a reply whose
+VM: `sudo arping -I ens6 -c 5 192.168.0.1`, followed by
+`ping -c 5 192.168.0.1`, alongside
+`sudo tcpdump -eni ens6 -nn 'arp or icmp'`. Acceptance: the VM receives ARP and
+ICMP echo replies whose
 source MAC is the configured RIF MAC; `status` increments `arp_sf_tx_sent` and
-shows at least one `sf_return_contexts`. Then verify ordinary L2 forwarding,
+`icmp_sf_tx_sent`, and shows increasing `local_ip_hits`. Then verify ordinary L2 forwarding,
 reject unknown SF source MACs, remove the gateway IP and verify replies stop.
-ICMP replies and IPv4 forwarding remain outside this milestone. A successful
+IPv4 forwarding remains outside this milestone. A successful
 `sendto()` is not delivery proof; the VM capture is authoritative.
 
-For the `VM ping gateway` use case, this milestone completes only the first
-phase: ARP resolution of the gateway IP. `ping` should populate the VM neighbor
-entry with the RIF MAC, but it will not receive an ICMP echo reply until the
-local-ICMP VR pipe and Arm handler are implemented in the next milestone.
+For `VM ping gateway`, `ESW_LOCAL_IP` matches `(VS metadata, RIF destination
+MAC, IPv4)` and sends the packet to the Arm RSS queue. The Arm handler validates
+the IPv4 and ICMP checksums, rejects fragments and non-echo traffic, builds the
+echo reply, and reuses `ESW_SF_RETURN` for delivery to the VM.
 
 ## Layout
 
@@ -75,6 +78,7 @@ eswitch_management/
     router_control.c          inventory/ownership integration and transactions
     router_state.c            versioned persistent desired configuration
     router_test.c             model/isolation/persistence tests
+    router_icmp.c             validated local ICMP echo reply builder
 ```
 
 ## Commands implemented
@@ -141,8 +145,8 @@ families in `doca-samples/samples/doca_flow/`:
 - `flow_ct_tcp_actions` and CT common code: directional NAT, lifetime, callbacks.
 - `applications/psp_gateway` in the sample bundle: Arm ARP and reinjection.
 
-Required work: reserved L3 gateway dispatch, typed Arm RSS reasons, public ARP,
-RIF-scoped neighbors, LPM/adjacency programming, ICMP local delivery, CT/NAT
+Required work: typed Arm RSS reasons, public ARP,
+RIF-scoped neighbors, LPM/adjacency programming, CT/NAT
 initialization and per-VR zones, route invalidation, first-packet handling,
 checksum/TTL/MTU exception paths, and durable config/hardware rollback.
 Do not treat this private-ARP milestone as the completed router implementation.
