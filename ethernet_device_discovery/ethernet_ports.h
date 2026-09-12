@@ -10,7 +10,8 @@
 
 enum ethernet_port_role {
   ETHERNET_PORT_ROLE_PARENT,
-  ETHERNET_PORT_ROLE_REPRESENTOR,
+  ETHERNET_PORT_ROLE_REPRESENTOR, /* External-host VF representor. */
+  ETHERNET_PORT_ROLE_SF_REPRESENTOR, /* Arm system SF; never tenant-owned. */
 };
 
 /* A DPDK Ethernet port created from an opened DOCA device. */

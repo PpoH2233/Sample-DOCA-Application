@@ -17,6 +17,7 @@
 #include "eswitch_manager.h"
 #include "pipeline/eswitch_pipeline.h"
 #include "pipeline/tx_build.h"
+#include "router/sf_packet_io.h"
 
 static volatile sig_atomic_t stop_requested;
 
@@ -47,6 +48,8 @@ static void print_inventory(const struct ethernet_ports *ports) {
     const struct ethernet_port *port = &ports->items[i];
     if (port->role == ETHERNET_PORT_ROLE_PARENT)
       printf("  DPDK port %u -> uplink/parent\n", port->port_id);
+    else if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+      printf("  DPDK port %u -> Arm system SF (reserved)\n", port->port_id);
     else
       printf("  DPDK port %u -> host=%u pf=%u vf=%u\n", port->port_id,
              port->host_index, port->pf_index, port->vf_index);
@@ -61,10 +64,12 @@ int main(int argc, char **argv) {
   struct switch_flow_ports flow_ports = {0};
   struct eswitch_pipeline pipeline = {0};
   struct eswitch_manager manager = {0};
+  struct sf_packet_io sf_io = {.fd = -1};
   struct control_server control = {.listen_fd = -1, .client_fd = -1};
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
   const char *state_path = getenv("ESWITCH_STATE_FILE");
   const char *vf_scope = getenv("ESWITCH_VF_SCOPE");
+  const char *sf_interface = getenv("ESWITCH_SF_IFACE");
   doca_error_t result;
   int separator;
   int exit_status = EXIT_FAILURE;
@@ -81,6 +86,8 @@ int main(int argc, char **argv) {
     state_path = ESWITCH_STATE_PATH;
   if (vf_scope == NULL || *vf_scope == '\0')
     vf_scope = ESWITCH_DEFAULT_VF_SCOPE;
+  if (sf_interface == NULL || *sf_interface == '\0')
+    sf_interface = ESWITCH_DEFAULT_SF_INTERFACE;
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -91,9 +98,8 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   printf("VF probe scope: %s\n", vf_scope);
-  result = switch_devices_open_scoped(argv[separator + 1],
-                                      SWITCH_DPDK_DEVARGS, vf_scope,
-                                      &devices);
+  result = switch_devices_open_scoped_with_sf(
+      argv[separator + 1], SWITCH_DPDK_DEVARGS, vf_scope, &devices);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr,
             "Failed to open/probe eSwitch endpoints with VF scope '%s': %s\n",
@@ -110,7 +116,7 @@ int main(int argc, char **argv) {
   }
   printf("TX BUILD: revision=%s compiled=%s %s\n",
          ESWITCH_TX_REVISION, __DATE__, __TIME__);
-  printf("TX CONFIG: plan=A mode=%s metadata=disabled "
+  printf("TX CONFIG: path=arm-sf-return mode=%s context=rif-mac-to-vswitch "
          "debug=first-3-then-1/s snapshots=5s\n", ESWITCH_TX_FLOW_MODE);
   result = flow_runtime_init_with_mode(&runtime, SWITCH_FLOW_COUNTER_COUNT,
                                        ESWITCH_TX_FLOW_MODE);
@@ -142,12 +148,18 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_flow_ports;
   }
-  result = eswitch_manager_init(&io, &flow_ports, &pipeline, state_path,
-                                &manager);
+  result = sf_packet_io_start(sf_interface, &sf_io);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Failed to start Arm SF packet I/O on %s: %s\n",
+            sf_interface, doca_error_get_descr(result));
+    goto cleanup_pipeline;
+  }
+  result = eswitch_manager_init(&io, &flow_ports, &pipeline, &sf_io,
+                                state_path, &manager);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize eSwitch manager: %s\n",
             doca_error_get_descr(result));
-    goto cleanup_pipeline;
+    goto cleanup_sf_io;
   }
   result = control_server_start(&control, socket_path,
                                 eswitch_manager_command, &manager);
@@ -189,6 +201,8 @@ int main(int argc, char **argv) {
 cleanup_manager:
   cleanup_error("Failed to remove managed vSwitch state",
                 eswitch_manager_destroy(&manager), &exit_status);
+cleanup_sf_io:
+  sf_packet_io_stop(&sf_io);
 cleanup_pipeline:
   /* If graceful manager cleanup failed, destroy its per-vSwitch HASH pipes
    * before destroying the shared pipes/gates they reference. */

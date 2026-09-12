@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -70,15 +71,17 @@ static doca_error_t vf_scope_matches(const char *scope, uint32_t vf_index,
   return DOCA_SUCCESS;
 }
 
-static doca_error_t open_scoped_vf_representors(
+static doca_error_t open_scoped_representors(
     struct doca_dev *parent,
     const char *vf_scope,
+    bool include_sf,
     struct doca_dev_rep ***opened_representors,
     size_t *opened_count) {
   struct doca_devinfo_rep **info_list = NULL;
   struct doca_dev_rep **representors = NULL;
   uint32_t info_count = 0;
-  size_t vf_count = 0;
+  size_t selected_count = 0;
+  size_t sf_count = 0;
   size_t opened = 0;
   doca_error_t result;
   doca_error_t destroy_result;
@@ -95,12 +98,17 @@ static doca_error_t open_scoped_vf_representors(
 
   for (uint32_t i = 0; i < info_count; i++) {
     enum doca_pci_func_type type;
-    uint32_t vf_index;
+    uint32_t vf_index = 0;
     bool selected;
 
     result = doca_devinfo_rep_get_pci_func_type(info_list[i], &type);
     if (result != DOCA_SUCCESS)
       goto destroy_list;
+    if (include_sf && type == DOCA_PCI_FUNC_TYPE_SF) {
+      sf_count++;
+      selected_count++;
+      continue;
+    }
     if (type != DOCA_PCI_FUNC_TYPE_VF)
       continue;
     result = doca_devinfo_rep_get_vf_index(info_list[i], &vf_index);
@@ -110,15 +118,24 @@ static doca_error_t open_scoped_vf_representors(
     if (result != DOCA_SUCCESS)
       goto destroy_list;
     if (selected)
-      vf_count++;
+      selected_count++;
   }
 
-  if (vf_count == 0) {
+  if (include_sf && sf_count != 1) {
+    fprintf(stderr,
+            "Expected exactly one Arm system SF representor, discovered %zu\n",
+            sf_count);
     result = DOCA_ERROR_NOT_FOUND;
     goto destroy_list;
   }
 
-  representors = calloc(vf_count, sizeof(*representors));
+  if (selected_count == (include_sf ? 1U : 0U)) {
+    fprintf(stderr, "VF scope '%s' selected no external-host VF\n", vf_scope);
+    result = DOCA_ERROR_NOT_FOUND;
+    goto destroy_list;
+  }
+
+  representors = calloc(selected_count, sizeof(*representors));
   if (representors == NULL) {
     result = DOCA_ERROR_NO_MEMORY;
     goto destroy_list;
@@ -126,22 +143,26 @@ static doca_error_t open_scoped_vf_representors(
 
   for (uint32_t i = 0; i < info_count; i++) {
     enum doca_pci_func_type type;
-    uint32_t vf_index;
+    uint32_t vf_index = 0;
     bool selected;
 
     result = doca_devinfo_rep_get_pci_func_type(info_list[i], &type);
     if (result != DOCA_SUCCESS)
       goto destroy_list;
-    if (type != DOCA_PCI_FUNC_TYPE_VF)
-      continue;
-    result = doca_devinfo_rep_get_vf_index(info_list[i], &vf_index);
-    if (result != DOCA_SUCCESS)
-      goto destroy_list;
-    result = vf_scope_matches(vf_scope, vf_index, &selected);
-    if (result != DOCA_SUCCESS)
-      goto destroy_list;
-    if (!selected)
-      continue;
+    if (include_sf && type == DOCA_PCI_FUNC_TYPE_SF) {
+      selected = true;
+    } else {
+      if (type != DOCA_PCI_FUNC_TYPE_VF)
+        continue;
+      result = doca_devinfo_rep_get_vf_index(info_list[i], &vf_index);
+      if (result != DOCA_SUCCESS)
+        goto destroy_list;
+      result = vf_scope_matches(vf_scope, vf_index, &selected);
+      if (result != DOCA_SUCCESS)
+        goto destroy_list;
+      if (!selected)
+        continue;
+    }
 
     result = doca_dev_rep_open(info_list[i], &representors[opened]);
     if (result != DOCA_SUCCESS)
@@ -187,8 +208,8 @@ doca_error_t switch_devices_open_scoped(const char *pci_address,
   if (devices->parent == NULL)
     return DOCA_ERROR_NOT_FOUND;
 
-  result = open_scoped_vf_representors(
-      devices->parent, vf_scope, &devices->representors,
+  result = open_scoped_representors(
+      devices->parent, vf_scope, false, &devices->representors,
       &devices->representor_count);
   if (result != DOCA_SUCCESS)
     goto close_parent;
@@ -199,6 +220,42 @@ doca_error_t switch_devices_open_scoped(const char *pci_address,
   if (result != DOCA_SUCCESS)
     goto close_representors;
 
+  return DOCA_SUCCESS;
+
+close_representors:
+  for (size_t i = 0; i < devices->representor_count; i++)
+    (void)doca_dev_rep_close(devices->representors[i]);
+  free(devices->representors);
+  devices->representors = NULL;
+  devices->representor_count = 0;
+close_parent:
+  (void)doca_dev_close(devices->parent);
+  devices->parent = NULL;
+  return result;
+}
+
+doca_error_t switch_devices_open_scoped_with_sf(
+    const char *pci_address, const char *devargs, const char *vf_scope,
+    struct switch_devices *devices) {
+  doca_error_t result;
+
+  if (pci_address == NULL || vf_scope == NULL || devices == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (devices->parent != NULL)
+    return DOCA_ERROR_BAD_STATE;
+  devices->parent = open_pci_device(pci_address);
+  if (devices->parent == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+  result = open_scoped_representors(
+      devices->parent, vf_scope, true, &devices->representors,
+      &devices->representor_count);
+  if (result != DOCA_SUCCESS)
+    goto close_parent;
+  result = ethernet_ports_probe_representors(
+      devices->parent, devices->representors, devices->representor_count,
+      devargs, &devices->ethernet_ports);
+  if (result != DOCA_SUCCESS)
+    goto close_representors;
   return DOCA_SUCCESS;
 
 close_representors:

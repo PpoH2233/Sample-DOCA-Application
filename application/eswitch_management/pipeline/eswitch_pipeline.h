@@ -38,6 +38,15 @@ struct eswitch_flood_group {
   uint16_t member_capacity;
 };
 
+#define ESWITCH_MAX_SF_RETURN_CONTEXTS 256U
+
+struct eswitch_sf_return_context {
+  uint16_t vswitch_id;
+  uint8_t rif_mac[6];
+  struct eswitch_rule rule;
+  bool active;
+};
+
 struct eswitch_pipeline {
   struct flow_runtime *runtime;
   struct switch_flow_ports *ports;
@@ -52,12 +61,11 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *arp_dispatch_pipe;
   struct eswitch_rule arp_dispatch_rule;
   struct doca_flow_pipe *ingress_classifier_pipe;
-  struct doca_flow_pipe *control_tx_pipe;
-  struct doca_flow_pipe *tx_probe_pipe, *tx_drop_pipe;
-  struct eswitch_rule tx_root_rule, tx_probe_rule;
-  uint16_t tx_probe_port;
-  uint8_t tx_probe_src[6], tx_probe_dst[6];
-  struct eswitch_rule control_tx_drop;
+  struct doca_flow_pipe *sf_return_pipe;
+  struct eswitch_rule sf_root_rule;
+  uint16_t sf_port_id;
+  struct eswitch_sf_return_context
+      sf_return_contexts[ESWITCH_MAX_SF_RETURN_CONTEXTS];
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -77,10 +85,18 @@ struct eswitch_hw_fdb_entry {
 };
 
 uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
-doca_error_t eswitch_pipeline_tx_probe_arm(struct eswitch_pipeline *pipeline,
-    uint16_t port, const uint8_t *src, const uint8_t *dst);
 void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
                             uint16_t *port_id);
+
+/* Authorize one RIF source MAC arriving from the system SF and restore its
+ * vSwitch context before feeding the existing destination FDB. */
+doca_error_t eswitch_pipeline_sf_bind_vswitch(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
+    const uint8_t rif_mac[6]);
+
+/* Remove a previously installed SF return context. This is idempotent. */
+doca_error_t eswitch_pipeline_sf_unbind_vswitch(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id);
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,

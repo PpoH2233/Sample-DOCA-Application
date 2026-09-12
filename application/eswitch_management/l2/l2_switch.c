@@ -50,6 +50,9 @@ doca_error_t attach_port(struct eswitch_manager *manager,
   port_index = find_port_index(manager, port_id);
   if (port_index < 0)
     return DOCA_ERROR_NOT_FOUND;
+  if (manager->ports->items[port_index].ethernet->role ==
+      ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+    return DOCA_ERROR_NOT_SUPPORTED;
   if (manager->port_owner[port_index] != 0 ||
       router_control_port_reserved(manager, (uint16_t)port_index))
     return DOCA_ERROR_IN_USE;
@@ -124,6 +127,9 @@ doca_error_t delete_vswitch(struct eswitch_manager *manager,
 
   if (vswitch == NULL)
     return DOCA_ERROR_NOT_FOUND;
+  result = eswitch_pipeline_sf_unbind_vswitch(manager->pipeline, id);
+  if (result != DOCA_SUCCESS)
+    return result;
   result = eswitch_fdb_flush_vswitch(&manager->fdb, id, "vs-delete");
   if (result != DOCA_SUCCESS)
     return result;

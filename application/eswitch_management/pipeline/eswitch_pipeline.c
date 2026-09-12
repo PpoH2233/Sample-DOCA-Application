@@ -340,14 +340,12 @@ static doca_error_t create_ingress_classifier(
   struct doca_flow_match match = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
-  struct doca_flow_fwd fwd = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
   match.parser_meta.port_id = UINT16_MAX;
   actions.meta.pkt_meta = UINT32_MAX;
-  fwd.type = DOCA_FLOW_FWD_PIPE;
-  fwd.next_pipe = pipeline->arp_dispatch_pipe;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
@@ -371,119 +369,146 @@ static doca_error_t create_ingress_classifier(
     return DOCA_ERROR_NO_MEMORY;
   pipeline->egress_gates = calloc(pipeline->ports->count,
                                   sizeof(*pipeline->egress_gates));
-  return pipeline->egress_gates == NULL ? DOCA_ERROR_NO_MEMORY
-                                         : DOCA_SUCCESS;
+  if (pipeline->egress_gates == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+
+  for (uint16_t i = 0; i < pipeline->ports->count; i++) {
+    const struct ethernet_port *port = pipeline->ports->items[i].ethernet;
+    struct eswitch_rule *rule = &pipeline->sf_root_rule;
+
+    if (port->role != ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+      continue;
+    if (rule->entry != NULL)
+      return DOCA_ERROR_BAD_STATE;
+    match.parser_meta.port_id = port->port_id;
+    actions.meta.pkt_meta = 0;
+    fwd.type = DOCA_FLOW_FWD_PIPE;
+    fwd.next_pipe = pipeline->sf_return_pipe;
+    flow_entry_cookie_prepare(&rule->cookie, "attach system SF",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_basic_add_entry(
+        pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe,
+        &match, 0, &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        &rule->cookie, &rule->entry);
+    if (result != DOCA_SUCCESS)
+      return result;
+    result = process_rules(pipeline, rule, 1);
+    if (result != DOCA_SUCCESS)
+      return result;
+    pipeline->sf_port_id = port->port_id;
+  }
+  return pipeline->sf_root_rule.entry == NULL ? DOCA_ERROR_NOT_FOUND
+                                               : DOCA_SUCCESS;
 }
 
-/* Plan A: independent root counter, exact Ethernet probe, counted DROP.
- * L2 DEFAULT pipes are never connected to this diagnostic EGRESS path. */
-static doca_error_t tx_basic_pipe(struct eswitch_pipeline *p, const char *name,
-                                  bool root, struct doca_flow_match *match,
-                                  struct doca_flow_match *mask,
-                                  struct doca_flow_fwd *fwd,
-                                  struct doca_flow_fwd *miss,
-                                  struct doca_flow_pipe **pipe) {
+/* Packets created by Arm enter the eSwitch through the actual SF endpoint.
+ * Their RIF source MAC restores the vSwitch context; destination forwarding
+ * then reuses the normal VS FDB/flood path. Unknown RIF sources fail closed. */
+static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_monitor monitor = {0};
-  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-  doca_error_t result = doca_flow_pipe_cfg_create(&cfg, p->switch_port);
-  if (result != DOCA_SUCCESS) return result;
-  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_BASIC, root, 1);
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->destination_pipe};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
+  doca_error_t result;
+
+  memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  actions.meta.pkt_meta = UINT32_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_SF_RETURN", DOCA_FLOW_PIPE_BASIC,
+                             false, ESWITCH_MAX_SF_RETURN_CONTEXTS);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_domain(cfg, DOCA_FLOW_PIPE_DOMAIN_EGRESS);
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, match, mask);
+    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, fwd, miss, pipe);
+    result = doca_flow_pipe_create(cfg, &fwd, &miss,
+                                   &pipeline->sf_return_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
   return result;
 }
 
-static doca_error_t tx_basic_entry(struct eswitch_pipeline *p,
-                                   struct doca_flow_pipe *pipe,
-                                   struct doca_flow_match *match,
-                                   struct doca_flow_fwd *fwd,
-                                   struct eswitch_rule *rule, const char *name) {
-  struct doca_flow_monitor monitor = {0};
-  monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-  flow_entry_cookie_prepare(&rule->cookie, name, DOCA_FLOW_ENTRY_OP_ADD);
-  doca_error_t result = doca_flow_pipe_basic_add_entry(
-      p->runtime->queue_id, pipe, match, 0, NULL, &monitor, fwd,
-      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie, &rule->entry);
-  if (result != DOCA_SUCCESS) return result;
-  return process_rules(p, rule, 1);
-}
-
-static doca_error_t create_control_tx(struct eswitch_pipeline *p) {
-  struct doca_flow_match match = {0}, mask = {0};
-  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_DROP};
-  doca_error_t result = tx_basic_pipe(p, "TX_A_DROP", false, &match, NULL,
-                                      &fwd, NULL, &p->tx_drop_pipe);
-  if (result != DOCA_SUCCESS) return result;
-  result = tx_basic_entry(p, p->tx_drop_pipe, &match, NULL, &p->control_tx_drop,
-                          "TX A drop");
-  if (result != DOCA_SUCCESS) return result;
-  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-                               .next_pipe = p->tx_drop_pipe};
-  match.outer.eth.type = DOCA_HTOBE16(0x0806);
-  mask.outer.eth.type = UINT16_MAX;
-  memset(match.outer.eth.src_mac, 0xff, 6);
-  memset(match.outer.eth.dst_mac, 0xff, 6);
-  memset(mask.outer.eth.src_mac, 0xff, 6);
-  memset(mask.outer.eth.dst_mac, 0xff, 6);
-  fwd.type = DOCA_FLOW_FWD_PORT;
-  fwd.port_id = UINT16_MAX;
-  result = tx_basic_pipe(p, "TX_A_ARP_PROBE", false, &match, &mask,
-                         &fwd, &miss, &p->tx_probe_pipe);
-  if (result != DOCA_SUCCESS) return result;
-  memset(&match, 0, sizeof(match));
-  fwd = (struct doca_flow_fwd){.type = DOCA_FLOW_FWD_PIPE,
-                              .next_pipe = p->tx_probe_pipe};
-  result = tx_basic_pipe(p, "TX_A_EGRESS_ROOT", true, &match, NULL,
-                         &fwd, &miss, &p->control_tx_pipe);
-  if (result != DOCA_SUCCESS) return result;
-  result = tx_basic_entry(p, p->control_tx_pipe, &match, NULL, &p->tx_root_rule,
-                          "TX A root");
-  if (result == DOCA_SUCCESS)
-    printf("TX PLAN A READY: root=all -> probe=unarmed -> DROP; no TX metadata\n");
-  return result;
-}
-
-doca_error_t eswitch_pipeline_tx_probe_arm(struct eswitch_pipeline *p,
-    uint16_t port, const uint8_t *src, const uint8_t *dst) {
-  if (p == NULL || !p->created || src == NULL || dst == NULL)
-    return DOCA_ERROR_INVALID_VALUE;
-  int index = find_port_index(p, port);
-  if (!p->created || index < 0 ||
-      p->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR)
-    return DOCA_ERROR_INVALID_VALUE;
-  if (p->tx_probe_rule.entry != NULL) {
-    if (p->tx_probe_rule.cookie.last_status != DOCA_FLOW_ENTRY_STATUS_SUCCESS)
-      return DOCA_ERROR_BAD_STATE;
-    return p->tx_probe_port == port && !memcmp(p->tx_probe_src, src, 6) &&
-           !memcmp(p->tx_probe_dst, dst, 6) ? DOCA_SUCCESS : DOCA_ERROR_BAD_STATE;
-  }
+doca_error_t eswitch_pipeline_sf_bind_vswitch(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
+    const uint8_t rif_mac[6]) {
+  struct eswitch_sf_return_context *free_context = NULL;
   struct doca_flow_match match = {0};
-  memcpy(match.outer.eth.src_mac, src, 6);
-  memcpy(match.outer.eth.dst_mac, dst, 6);
-  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PORT, .port_id = port};
-  printf("TX MATCH: domain=EGRESS ethertype=0x0806 "
-         "src=%02x:%02x:%02x:%02x:%02x:%02x "
-         "dst=%02x:%02x:%02x:%02x:%02x:%02x target=%u "
-         "mac_fields=per-entry metadata=disabled\n",
-         src[0], src[1], src[2], src[3], src[4], src[5],
-         dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], port);
-  doca_error_t result = tx_basic_entry(p, p->tx_probe_pipe, &match, &fwd,
-                                      &p->tx_probe_rule, "TX A ARP probe");
-  if (result == DOCA_SUCCESS) {
-    p->tx_probe_port = port;
-    memcpy(p->tx_probe_src, src, 6);
-    memcpy(p->tx_probe_dst, dst, 6);
-    printf("TX PROBE ARMED: dpdk-port=%u; tuple locked until restart\n", port);
+  struct doca_flow_actions actions = {0};
+  doca_error_t result;
+
+  if (pipeline == NULL || !pipeline->created || vswitch_id == 0 ||
+      rif_mac == NULL || (rif_mac[0] & 1U) != 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+    if (!context->active) {
+      if (free_context == NULL)
+        free_context = context;
+      continue;
+    }
+    if (context->vswitch_id == vswitch_id)
+      return memcmp(context->rif_mac, rif_mac, 6) == 0
+                 ? DOCA_SUCCESS
+                 : DOCA_ERROR_BAD_STATE;
+    if (memcmp(context->rif_mac, rif_mac, 6) == 0)
+      return DOCA_ERROR_ALREADY_EXIST;
   }
-  return result;
+  if (free_context == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+
+  memcpy(match.outer.eth.src_mac, rif_mac, 6);
+  actions.meta.pkt_meta = DOCA_HTOBE32(
+      eswitch_metadata_encode(vswitch_id, pipeline->sf_port_id));
+  flow_entry_cookie_prepare(&free_context->rule.cookie, "bind SF RIF context",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(
+      pipeline->runtime->queue_id, pipeline->sf_return_pipe, &match, 0,
+      &actions, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &free_context->rule.cookie, &free_context->rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = process_rules(pipeline, &free_context->rule, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = remove_rule(pipeline, &free_context->rule,
+                                       "rollback SF RIF context");
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
+  free_context->vswitch_id = vswitch_id;
+  memcpy(free_context->rif_mac, rif_mac, 6);
+  free_context->active = true;
+  printf("SF RETURN BIND: vs=%u rif="
+         "%02x:%02x:%02x:%02x:%02x:%02x sf-port=%u\n",
+         vswitch_id, rif_mac[0], rif_mac[1], rif_mac[2], rif_mac[3],
+         rif_mac[4], rif_mac[5], pipeline->sf_port_id);
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_sf_unbind_vswitch(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id) {
+  if (pipeline == NULL || !pipeline->created || vswitch_id == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+    doca_error_t result;
+
+    if (!context->active || context->vswitch_id != vswitch_id)
+      continue;
+    result = remove_rule(pipeline, &context->rule, "unbind SF RIF context");
+    if (result != DOCA_SUCCESS)
+      return result;
+    printf("SF RETURN UNBIND: vs=%u\n", vswitch_id);
+    *context = (struct eswitch_sf_return_context){0};
+    return DOCA_SUCCESS;
+  }
+  return DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
@@ -510,9 +535,9 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   } while (0)
 
   CREATE_STAGE("RSS slow path", create_rss_pipe(pipeline));
-  CREATE_STAGE("control TX egress", create_control_tx(pipeline));
   CREATE_STAGE("flood selector", create_flood_selector(pipeline));
   CREATE_STAGE("destination FDB", create_destination_pipe(pipeline));
+  CREATE_STAGE("SF return classifier", create_sf_return(pipeline));
   CREATE_STAGE("learning clone", create_learning_clone(pipeline));
   CREATE_STAGE("learning dispatch", create_learning_dispatch(pipeline));
   CREATE_STAGE("source guard", create_source_guard(pipeline));
@@ -530,14 +555,10 @@ fail:
 void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
   if (pipeline == NULL)
     return;
-  if (pipeline->control_tx_pipe != NULL)
-    doca_flow_pipe_destroy(pipeline->control_tx_pipe);
-  if (pipeline->tx_probe_pipe != NULL)
-    doca_flow_pipe_destroy(pipeline->tx_probe_pipe);
-  if (pipeline->tx_drop_pipe != NULL)
-    doca_flow_pipe_destroy(pipeline->tx_drop_pipe);
   if (pipeline->ingress_classifier_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
+  if (pipeline->sf_return_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->sf_return_pipe);
   if (pipeline->arp_dispatch_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->arp_dispatch_pipe);
   if (pipeline->source_guard_pipe != NULL)
@@ -568,6 +589,8 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t vswitch_id) {
   struct doca_flow_match match = {0};
   struct doca_flow_actions actions = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->arp_dispatch_pipe};
   struct eswitch_rule *rule;
   uint16_t port_id;
   doca_error_t result;
@@ -575,6 +598,9 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
   if (pipeline == NULL || !pipeline->created ||
       port_index >= pipeline->ports->count || vswitch_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
+  if (pipeline->ports->items[port_index].ethernet->role ==
+      ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+    return DOCA_ERROR_NOT_SUPPORTED;
   rule = &pipeline->classifier_rules[port_index];
   if (rule->entry != NULL)
     return DOCA_ERROR_BAD_STATE;
@@ -586,7 +612,7 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe, &match,
-      0, &actions, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie,
+      0, &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie,
       &rule->entry);
   if (result != DOCA_SUCCESS)
     return result;

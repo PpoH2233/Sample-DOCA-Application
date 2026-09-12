@@ -35,6 +35,7 @@ RUN ldd /usr/local/bin/eswitch-management \
 
 ENV ESWITCH_CONTROL_SOCKET=/run/eswitch-management/control.sock
 ENV ESWITCH_STATE_FILE=/var/lib/eswitch-management/eswitch.conf
+ENV ESWITCH_SF_IFACE=enp3s0f0s0
 
 STOPSIGNAL SIGTERM
 HEALTHCHECK --start-period=30s --interval=10s --timeout=3s --retries=3 \

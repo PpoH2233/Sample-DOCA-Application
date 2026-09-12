@@ -7,7 +7,7 @@
 bool router_control_port_reserved(const struct eswitch_manager *m,uint16_t index) {
   if(!m->router || index>=m->ports->count) return false;
   const struct ethernet_port *p=m->ports->items[index].ethernet;
-  if(p->role==ETHERNET_PORT_ROLE_PARENT) return false;
+  if(p->role!=ETHERNET_PORT_ROLE_REPRESENTOR) return false;
   struct router_port_identity id={p->host_index,p->pf_index,p->vf_index};
   return router_port_reserved(m->router,&id);
 }
@@ -16,7 +16,7 @@ static bool inventory_port(void *context,uint16_t port,struct router_port_identi
   for(uint16_t i=0;i<m->ports->count;i++) {
     const struct ethernet_port *p=m->ports->items[i].ethernet;
     if(p->port_id!=port) continue;
-    if(p->role==ETHERNET_PORT_ROLE_PARENT || m->port_owner[i]) return false;
+    if(p->role!=ETHERNET_PORT_ROLE_REPRESENTOR || m->port_owner[i]) return false;
     *id=(struct router_port_identity){p->host_index,p->pf_index,p->vf_index};
     return true;
   }
@@ -46,7 +46,7 @@ doca_error_t router_control_restore(struct eswitch_manager *m) {
     if(rif->attachment==ROUTER_VSWITCH) found=inventory_switch(m,rif->vswitch_id);
     else for(uint16_t i=0;i<m->ports->count;i++) {
       const struct ethernet_port *p=m->ports->items[i].ethernet;
-      if(p->role!=ETHERNET_PORT_ROLE_PARENT && p->host_index==rif->port.host &&
+      if(p->role==ETHERNET_PORT_ROLE_REPRESENTOR && p->host_index==rif->port.host &&
         p->pf_index==rif->port.pf && p->vf_index==rif->port.vf && !m->port_owner[i]) found=true;
     }
     if(!found) {

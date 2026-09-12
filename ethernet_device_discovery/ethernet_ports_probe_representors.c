@@ -9,15 +9,17 @@
 #include <doca_dpdk.h>
 #include <rte_ethdev.h>
 
-struct vf_identity {
+struct representor_identity {
   char vuid[DOCA_DEVINFO_VUID_SIZE];
+  enum doca_pci_func_type type;
   uint32_t host_index;
   uint32_t pf_index;
   uint32_t vf_index;
 };
 
-static doca_error_t get_vf_identity(struct doca_dev_rep *representor,
-                                    struct vf_identity *identity) {
+static doca_error_t get_representor_identity(
+    struct doca_dev_rep *representor,
+    struct representor_identity *identity) {
   struct doca_devinfo_rep *rep_info;
   enum doca_pci_func_type function_type;
   doca_error_t result;
@@ -33,13 +35,19 @@ static doca_error_t get_vf_identity(struct doca_dev_rep *representor,
   if (result != DOCA_SUCCESS)
     return result;
 
-  if (function_type != DOCA_PCI_FUNC_TYPE_VF)
+  if (function_type != DOCA_PCI_FUNC_TYPE_VF &&
+      function_type != DOCA_PCI_FUNC_TYPE_SF)
     return DOCA_ERROR_NOT_SUPPORTED;
+
+  identity->type = function_type;
 
   result = doca_devinfo_rep_get_vuid(rep_info, identity->vuid,
                                      sizeof(identity->vuid));
   if (result != DOCA_SUCCESS)
     return result;
+
+  if (function_type == DOCA_PCI_FUNC_TYPE_SF)
+    return DOCA_SUCCESS;
 
   result = doca_devinfo_rep_get_host_index(rep_info, &identity->host_index);
   if (result != DOCA_SUCCESS)
@@ -52,12 +60,15 @@ static doca_error_t get_vf_identity(struct doca_dev_rep *representor,
   return doca_devinfo_rep_get_vf_index(rep_info, &identity->vf_index);
 }
 
-static bool vf_identity_is_equal(const struct vf_identity *left,
-                                 const struct vf_identity *right) {
-  return strcmp(left->vuid, right->vuid) == 0 &&
-         left->host_index == right->host_index &&
-         left->pf_index == right->pf_index &&
-         left->vf_index == right->vf_index;
+static bool representor_identity_is_equal(
+    const struct representor_identity *left,
+    const struct representor_identity *right) {
+  if (left->type != right->type || strcmp(left->vuid, right->vuid) != 0)
+    return false;
+  return left->type == DOCA_PCI_FUNC_TYPE_SF ||
+         (left->host_index == right->host_index &&
+          left->pf_index == right->pf_index &&
+          left->vf_index == right->vf_index);
 }
 
 static void close_dpdk_ports(const uint16_t *port_ids, uint16_t port_count) {
@@ -71,13 +82,13 @@ static doca_error_t map_representor_port(
     uint16_t port_id,
     struct doca_dev *parent_device,
     struct doca_dev_rep **representors,
-    const struct vf_identity *input_identities,
+    const struct representor_identity *input_identities,
     bool *is_mapped,
     size_t representor_count,
     struct ethernet_port *port,
     bool *is_representor) {
   struct doca_dev_rep *mapped_representor = NULL;
-  struct vf_identity mapped_identity = {0};
+  struct representor_identity mapped_identity = {0};
   doca_error_t result;
   size_t match_index;
 
@@ -102,7 +113,7 @@ static doca_error_t map_representor_port(
 
   *is_representor = true;
 
-  result = get_vf_identity(mapped_representor, &mapped_identity);
+  result = get_representor_identity(mapped_representor, &mapped_identity);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr,
             "Failed to read identity from DPDK port %u representor: %s\n",
@@ -112,16 +123,18 @@ static doca_error_t map_representor_port(
 
   for (match_index = 0; match_index < representor_count; match_index++) {
     if (!is_mapped[match_index] &&
-        vf_identity_is_equal(&mapped_identity, &input_identities[match_index]))
+        representor_identity_is_equal(&mapped_identity,
+                                      &input_identities[match_index]))
       break;
   }
 
   if (match_index == representor_count) {
     fprintf(stderr,
-            "DPDK port %u maps to an unexpected representor "
-            "(host=%u pf=%u vf=%u vuid=%s)\n",
-            port_id, mapped_identity.host_index, mapped_identity.pf_index,
-            mapped_identity.vf_index, mapped_identity.vuid);
+            "DPDK port %u maps to an unexpected representor (type=%d "
+            "host=%u pf=%u vf=%u vuid=%s)\n",
+            port_id, (int)mapped_identity.type, mapped_identity.host_index,
+            mapped_identity.pf_index, mapped_identity.vf_index,
+            mapped_identity.vuid);
     result = DOCA_ERROR_NOT_FOUND;
     goto close_mapped_representor;
   }
@@ -129,7 +142,9 @@ static doca_error_t map_representor_port(
   port->device = parent_device;
   port->representor = representors[match_index];
   port->port_id = port_id;
-  port->role = ETHERNET_PORT_ROLE_REPRESENTOR;
+  port->role = mapped_identity.type == DOCA_PCI_FUNC_TYPE_SF
+                   ? ETHERNET_PORT_ROLE_SF_REPRESENTOR
+                   : ETHERNET_PORT_ROLE_REPRESENTOR;
   port->host_index = mapped_identity.host_index;
   port->pf_index = mapped_identity.pf_index;
   port->vf_index = mapped_identity.vf_index;
@@ -158,7 +173,7 @@ doca_error_t ethernet_ports_probe_representors(
     size_t representor_count,
     const char *devargs,
     struct ethernet_ports *ports) {
-  struct vf_identity *input_identities = NULL;
+  struct representor_identity *input_identities = NULL;
   struct ethernet_port *mapped_ports = NULL;
   uint16_t *port_ids = NULL;
   bool *is_mapped = NULL;
@@ -201,40 +216,45 @@ doca_error_t ethernet_ports_probe_representors(
   }
 
   for (size_t i = 0; i < representor_count; i++) {
-    uint16_t dpdk_vf_index;
-
-    result = get_vf_identity(representors[i], &input_identities[i]);
+    result = get_representor_identity(representors[i], &input_identities[i]);
     if (result != DOCA_SUCCESS) {
       fprintf(stderr, "Failed to read identity of representor[%zu]: %s\n", i,
               doca_error_get_descr(result));
       goto cleanup;
     }
 
-    result = doca_dpdk_get_rep_vf_index(
-        doca_dev_rep_as_devinfo(representors[i]), &dpdk_vf_index);
-    if (result != DOCA_SUCCESS) {
-      fprintf(stderr,
-              "Representor[%zu] host=%u pf=%u vf=%u cannot be used as a "
-              "DPDK VF representor: %s\n",
-              i, input_identities[i].host_index,
-              input_identities[i].pf_index, input_identities[i].vf_index,
-              doca_error_get_descr(result));
-      goto cleanup;
+    if (input_identities[i].type == DOCA_PCI_FUNC_TYPE_VF) {
+      uint16_t dpdk_vf_index;
+
+      result = doca_dpdk_get_rep_vf_index(
+          doca_dev_rep_as_devinfo(representors[i]), &dpdk_vf_index);
+      if (result != DOCA_SUCCESS) {
+        fprintf(stderr,
+                "Representor[%zu] host=%u pf=%u vf=%u cannot be used as a "
+                "DPDK VF representor: %s\n",
+                i, input_identities[i].host_index,
+                input_identities[i].pf_index, input_identities[i].vf_index,
+                doca_error_get_descr(result));
+        goto cleanup;
+      }
+      printf("Input VF representor[%zu]: host=%u pf=%u vf=%u dpdk-vf=%u "
+             "vuid=%s\n",
+             i, input_identities[i].host_index,
+             input_identities[i].pf_index, input_identities[i].vf_index,
+             dpdk_vf_index, input_identities[i].vuid);
+    } else {
+      printf("Input system SF representor[%zu]: vuid=%s\n", i,
+             input_identities[i].vuid);
     }
 
-    printf("Input representor[%zu]: host=%u pf=%u vf=%u dpdk-vf=%u "
-           "vuid=%s\n",
-           i, input_identities[i].host_index, input_identities[i].pf_index,
-           input_identities[i].vf_index, dpdk_vf_index,
-           input_identities[i].vuid);
-
     for (size_t previous = 0; previous < i; previous++) {
-      if (vf_identity_is_equal(&input_identities[i],
-                               &input_identities[previous])) {
+      if (representor_identity_is_equal(&input_identities[i],
+                                        &input_identities[previous])) {
         fprintf(stderr,
                 "Representor[%zu] duplicates representor[%zu] "
-                "(host=%u pf=%u vf=%u vuid=%s)\n",
-                i, previous, input_identities[i].host_index,
+                "(type=%d host=%u pf=%u vf=%u vuid=%s)\n",
+                i, previous, (int)input_identities[i].type,
+                input_identities[i].host_index,
                 input_identities[i].pf_index, input_identities[i].vf_index,
                 input_identities[i].vuid);
         result = DOCA_ERROR_INVALID_VALUE;

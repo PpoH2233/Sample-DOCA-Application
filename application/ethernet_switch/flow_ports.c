@@ -107,18 +107,19 @@ doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
 
     flow_port = &ports->items[ports->count];
     flow_port->ethernet = ethernet;
-    printf("Starting DOCA Flow representor port %u "
-           "(host=%u pf=%u vf=%u)\n",
-           ethernet->port_id, ethernet->host_index, ethernet->pf_index,
-           ethernet->vf_index);
+    if (ethernet->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+      printf("Starting DOCA Flow system SF representor port %u\n",
+             ethernet->port_id);
+    else
+      printf("Starting DOCA Flow VF representor port %u "
+             "(host=%u pf=%u vf=%u)\n",
+             ethernet->port_id, ethernet->host_index, ethernet->pf_index,
+             ethernet->vf_index);
 
     result = start_one_port(ethernet, &flow_port->flow);
     if (result != DOCA_SUCCESS) {
-      fprintf(stderr,
-              "Failed to start representor DPDK port %u "
-              "(host=%u pf=%u vf=%u): %s\n",
-              ethernet->port_id, ethernet->host_index, ethernet->pf_index,
-              ethernet->vf_index, doca_error_get_descr(result));
+      fprintf(stderr, "Failed to start representor DPDK port %u: %s\n",
+              ethernet->port_id, doca_error_get_descr(result));
       goto error;
     }
     ports->count++;

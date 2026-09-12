@@ -43,6 +43,7 @@ executable(
     'router/router_arp.c',
     'router/router_state.c',
     'router/router_control.c',
+    'router/sf_packet_io.c',
     '../ethernet_switch/switch_devices.c',
     '../ethernet_switch/dpdk_io.c',
     '../ethernet_switch/flow_runtime.c',
@@ -90,11 +91,3 @@ arp_test = executable(
   install: false,
 )
 test('eswitch-router-arp', arp_test)
-
-tx_metadata_test = executable(
-  'eswitch-tx-plan-a-test',
-  'pipeline/tx_plan_a_test.c',
-  build_by_default: false,
-  install: false,
-)
-test('eswitch-tx-plan-a', tx_metadata_test)

@@ -12,6 +12,7 @@
 #include "eswitch_config.h"
 #include "l2/eswitch_fdb.h"
 #include "router/router.h"
+#include "router/sf_packet_io.h"
 
 struct managed_vswitch {
   bool exists;
@@ -23,17 +24,15 @@ struct eswitch_manager {
   struct dpdk_io *io;
   struct switch_flow_ports *ports;
   struct eswitch_pipeline *pipeline;
+  struct sf_packet_io *sf_io;
   struct eswitch_fdb fdb;
   struct router_config *router;
   uint64_t arp_replies, arp_tx_drops, arp_rate_drops;
   uint64_t arp_window_ns;
   unsigned arp_window_replies;
-  uint64_t arp_seen, arp_ignored, arp_built, arp_alloc_drops, arp_append_drops;
-  uint64_t arp_target_drops, arp_enqueue_drops;
+  uint64_t arp_seen, arp_ignored, arp_built;
+  uint64_t arp_target_drops, arp_sf_send_drops;
   uint64_t tx_log_ns, tx_snapshot_ns, tx_snapshot_seen;
-  uint64_t tx_hw_packets[3], tx_hw_sample_ns;
-  doca_error_t tx_hw_errors[3];
-  bool tx_hw_valid[3];
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];
   uint16_t *port_owner; /* indexed like ports->items; 0 means available */
   uint64_t started_ns;
@@ -45,6 +44,7 @@ struct eswitch_manager {
 doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct switch_flow_ports *ports,
                                   struct eswitch_pipeline *pipeline,
+                                  struct sf_packet_io *sf_io,
                                   const char *state_path,
                                   struct eswitch_manager *manager);
 doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,

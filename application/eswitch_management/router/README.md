@@ -2,77 +2,65 @@
 
 This change introduces the control-plane foundation and a private gateway ARP
 responder. It does **not** implement IPv4 router forwarding or ICMP echo replies.
-Interfaces with IPs report `PENDING_DATAPLANE`, and
-daemon status reports `router_dataplane=NOT_IMPLEMENTED`. Public ports are
-reserved but remain root-miss DROP. Private L2 forwarding remains active.
+Interfaces with IPs still report `PENDING_DATAPLANE`, while daemon status
+reports `router_dataplane=GATEWAY_ARP_ONLY`. Public ports are reserved but
+remain root-miss DROP. Private L2 forwarding remains active.
 No API stub returns a fabricated hardware success.
 
-## Private gateway ARP / TX Plan A
+## Private gateway ARP through the Arm system SF
 
-Plan A replaces the old metadata TX implementation. RX ARP dispatch and the
-portable 60-byte ARP response builder are unchanged. DEFAULT-domain L2
-forwarding is unchanged. This is a single-pair diagnostic, not multi-VR TX.
+The old parent-PF TX probe has been replaced by the same topology proven by the
+SF-to-VF10 PoC. RX ARP dispatch and the portable 60-byte ARP response builder
+are unchanged. The return path is multi-VS capable and fail-closed.
 
 Software path:
 1. Validate gateway request and current VS ownership.
-2. Require exact configured test VS and VM MAC selectors.
-3. Resolve the request's ingress endpoint using current inventory (never VF
-   arithmetic). Commit one Ethernet ARP probe rule for gateway MAC -> VM MAC.
-4. Allocate fresh mbuf, copy padded ARP reply, set no TX offload/metadata flag.
-5. Send on the actual parent TX queue; free only on enqueue failure.
+2. Learn the requesting VM source MAC in the normal VS FDB.
+3. Bind the RIF source MAC to that VS in `ESW_SF_RETURN`.
+4. Build a padded 60-byte Ethernet ARP reply.
+5. Send the complete frame through an `AF_PACKET/SOCK_RAW` socket bound to the
+   actual Arm SF endpoint (`ESWITCH_SF_IFACE`, default `enp3s0f0s0`).
 
-Hardware path (all BASIC pipes in EGRESS):
+Hardware path (DEFAULT domain):
 ```text
-TX_A_EGRESS_ROOT: match all + entry counter
-  -> TX_A_ARP_PROBE: EtherType ARP + source/destination MAC + counter -> VF
-       miss -> TX_A_DROP: match all + entry counter -> DROP
+actual Arm SF -> system-SF representor
+  -> ESW_INGRESS_CLASSIFIER: SF port -> ESW_SF_RETURN
+     -> known RIF source MAC: set pkt_meta=(VS << 16) | SF_port
+        -> ESW_DEST_FDB: (VS, VM destination MAC)
+           -> ESW_EGRESS_GATE_<VF> -> VF -> VM
+     -> unknown RIF source MAC: DROP
 ```
 
-DROP and probe pipes are created before the root. The probe starts empty.
-Its one tuple is locked after successful programming until daemon restart.
-A changed gateway MAC or moved VM therefore requires restarting this test
-daemon; do not modify topology during a measurement. Software validates
-current ownership/address on every reply, including after address removal.
-Other pairs never generate TX; unmatched EGRESS traffic is dropped. Do not
-connect the existing DEFAULT L2 path to this diagnostic EGRESS root.
+The SF root entry and SF-return miss both fail closed. The SF cannot be attached
+as a tenant port. A RIF-to-VS binding is installed on the first reply and reused.
+Changing an already-used RIF MAC currently requires a daemon restart so the old
+hardware binding is removed; configure RIF MACs before traffic during this
+milestone.
 
 Launch in doca-dev with the production PF owner stopped:
 ```sh
 export ESWITCH_CONTROL_SOCKET=/run/eswitch-router-test/control.sock
 export ESWITCH_STATE_FILE=/var/lib/eswitch-router-test/eswitch.conf
-export ESWITCH_TX_PROBE_VS=100
-export ESWITCH_TX_PROBE_VM_MAC=7e:83:a5:77:11:06
+export ESWITCH_SF_IFACE=enp3s0f0s0
+ip link set dev "$ESWITCH_SF_IFACE" up
 ./eswitch-management -l 0 -- 03:00.0
 ```
-Use canonical decimal VS and lowercase colon-separated MAC. Unset/malformed
-selectors disable replies (fail closed). Keep the established VF scope; the
-selectors never change the set of probed VFs.
+The process needs `CAP_NET_RAW` (or root). In a container use host networking so
+the actual SF netdev is visible. Keep the established VF scope; it never changes
+which system SF is selected.
 
 VM: `sudo arping -I ens6 -c 5 192.168.0.1`, alongside
-`sudo tcpdump -eni ens6 -nn arp`. Capture a baseline and another
-`eswitchctl status` after waiting at least two seconds for counter sampling.
+`sudo tcpdump -eni ens6 -nn arp`. Acceptance: the VM receives a reply whose
+source MAC is the configured RIF MAC; `status` increments `arp_sf_tx_sent` and
+shows at least one `sf_return_contexts`. Then verify ordinary L2 forwarding,
+reject unknown SF source MACs, remove the gateway IP and verify replies stop.
+ICMP replies and IPv4 forwarding remain outside this milestone. A successful
+`sendto()` is not delivery proof; the VM capture is authoritative.
 
-- `egress_enter`: packet reached the root, independent of metadata/header.
-- `arp_probe_hit`: exact Ethernet tuple selected the VF.
-- `tx_probe_drop`: packet missed the probe.
-- `unavailable` is not zero; probe is unarmed until the first selected request.
-- Flow entry counters are sampled by maintenance once per aging interval.
-  `status` and `tx-debug` read that cache; neither performs Flow miss queries
-  or steering dumps. Parent ethdev stats remain read-only on demand.
-- Entry-query behavior still needs hardware validation. Removing miss-query
-  avoids the newly suspected call but does not prove the earlier crash cause.
-- Packet logs are sampled; enqueue and parent statistics are not delivery proof.
-
-Acceptance: selected VM gets the RIF MAC in an ARP reply; root and probe
-counters increase, drop stays flat in an otherwise quiet test. Then verify
-ordinary known-unicast and broadcast between the two L2 test VMs, reject other
-VS/VM pairs, remove gateway IP and verify replies stop. ICMP replies and router
-IPv4 forwarding remain outside this milestone.
-
-If root stays flat despite parent TX increases, inspect software-TX/root
-binding rather than metadata. If root increases and drop increases, inspect
-Ethernet matching. If probe increases without guest capture, investigate the
-VF/host/VM path. Hardware counters may include other traffic: compare deltas.
+For the `VM ping gateway` use case, this milestone completes only the first
+phase: ARP resolution of the gateway IP. `ping` should populate the VM neighbor
+entry with the RIF MAC, but it will not receive an ICMP echo reply until the
+local-ICMP VR pipe and Arm handler are implemented in the next milestone.
 
 ## Layout
 
@@ -154,7 +142,7 @@ families in `doca-samples/samples/doca_flow/`:
 - `applications/psp_gateway` in the sample bundle: Arm ARP and reinjection.
 
 Required work: reserved L3 gateway dispatch, typed Arm RSS reasons, public ARP,
-RIF-scoped neighbors, LPM/adjacency programming, trusted control TX, CT/NAT
+RIF-scoped neighbors, LPM/adjacency programming, ICMP local delivery, CT/NAT
 initialization and per-VR zones, route invalidation, first-packet handling,
 checksum/TTL/MTU exception paths, and durable config/hardware rollback.
 Do not treat this private-ARP milestone as the completed router implementation.

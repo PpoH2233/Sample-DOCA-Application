@@ -112,8 +112,10 @@ Example:
 OK
 service=eSwitch Management state=running uptime=120s
 config=/var/lib/eswitch-management/eswitch.conf
-ports=7 assigned=3 available=4 vswitches=1 fdb=2
+ports=8 assignable=7 assigned=3 available=4 vswitches=1 fdb=2
 ```
+
+`ports` includes the reserved system SF; `assignable` excludes it.
 
 ### `vs-create --id <id>`
 
@@ -223,9 +225,10 @@ DPDK port 0 (uplink/parent)
 DPDK port 1 (host=1 pf=0 vf=0)
 ```
 
-The Arm-side representor does not provide the x86 host's Linux interface name.
-The stable `host/pf/vf` identity identifies which host VF the DPDK port
-represents.
+The reserved system-SF representor is intentionally omitted from this output
+and cannot be attached to a VS or VR. For external-host VFs, the Arm-side
+representor does not provide the x86 host's Linux interface name. The stable
+`host/pf/vf` identity identifies which host VF the DPDK port represents.
 
 ## Backward compatibility
 
@@ -263,7 +266,8 @@ eswitchctl vs-port-detach --port 1 --id 100
 # Router command group
 
 See [router/README.md](router/README.md) for `eswitchctl vr` commands.
-These stage configuration; router forwarding is not implemented yet.
+These stage configuration. Private gateway ARP is implemented through the Arm
+system SF; local ICMP and IPv4 forwarding are not implemented yet.
 Existing L2 commands below retain their syntax. A port reserved by a VR cannot
 be attached to a vSwitch, and a router-linked vSwitch cannot be deleted until
 its logical interface is detached.

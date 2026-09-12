@@ -11,7 +11,6 @@
 
 #include <rte_byteorder.h>
 #include <rte_ethdev.h>
-#include <rte_errno.h>
 #include <rte_flow.h>
 #include <rte_mbuf.h>
 #include <rte_version.h>
@@ -21,7 +20,6 @@
 #include "router/router_control.h"
 #include "router/router_arp.h"
 #include "l2/l2_switch.h"
-#include "pipeline/tx_plan_a.h"
 #include "pipeline/tx_build.h"
 
 static uint64_t monotonic_ns(void) {
@@ -262,13 +260,16 @@ static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
 doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct switch_flow_ports *ports,
                                   struct eswitch_pipeline *pipeline,
+                                  struct sf_packet_io *sf_io,
                                   const char *state_path,
                                   struct eswitch_manager *manager) {
   doca_error_t result;
 
-  if (io == NULL || ports == NULL || pipeline == NULL || state_path == NULL ||
+  if (io == NULL || ports == NULL || pipeline == NULL || sf_io == NULL ||
+      state_path == NULL ||
       *state_path == '\0' || manager == NULL ||
-      !io->port_started || !ports->started || !pipeline->created)
+      !io->port_started || !ports->started || !pipeline->created ||
+      !sf_io->started)
     return DOCA_ERROR_INVALID_VALUE;
   if (!rte_flow_dynf_metadata_avail())
     return DOCA_ERROR_NOT_SUPPORTED;
@@ -278,6 +279,7 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   manager->io = io;
   manager->ports = ports;
   manager->pipeline = pipeline;
+  manager->sf_io = sf_io;
   if (snprintf(manager->state_path, sizeof(manager->state_path), "%s",
                state_path) >= (int)sizeof(manager->state_path)) {
     free(manager->port_owner);
@@ -325,25 +327,11 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_built++;
-  /* Plan A is explicitly scoped to one test VS/VM, never first-packet wins. */
-  char vs_text[6], vm_text[18];
-  snprintf(vs_text, sizeof(vs_text), "%u", vs);
-  snprintf(vm_text, sizeof(vm_text), "%02x:%02x:%02x:%02x:%02x:%02x",
-           response[0], response[1], response[2], response[3], response[4], response[5]);
-  const char *selected_vs = getenv("ESWITCH_TX_PROBE_VS");
-  const char *selected_vm = getenv("ESWITCH_TX_PROBE_VM_MAC");
-  if (!tx_plan_a_selected(selected_vs, selected_vm, vs, response)) {
-    manager->arp_target_drops++;
-    manager->arp_tx_drops++;
-    if (debug) printf("TX PLAN A SKIP: select ESWITCH_TX_PROBE_VS=%s "
-                      "ESWITCH_TX_PROBE_VM_MAC=%s to test this tuple\n", vs_text, vm_text);
-    return;
-  }
   int index = find_port_index(manager, ingress);
   if (index < 0 || ingress == UINT16_MAX ||
       manager->port_owner[index] != vs ||
       manager->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR ||
-      !manager->io->port_started) {
+      manager->sf_io == NULL || !manager->sf_io->started) {
     manager->arp_target_drops++;
     manager->arp_tx_drops++;
     if (debug)
@@ -361,53 +349,35 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_window_replies++;
-  doca_error_t arm_result = eswitch_pipeline_tx_probe_arm(
-      manager->pipeline, ingress, response + 6, response);
+  doca_error_t arm_result = eswitch_pipeline_sf_bind_vswitch(
+      manager->pipeline, vs, response + 6);
   if (arm_result != DOCA_SUCCESS) {
     manager->arp_target_drops++; manager->arp_tx_drops++;
-    if (debug) printf("TX PLAN A ARM FAILED: port=%u error=%s\n",
+    if (debug) printf("SF RETURN BIND FAILED: port=%u error=%s\n",
                       ingress, doca_error_get_descr(arm_result));
     return;
   }
-  struct rte_mbuf *reply = rte_pktmbuf_alloc(manager->io->mbuf_pool);
-  if (!reply) {
-    manager->arp_tx_drops++; manager->arp_alloc_drops++;
-    if (debug) printf("ARP TX DROP: stage=mbuf-alloc errno=%d\n", rte_errno);
-    return;
-  }
-  void *data = rte_pktmbuf_append(reply, sizeof(response));
-  if (!data) {
-    if (debug) printf("ARP TX DROP: stage=append need=%zu tailroom=%u\n",
-                       sizeof(response), rte_pktmbuf_tailroom(reply));
-    rte_pktmbuf_free(reply); manager->arp_tx_drops++; manager->arp_append_drops++;
-    return;
-  }
-  memcpy(data, response, sizeof(response));
-  /* Plan A deliberately sends NO TX metadata. Only Ethernet fields select VF. */
-  reply->ol_flags = 0;
   if (debug) {
     const struct ethernet_port *target = manager->ports->items[index].ethernet;
-    printf("ARP TX BUILD: vs=%u parent=%u queue=%u target=%u host=%u pf=%u vf=%u "
-           "len=%u data_len=%u nb_segs=%u metadata=disabled flags=0x%016" PRIx64 "\n",
-           vs, manager->io->parent_port_id, SWITCH_TX_QUEUE_ID, ingress,
-           target->host_index, target->pf_index, target->vf_index,
-           reply->pkt_len, reply->data_len, reply->nb_segs,
-           reply->ol_flags);
+    printf("ARP SF TX BUILD: vs=%u iface=%s sf-port=%u target=%u "
+           "host=%u pf=%u vf=%u len=%zu\n",
+           vs, manager->sf_io->interface_name, manager->pipeline->sf_port_id,
+           ingress, target->host_index, target->pf_index, target->vf_index,
+           sizeof(response));
     printf("ARP TX FRAME:");
     for (size_t i = 0; i < sizeof(response); i++) printf(" %02x", response[i]);
     printf("\n");
   }
-  if (rte_eth_tx_burst(manager->io->parent_port_id, SWITCH_TX_QUEUE_ID,
-                       &reply, 1) == 1) {
+  if (sf_packet_io_send(manager->sf_io, response, sizeof(response)) ==
+      DOCA_SUCCESS) {
     manager->arp_replies++;
-    if (debug) printf("ARP TX ENQUEUED: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
+    if (debug) printf("ARP SF TX SENT: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
            response[28], response[29], response[30], response[31]);
   } else {
     manager->arp_tx_drops++;
-    manager->arp_enqueue_drops++;
-    if (debug) printf("ARP TX DROP: stage=enqueue parent=%u queue=%u accepted=0\n",
-                       manager->io->parent_port_id, SWITCH_TX_QUEUE_ID);
-    rte_pktmbuf_free(reply); /* Only free when ownership was not transferred. */
+    manager->arp_sf_send_drops++;
+    if (debug) printf("ARP TX DROP: stage=sf-send iface=%s\n",
+                      manager->sf_io->interface_name);
   }
 }
 
@@ -446,9 +416,6 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
         memcmp(header->src_addr.addr_bytes, rif->mac, 6) == 0)
       return DOCA_SUCCESS;
   }
-  if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP))
-    reply_gateway_arp(manager, packet, vswitch_id, port_id, now_ns);
-
   printf("ARM RX: vs=%u port=%u len=%u src=%02x:%02x:%02x:%02x:%02x:%02x "
          "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
          vswitch_id, port_id, rte_pktmbuf_pkt_len(packet),
@@ -461,7 +428,13 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
 
   result = eswitch_fdb_learn(&manager->fdb, vswitch_id, 0,
                              &header->src_addr, port_id, now_ns);
-  return result;
+  if (result != DOCA_SUCCESS)
+    return result;
+  /* The SF reply rejoins at ESW_DEST_FDB, so commit the requesting VM's
+   * destination rule before transmitting the reply. */
+  if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP))
+    reply_gateway_arp(manager, packet, vswitch_id, port_id, now_ns);
+  return DOCA_SUCCESS;
 }
 
 doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
@@ -495,31 +468,11 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   if (manager == NULL || !manager->initialized)
     return DOCA_ERROR_INVALID_VALUE;
   now_ns = monotonic_ns();
-  /* Delayed snapshots, not synchronous HW reads per packet. Include one
-   * snapshot after traffic stops; keep normal idle operation quiet. */
-  if (now_ns >= manager->next_aging_ns) {
-    const struct eswitch_rule *rules[] = {&manager->pipeline->tx_root_rule,
-        &manager->pipeline->tx_probe_rule, &manager->pipeline->control_tx_drop};
-    for (unsigned i = 0; i < 3; i++) {
-      struct doca_flow_resource_query q = {0};
-      manager->tx_hw_valid[i] = false;
-      if (!rules[i]->entry) {
-        manager->tx_hw_errors[i] = DOCA_ERROR_NOT_FOUND;
-        continue;
-      }
-      manager->tx_hw_errors[i] = doca_flow_resource_query_entry(rules[i]->entry, &q);
-      if (manager->tx_hw_errors[i] == DOCA_SUCCESS) {
-        manager->tx_hw_valid[i] = true;
-        manager->tx_hw_packets[i] = q.counter.total_pkts;
-      }
-    }
-    manager->tx_hw_sample_ns = now_ns;
-  }
   if (manager->arp_seen != manager->tx_snapshot_seen &&
       now_ns - manager->tx_snapshot_ns >= 5000000000ULL) {
     char diagnostic[8192];
     format_status(manager, diagnostic, sizeof(diagnostic));
-    printf("TX DEBUG SNAPSHOT (cumulative; enqueue/rule hits are not guest receipt):\n%s",
+    printf("SF TX DEBUG SNAPSHOT (cumulative; send success is not guest receipt):\n%s",
            diagnostic);
     manager->tx_snapshot_seen = manager->arp_seen;
     manager->tx_snapshot_ns = now_ns;
@@ -590,13 +543,22 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t used = 0;
   size_t switch_count = 0;
   size_t assigned_count = 0;
+  size_t assignable_port_count = 0;
+  size_t sf_return_count = 0;
   uint64_t uptime = (monotonic_ns() - manager->started_ns) / 1000000000ULL;
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
     switch_count += manager->switches[i].exists ? 1U : 0U;
-  for (uint16_t i = 0; i < manager->ports->count; i++)
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    const struct ethernet_port *port = manager->ports->items[i].ethernet;
+    if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+      continue;
+    assignable_port_count++;
     assigned_count += (manager->port_owner[i] != 0 ||
                        router_control_port_reserved(manager, i)) ? 1U : 0U;
+  }
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
+    sf_return_count += manager->pipeline->sf_return_contexts[i].active ? 1U : 0U;
   used = append_text(response, size, used, "OK\n");
   used = append_text(response, size, used,
                      "service=eSwitch Management state=running uptime=%" PRIu64
@@ -605,50 +567,31 @@ static size_t format_status(const struct eswitch_manager *manager,
   used = append_text(response, size, used, "config=%s\n",
                      manager->state_path);
   used = append_text(response, size, used,
-      "tx_revision=%s tx_mode=%s\n", ESWITCH_TX_REVISION, ESWITCH_TX_FLOW_MODE);
+      "tx_revision=%s tx_mode=%s sf_iface=%s sf_port=%u\n",
+      ESWITCH_TX_REVISION, ESWITCH_TX_FLOW_MODE,
+      manager->sf_io->interface_name, manager->pipeline->sf_port_id);
   used = append_text(response, size, used,
-                     "ports=%u assigned=%zu available=%zu vswitches=%zu "
-                     "fdb=%zu\n",
-                     manager->ports->count, assigned_count,
-                     manager->ports->count - assigned_count, switch_count,
+                     "ports=%u assignable=%zu assigned=%zu available=%zu "
+                     "vswitches=%zu fdb=%zu\n",
+                     manager->ports->count, assignable_port_count,
+                     assigned_count, assignable_port_count - assigned_count,
+                     switch_count,
                      manager->fdb.count);
   used = append_text(response, size, used,
-                     "routers=%zu router_dataplane=NOT_IMPLEMENTED\n",
+                     "routers=%zu router_dataplane=GATEWAY_ARP_ONLY\n",
                      manager->router ? manager->router->vr_count : 0);
   used = append_text(response, size, used,
-      "private_gateway_arp=enabled arp_tx_enqueued=%" PRIu64
+      "private_gateway_arp=enabled arp_sf_tx_sent=%" PRIu64
       " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",
       manager->arp_replies, manager->arp_tx_drops, manager->arp_rate_drops);
   used = append_text(response, size, used,
       "arp_seen=%" PRIu64 " arp_ignored=%" PRIu64 " arp_built=%" PRIu64
-      " target_drops=%" PRIu64 " alloc_drops=%" PRIu64 " append_drops=%" PRIu64
-      " enqueue_drops=%" PRIu64 "\n",
+      " target_drops=%" PRIu64 " sf_send_drops=%" PRIu64 "\n",
       manager->arp_seen, manager->arp_ignored, manager->arp_built,
-      manager->arp_target_drops, manager->arp_alloc_drops, manager->arp_append_drops,
-      manager->arp_enqueue_drops);
-  struct rte_eth_stats stats = {0};
-  int stats_result = rte_eth_stats_get(manager->io->parent_port_id, &stats);
-  if (stats_result == 0)
-    used = append_text(response, size, used,
-        "parent_tx port=%u opackets=%" PRIu64 " obytes=%" PRIu64
-        " oerrors=%" PRIu64 " (ethdev-counters-not-delivery-proof)\n",
-        manager->io->parent_port_id, stats.opackets, stats.obytes, stats.oerrors);
-  else
-    used = append_text(response, size, used, "parent_tx port=%u stats_error=%d\n",
-                        manager->io->parent_port_id, stats_result);
-  const char *names[] = {"egress_enter", "arp_probe_hit", "tx_probe_drop"};
-  for (unsigned i = 0; i < 3; i++) {
-    if (manager->tx_hw_valid[i])
-      used = append_text(response, size, used, "%s hw_packets=%" PRIu64 "\n",
-                          names[i], manager->tx_hw_packets[i]);
-    else
-      used = append_text(response, size, used, "%s unavailable error=%d\n",
-                          names[i], (int)manager->tx_hw_errors[i]);
-  }
+      manager->arp_target_drops, manager->arp_sf_send_drops);
   used = append_text(response, size, used,
-      "tx_plan=A metadata=disabled probe=%s sample_age_ms=%" PRIu64 "\n",
-      manager->pipeline->tx_probe_rule.entry ? "armed" : "unarmed",
-      manager->tx_hw_sample_ns ? (monotonic_ns() - manager->tx_hw_sample_ns) / UINT64_C(1000000) : 0);
+      "sf_return_contexts=%zu source_identity=rif-mac destination=vs-fdb\n",
+      sf_return_count);
   return used;
 }
 
@@ -685,6 +628,8 @@ static size_t format_available_ports(const struct eswitch_manager *manager,
 
   for (uint16_t i = 0; i < manager->ports->count; i++) {
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
+    if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
+      continue;
     if (manager->port_owner[i] != 0 || router_control_port_reserved(manager, i))
       continue;
     if (port->role == ETHERNET_PORT_ROLE_PARENT) {

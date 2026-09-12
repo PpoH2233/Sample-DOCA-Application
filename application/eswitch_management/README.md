@@ -13,9 +13,11 @@ Existing build directories retain their Meson option: use `meson configure
 `ESWITCH_VF_SCOPE` still overrides the compiled default.
 
 `eswitch-management` is the single owner of the BlueField eSwitch, DOCA Flow
-runtime, parent device and all VF representors. `eswitchctl` sends local control
-commands over `/run/eswitch-management/control.sock`; it never initializes
-DPDK or DOCA itself.
+runtime, parent device, selected VF representors and one Arm system-SF
+representor. The SF is reserved infrastructure: it is never shown as an
+available tenant port and cannot be attached to a VS or VR. `eswitchctl` sends
+local control commands over `/run/eswitch-management/control.sock`; it never
+initializes DPDK or DOCA itself.
 
 At startup every discovered DPDK port is **unassigned**. The root pipe has a
 DROP miss action, so an unassigned VF or uplink cannot exchange traffic through
@@ -38,6 +40,24 @@ endpoint
 root miss -> DROP
 ```
 
+Gateway packets created on Arm take a separate ingress leg and then join the
+same VS destination path:
+
+```text
+raw Ethernet frame on actual SF (default enp3s0f0s0)
+   -> system-SF representor root entry
+      -> RIF source-MAC classifier: restore VS in pkt_meta
+         -> destination FDB -> target VF egress gate -> VM
+unknown SF source MAC -> DROP
+```
+
+The daemon learns the requesting VM MAC before transmitting its ARP reply, so
+the reply normally takes a known-unicast FDB entry. This removes the unsupported
+parent-PF software-TX shortcut: a successful raw-socket send only proves that
+the packet entered the SF endpoint; guest capture remains the delivery proof.
+Treat this SF as a dedicated application endpoint while the daemon owns the
+eSwitch; ordinary host networking on the same SF is outside this design.
+
 The Arm copy learns `(vswitch_id, untagged VLAN 0, source MAC)`. Membership
 changes update only one HASH member entry and one root classifier entry. A
 learned destination uses one hardware rule keyed by `(vswitch_id, dst_mac)`;
@@ -58,6 +78,8 @@ For `P` probed ports, `M` attached memberships, `V` non-empty vSwitches and
 
 ```text
 root classifier entries       M
+system-SF root entries         1
+SF RIF-context entries         <= configured private RIFs used for TX
 shared egress-gate pipes       <= P       (2 control entries per used port)
 vSwitch flooding HASH pipes   V
 flood member entries          M
@@ -149,12 +171,14 @@ sudo docker build \
 `VF_SCOPE` limits which VF representors are opened and passed to
 `doca_dpdk_port_probe_with_representors()`. It accepts `all`, one index such as
 `4`, or comma-separated indexes/ranges such as `0-6,10-20`. The parent DPDK
-port is always probed. The image stores this as its default scope; a deployment
-may override it without rebuilding:
+port and exactly one Arm system SF representor are always probed. Startup fails
+closed when no SF or more than one SF is discovered. The image stores this as
+its default scope; a deployment may override it without rebuilding:
 
 ```bash
 sudo docker run ... \
   --env ESWITCH_VF_SCOPE='10-20' \
+  --env ESWITCH_SF_IFACE='enp3s0f0s0' \
   eswitch-management:3.4.0 -l 0 -- 03:00.0
 ```
 
@@ -177,6 +201,7 @@ interactive shell:
 ```bash
 sudo install -d -m 0755 /run/eswitch-management
 sudo install -d -m 0750 /var/lib/eswitch-management
+sudo ip link set dev enp3s0f0s0 up
 
 sudo docker run -d \
   --name eswitch-management \
@@ -190,6 +215,11 @@ sudo docker run -d \
   eswitch-management:3.4.0 \
   -l 0 -- 03:00.0
 ```
+
+`--network host` exposes the actual Arm SF netdev inside the container and
+`--privileged` supplies the raw-packet capability required by `AF_PACKET`.
+Override `ESWITCH_SF_IFACE` when the actual SF netdev name is not
+`enp3s0f0s0`. Bring that interface UP before starting the daemon.
 
 The `/run/eswitch-management` bind mount publishes only the Unix control
 socket. The `/var/lib/eswitch-management` bind mount preserves `eswitch.conf`
@@ -217,6 +247,7 @@ executes the existing DOCA Flow, DPDK port and device cleanup path.
 
 ```bash
 sudo install -d -m 0750 /var/lib/eswitch-management
+sudo ip link set dev enp3s0f0s0 up
 sudo /tmp/eswitch-management-build/eswitch-management -l 0 -- 03:00.0
 ```
 

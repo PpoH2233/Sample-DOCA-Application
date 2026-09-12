@@ -85,7 +85,9 @@ doca_error_t ethernet_port_print_info(const struct ethernet_port *port) {
 
   printf("Role: %s\n", port->role == ETHERNET_PORT_ROLE_PARENT
                             ? "parent"
-                            : "VF representor");
+                            : port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR
+                                  ? "system SF representor"
+                                  : "VF representor");
   printf("DPDK port ID: %u\n", port->port_id);
   printf("Driver: %s\n",
          device_info.driver_name == NULL ? "unknown" : device_info.driver_name);
@@ -111,13 +113,14 @@ doca_error_t ethernet_port_print_info(const struct ethernet_port *port) {
   else
     printf("Current MTU: unavailable\n");
 
-  if (port->role == ETHERNET_PORT_ROLE_REPRESENTOR) {
+  if (port->role != ETHERNET_PORT_ROLE_PARENT) {
     char vuid[DOCA_DEVINFO_VUID_SIZE] = {0};
     struct doca_devinfo_rep *rep_info =
         doca_dev_rep_as_devinfo(port->representor);
 
-    printf("VF topology: host=%u pf=%u vf=%u\n", port->host_index,
-           port->pf_index, port->vf_index);
+    if (port->role == ETHERNET_PORT_ROLE_REPRESENTOR)
+      printf("VF topology: host=%u pf=%u vf=%u\n", port->host_index,
+             port->pf_index, port->vf_index);
 
     if (rep_info != NULL &&
         doca_devinfo_rep_get_vuid(rep_info, vuid, sizeof(vuid)) ==
