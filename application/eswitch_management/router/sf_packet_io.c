@@ -5,6 +5,7 @@
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -102,6 +103,32 @@ doca_error_t sf_packet_io_send(struct sf_packet_io *io,
     return DOCA_ERROR_DRIVER;
   }
   return DOCA_SUCCESS;
+}
+
+doca_error_t sf_packet_io_send_context(struct sf_packet_io *io,
+                                       const uint8_t *frame, size_t length,
+                                       uint16_t context_tag) {
+  uint8_t *tagged;
+  doca_error_t result;
+
+  if (io == NULL || !io->started || frame == NULL || length < ETH_HLEN ||
+      context_tag == 0 || context_tag > 4094 || length > SIZE_MAX - 4)
+    return DOCA_ERROR_INVALID_VALUE;
+  tagged = malloc(length + 4);
+  if (tagged == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+
+  memcpy(tagged, frame, ETH_ALEN); /* Original VM destination. */
+  memcpy(tagged + ETH_ALEN, io->mac, ETH_ALEN); /* SF-enforced source. */
+  tagged[12] = 0x81;
+  tagged[13] = 0x00;
+  tagged[14] = (uint8_t)(context_tag >> 8);
+  tagged[15] = (uint8_t)context_tag;
+  memcpy(tagged + 16, frame + 12, length - 12);
+
+  result = sf_packet_io_send(io, tagged, length + 4);
+  free(tagged);
+  return result;
 }
 
 void sf_packet_io_stop(struct sf_packet_io *io) {

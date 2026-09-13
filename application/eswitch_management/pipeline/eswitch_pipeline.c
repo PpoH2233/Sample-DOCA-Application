@@ -451,9 +451,9 @@ static doca_error_t create_ingress_classifier(
                                                : DOCA_SUCCESS;
 }
 
-/* Packets created by Arm enter the eSwitch through the actual SF endpoint.
- * Their RIF source MAC restores the vSwitch context; destination forwarding
- * then reuses the normal VS FDB/flood path. Unknown RIF sources fail closed. */
+/* Packets created by Arm enter through the actual SF MAC with an internal VLAN
+ * context. Hardware removes that private tag, restores the virtual RIF source
+ * MAC and reuses the normal VS FDB/flood path. Unknown tags fail closed. */
 static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
@@ -466,10 +466,10 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
-  /* Explicit matching requires both an all-ones pipe value and a non-zero
-   * mask to defer the source MAC value to each context entry. */
-  memset(match.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
-  memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  match.outer.eth_vlan[0].tci = UINT16_MAX;
+  mask.outer.eth_vlan[0].tci = UINT16_MAX;
+  actions.pop_vlan = true;
+  memset(actions.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   actions.meta.pkt_meta = UINT32_MAX;
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
@@ -492,7 +492,7 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
 
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint8_t rif_mac[6]) {
+    const uint8_t rif_mac[6], uint16_t *context_tag) {
   struct eswitch_sf_return_context *free_context = NULL;
   struct doca_flow_match return_match = {0};
   struct doca_flow_match local_match = {0};
@@ -500,7 +500,7 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created || vswitch_id == 0 ||
-      rif_mac == NULL || (rif_mac[0] & 1U) != 0)
+      rif_mac == NULL || context_tag == NULL || (rif_mac[0] & 1U) != 0)
     return DOCA_ERROR_INVALID_VALUE;
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     struct eswitch_sf_return_context *context =
@@ -510,17 +510,19 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
         free_context = context;
       continue;
     }
-    if (context->vswitch_id == vswitch_id)
-      return memcmp(context->rif_mac, rif_mac, 6) == 0
-                 ? DOCA_SUCCESS
-                 : DOCA_ERROR_BAD_STATE;
-    if (memcmp(context->rif_mac, rif_mac, 6) == 0)
-      return DOCA_ERROR_ALREADY_EXIST;
+    if (context->vswitch_id == vswitch_id) {
+      if (memcmp(context->rif_mac, rif_mac, 6) != 0)
+        return DOCA_ERROR_BAD_STATE;
+      *context_tag = context->context_tag;
+      return DOCA_SUCCESS;
+    }
   }
   if (free_context == NULL)
     return DOCA_ERROR_NO_MEMORY;
 
-  memcpy(return_match.outer.eth.src_mac, rif_mac, 6);
+  *context_tag = (uint16_t)(free_context - pipeline->sf_return_contexts) + 1;
+  return_match.outer.eth_vlan[0].tci = DOCA_HTOBE16(*context_tag);
+  memcpy(actions.outer.eth.src_mac, rif_mac, 6);
   actions.meta.pkt_meta = DOCA_HTOBE32(
       eswitch_metadata_encode(vswitch_id, pipeline->sf_port_id));
   flow_entry_cookie_prepare(&free_context->return_rule.cookie,
@@ -562,11 +564,13 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
   }
 
   free_context->vswitch_id = vswitch_id;
+  free_context->context_tag = *context_tag;
   memcpy(free_context->rif_mac, rif_mac, 6);
   free_context->active = true;
-  printf("SF RETURN BIND: vs=%u rif="
+  printf("SF RETURN BIND: vs=%u context-vlan=%u rif="
          "%02x:%02x:%02x:%02x:%02x:%02x sf-port=%u\n",
-         vswitch_id, rif_mac[0], rif_mac[1], rif_mac[2], rif_mac[3],
+         vswitch_id, *context_tag,
+         rif_mac[0], rif_mac[1], rif_mac[2], rif_mac[3],
          rif_mac[4], rif_mac[5], pipeline->sf_port_id);
   return DOCA_SUCCESS;
 }

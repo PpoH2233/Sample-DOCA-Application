@@ -42,6 +42,7 @@ struct eswitch_flood_group {
 
 struct eswitch_sf_return_context {
   uint16_t vswitch_id;
+  uint16_t context_tag;
   uint8_t rif_mac[6];
   struct eswitch_rule return_rule;
   struct eswitch_rule local_ip_rule;
@@ -90,11 +91,10 @@ uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
 void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
                             uint16_t *port_id);
 
-/* Authorize one RIF source MAC arriving from the system SF and restore its
- * vSwitch context before feeding the existing destination FDB. */
+/* Bind an internal SF VLAN tag to one VS and virtual RIF source identity. */
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint8_t rif_mac[6]);
+    const uint8_t rif_mac[6], uint16_t *context_tag);
 
 /* Remove a previously installed SF return context. This is idempotent. */
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(

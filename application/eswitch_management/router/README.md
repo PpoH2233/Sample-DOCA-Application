@@ -17,26 +17,29 @@ are unchanged. The return path is multi-VS capable and fail-closed.
 Software path:
 1. Validate gateway request and current VS ownership.
 2. Learn the requesting VM source MAC in the normal VS FDB.
-3. Bind the RIF source MAC to that VS in `ESW_SF_RETURN`.
+3. Bind a private context VLAN to that VS and its virtual RIF MAC in
+   `ESW_SF_RETURN`.
 4. Build a padded 60-byte Ethernet ARP reply.
-5. Send the complete frame through an `AF_PACKET/SOCK_RAW` socket bound to the
-   actual Arm SF endpoint (`ESWITCH_SF_IFACE`, default `enp3s0f0s0`).
+5. Replace the wire source with the actual SF MAC, insert the private context
+   VLAN, and send through an `AF_PACKET/SOCK_RAW` socket bound to the actual
+   Arm SF endpoint (`ESWITCH_SF_IFACE`, default `enp3s0f0s0`).
 
 Hardware path (DEFAULT domain):
 ```text
 actual Arm SF -> system-SF representor
   -> ESW_INGRESS_CLASSIFIER: SF port -> ESW_SF_RETURN
-     -> known RIF source MAC: set pkt_meta=(VS << 16) | SF_port
+     -> known context VLAN: pop VLAN, rewrite source to virtual RIF MAC,
+        set pkt_meta=(VS << 16) | SF_port
         -> ESW_DEST_FDB: (VS, VM destination MAC)
            -> ESW_EGRESS_GATE_<VF> -> VF -> VM
-     -> unknown RIF source MAC: DROP
+     -> unknown context VLAN: DROP
 ```
 
-The SF root entry and SF-return miss both fail closed. The SF cannot be attached
-as a tenant port. A RIF-to-VS binding is installed on the first reply and reused.
-Changing an already-used RIF MAC currently requires a daemon restart so the old
-hardware binding is removed; configure RIF MACs before traffic during this
-milestone.
+The private VLAN never leaves the SF return pipe. The SF root entry and
+SF-return miss both fail closed, and the SF cannot be attached as a tenant
+port. A tag/RIF-to-VS binding is installed on the first reply and reused. When
+the configured RIF MAC changes, the next gateway ARP packet removes the old
+return/local-IP entries and binds the new RIF MAC without a daemon restart.
 
 Launch in doca-dev with the production PF owner stopped:
 ```sh

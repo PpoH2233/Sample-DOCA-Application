@@ -25,6 +25,12 @@ doca_error_t sf_packet_io_start(const char *interface_name,
 doca_error_t sf_packet_io_send(struct sf_packet_io *io,
                                const uint8_t *frame, size_t length);
 
+/* Transmit through the actual SF identity while carrying an internal VLAN
+ * context. The eSwitch return pipe removes the tag and restores the RIF MAC. */
+doca_error_t sf_packet_io_send_context(struct sf_packet_io *io,
+                                       const uint8_t *frame, size_t length,
+                                       uint16_t context_tag);
+
 void sf_packet_io_stop(struct sf_packet_io *io);
 
 #endif /* ESWITCH_SF_PACKET_IO_H */

@@ -65,6 +65,29 @@ static int find_port_index(const struct eswitch_manager *manager,
   return -1;
 }
 
+/* Keep the hardware return context synchronized with the desired RIF MAC.
+ * A MAC edit is persisted by router_control first; the next gateway packet
+ * performs an idempotent bind or replaces the previous entry for this VS. */
+static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
+                                           uint16_t vswitch_id,
+                                           const uint8_t rif_mac[6],
+                                           uint16_t *context_tag) {
+  doca_error_t result = eswitch_pipeline_sf_bind_vswitch(
+      manager->pipeline, vswitch_id, rif_mac, context_tag);
+
+  if (result != DOCA_ERROR_BAD_STATE)
+    return result;
+  result = eswitch_pipeline_sf_unbind_vswitch(manager->pipeline, vswitch_id);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = eswitch_pipeline_sf_bind_vswitch(
+      manager->pipeline, vswitch_id, rif_mac, context_tag);
+  if (result == DOCA_SUCCESS)
+    printf("SF RETURN REBIND: vs=%u context-vlan=%u\n", vswitch_id,
+           *context_tag);
+  return result;
+}
+
 
 static doca_error_t manager_to_state(const struct eswitch_manager *manager,
                                      struct eswitch_state *state) {
@@ -311,6 +334,7 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
                               struct rte_mbuf *request, uint16_t vs,
                               uint16_t ingress, uint64_t now_ns) {
   uint8_t scratch[42], response[60];
+  uint16_t context_tag = 0;
   bool debug = manager->arp_seen < 3 || now_ns - manager->tx_log_ns >= 1000000000ULL;
   if (manager->arp_seen == manager->tx_snapshot_seen)
     manager->tx_snapshot_ns = now_ns;
@@ -350,8 +374,8 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_window_replies++;
-  doca_error_t arm_result = eswitch_pipeline_sf_bind_vswitch(
-      manager->pipeline, vs, response + 6);
+  doca_error_t arm_result = bind_sf_return_context(
+      manager, vs, response + 6, &context_tag);
   if (arm_result != DOCA_SUCCESS) {
     manager->arp_target_drops++; manager->arp_tx_drops++;
     if (debug) printf("SF RETURN BIND FAILED: port=%u error=%s\n",
@@ -361,16 +385,22 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
   if (debug) {
     const struct ethernet_port *target = manager->ports->items[index].ethernet;
     printf("ARP SF TX BUILD: vs=%u iface=%s sf-port=%u target=%u "
-           "host=%u pf=%u vf=%u len=%zu\n",
+           "host=%u pf=%u vf=%u context-vlan=%u wire-src="
+           "%02x:%02x:%02x:%02x:%02x:%02x guest-src="
+           "%02x:%02x:%02x:%02x:%02x:%02x len=%zu\n",
            vs, manager->sf_io->interface_name, manager->pipeline->sf_port_id,
            ingress, target->host_index, target->pf_index, target->vf_index,
+           context_tag, manager->sf_io->mac[0], manager->sf_io->mac[1],
+           manager->sf_io->mac[2], manager->sf_io->mac[3],
+           manager->sf_io->mac[4], manager->sf_io->mac[5], response[6],
+           response[7], response[8], response[9], response[10], response[11],
            sizeof(response));
-    printf("ARP TX FRAME:");
+    printf("ARP GUEST FRAME:");
     for (size_t i = 0; i < sizeof(response); i++) printf(" %02x", response[i]);
     printf("\n");
   }
-  if (sf_packet_io_send(manager->sf_io, response, sizeof(response)) ==
-      DOCA_SUCCESS) {
+  if (sf_packet_io_send_context(manager->sf_io, response, sizeof(response),
+                                context_tag) == DOCA_SUCCESS) {
     manager->arp_replies++;
     if (debug) printf("ARP SF TX SENT: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
            response[28], response[29], response[30], response[31]);
@@ -391,6 +421,7 @@ static void reply_gateway_icmp(struct eswitch_manager *manager,
   uint8_t *response = NULL;
   const uint8_t *bytes;
   size_t response_length;
+  uint16_t context_tag = 0;
   int index;
   doca_error_t result;
 
@@ -420,15 +451,15 @@ static void reply_gateway_icmp(struct eswitch_manager *manager,
     manager->icmp_tx_drops++;
     goto out;
   }
-  result = eswitch_pipeline_sf_bind_vswitch(manager->pipeline, vs,
-                                             response + 6);
+  result = bind_sf_return_context(manager, vs, response + 6, &context_tag);
   if (result != DOCA_SUCCESS) {
     manager->icmp_tx_drops++;
     fprintf(stderr, "ICMP SF RETURN BIND FAILED: vs=%u error=%s\n", vs,
             doca_error_get_descr(result));
     goto out;
   }
-  result = sf_packet_io_send(manager->sf_io, response, response_length);
+  result = sf_packet_io_send_context(manager->sf_io, response,
+                                     response_length, context_tag);
   if (result != DOCA_SUCCESS) {
     manager->icmp_tx_drops++;
     fprintf(stderr, "ICMP TX DROP: stage=sf-send vs=%u port=%u\n", vs,
@@ -436,8 +467,8 @@ static void reply_gateway_icmp(struct eswitch_manager *manager,
     goto out;
   }
   manager->icmp_replies++;
-  printf("ICMP ECHO SF TX SENT: vs=%u port=%u len=%zu\n", vs, ingress,
-         response_length);
+  printf("ICMP ECHO SF TX SENT: vs=%u port=%u context-vlan=%u len=%zu\n",
+         vs, ingress, context_tag, response_length);
   goto out;
 
 ignored:
@@ -671,7 +702,8 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->icmp_seen, manager->icmp_ignored, manager->icmp_built,
       manager->icmp_replies, manager->icmp_tx_drops);
   used = append_text(response, size, used,
-      "sf_return_contexts=%zu source_identity=rif-mac destination=vs-fdb\n",
+      "sf_return_contexts=%zu source_identity=context-vlan "
+      "sf_wire_source=actual-sf rewrite_source=rif-mac destination=vs-fdb\n",
       sf_return_count);
   if (sf_counter_result == DOCA_SUCCESS)
     used = append_text(response, size, used,
