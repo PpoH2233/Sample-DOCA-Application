@@ -13,6 +13,10 @@
 #define ESWITCH_METADATA_VSWITCH_MASK UINT32_C(0xffff0000)
 #define ESWITCH_METADATA_PORT_MASK UINT32_C(0x0000ffff)
 
+static doca_error_t get_egress_gate(struct eswitch_pipeline *pipeline,
+                                    uint16_t port_id,
+                                    struct doca_flow_pipe **gate_pipe);
+
 static doca_error_t set_pipe_identity(struct doca_flow_pipe_cfg *cfg,
                                       const char *name,
                                       enum doca_flow_pipe_type type,
@@ -454,8 +458,9 @@ static doca_error_t create_ingress_classifier(
 }
 
 /* Packets created by Arm enter through the actual SF MAC with an internal VLAN
- * context. Hardware removes that private tag, restores the virtual RIF source
- * MAC and reuses the normal VS FDB/flood path. Unknown tags fail closed. */
+ * context. Hardware removes that private tag and restores the virtual RIF
+ * source MAC. A directed context jumps to one resolved egress gate; a flood
+ * context uses the normal VS FDB/flood path. Unknown tags fail closed. */
 static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
@@ -463,8 +468,7 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
   struct doca_flow_monitor monitor = {0};
-  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
-                              .next_pipe = pipeline->destination_pipe};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
@@ -492,13 +496,16 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   return result;
 }
 
-doca_error_t eswitch_pipeline_sf_bind_vswitch(
+static doca_error_t bind_sf_return_context(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint8_t rif_mac[6], uint16_t *context_tag) {
+    uint16_t target_port_id, bool directed, const uint8_t rif_mac[6],
+    uint16_t *context_tag) {
   struct eswitch_sf_return_context *free_context = NULL;
   struct doca_flow_match return_match = {0};
   struct doca_flow_match local_match = {0};
   struct doca_flow_actions actions = {0};
+  struct doca_flow_fwd fwd = {0};
+  struct doca_flow_pipe *gate_pipe = NULL;
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created || vswitch_id == 0 ||
@@ -512,7 +519,9 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
         free_context = context;
       continue;
     }
-    if (context->vswitch_id == vswitch_id) {
+    if (context->vswitch_id == vswitch_id &&
+        context->directed == directed &&
+        (!directed || context->target_port_id == target_port_id)) {
       if (memcmp(context->rif_mac, rif_mac, 6) != 0)
         return DOCA_ERROR_BAD_STATE;
       *context_tag = context->context_tag;
@@ -521,6 +530,17 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
   }
   if (free_context == NULL)
     return DOCA_ERROR_NO_MEMORY;
+
+  if (directed) {
+    result = get_egress_gate(pipeline, target_port_id, &gate_pipe);
+    if (result != DOCA_SUCCESS)
+      return result;
+    fwd.type = DOCA_FLOW_FWD_PIPE;
+    fwd.next_pipe = gate_pipe;
+  } else {
+    fwd.type = DOCA_FLOW_FWD_PIPE;
+    fwd.next_pipe = pipeline->destination_pipe;
+  }
 
   *context_tag = (uint16_t)(free_context - pipeline->sf_return_contexts) + 1;
   return_match.outer.eth_vlan[0].tci = DOCA_HTOBE16(*context_tag);
@@ -531,7 +551,7 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
                             "bind SF return context", DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->sf_return_pipe, &return_match, 0,
-      &actions, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
       &free_context->return_rule.cookie, &free_context->return_rule.entry);
   if (result != DOCA_SUCCESS)
     return result;
@@ -543,38 +563,58 @@ doca_error_t eswitch_pipeline_sf_bind_vswitch(
     return cleanup == DOCA_SUCCESS ? original_error : cleanup;
   }
 
-  local_match.meta.pkt_meta =
-      DOCA_HTOBE32((uint32_t)vswitch_id << 16);
-  memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
-  flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
-                            "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_basic_add_entry(
-      pipeline->runtime->queue_id, pipeline->local_ip_pipe, &local_match, 0,
-      NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
-      &free_context->local_ip_rule.cookie,
-      &free_context->local_ip_rule.entry);
-  if (result == DOCA_SUCCESS)
-    result = process_rules(pipeline, &free_context->local_ip_rule, 1);
-  if (result != DOCA_SUCCESS) {
-    doca_error_t original_error = result;
-    doca_error_t cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
-                                       "rollback local RIF IPv4");
-    if (cleanup == DOCA_SUCCESS)
-      cleanup = remove_rule(pipeline, &free_context->return_rule,
-                            "rollback SF return context");
-    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  if (!directed) {
+    local_match.meta.pkt_meta =
+        DOCA_HTOBE32((uint32_t)vswitch_id << 16);
+    memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
+    flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
+                              "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_basic_add_entry(
+        pipeline->runtime->queue_id, pipeline->local_ip_pipe, &local_match, 0,
+        NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        &free_context->local_ip_rule.cookie,
+        &free_context->local_ip_rule.entry);
+    if (result == DOCA_SUCCESS)
+      result = process_rules(pipeline, &free_context->local_ip_rule, 1);
+    if (result != DOCA_SUCCESS) {
+      doca_error_t original_error = result;
+      doca_error_t cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
+                                         "rollback local RIF IPv4");
+      if (cleanup == DOCA_SUCCESS)
+        cleanup = remove_rule(pipeline, &free_context->return_rule,
+                              "rollback SF return context");
+      return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+    }
   }
 
   free_context->vswitch_id = vswitch_id;
   free_context->context_tag = *context_tag;
+  free_context->target_port_id = target_port_id;
   memcpy(free_context->rif_mac, rif_mac, 6);
+  free_context->directed = directed;
   free_context->active = true;
-  printf("SF RETURN BIND: vs=%u context-vlan=%u rif="
+  printf("SF RETURN BIND: vs=%u context-vlan=%u mode=%s target=%u rif="
          "%02x:%02x:%02x:%02x:%02x:%02x sf-port=%u\n",
-         vswitch_id, *context_tag,
+         vswitch_id, *context_tag, directed ? "directed" : "flood",
+         directed ? target_port_id : UINT16_MAX,
          rif_mac[0], rif_mac[1], rif_mac[2], rif_mac[3],
          rif_mac[4], rif_mac[5], pipeline->sf_port_id);
   return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_sf_bind_vswitch(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
+    const uint8_t rif_mac[6], uint16_t *context_tag) {
+  return bind_sf_return_context(pipeline, vswitch_id, UINT16_MAX, false,
+                                rif_mac, context_tag);
+}
+
+doca_error_t eswitch_pipeline_sf_bind_egress(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
+    uint16_t target_port_id, const uint8_t rif_mac[6],
+    uint16_t *context_tag) {
+  return bind_sf_return_context(pipeline, vswitch_id, target_port_id, true,
+                                rif_mac, context_tag);
 }
 
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(
@@ -588,17 +628,21 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
 
     if (!context->active || context->vswitch_id != vswitch_id)
       continue;
-    result = remove_rule(pipeline, &context->local_ip_rule,
-                         "unbind local RIF IPv4");
-    if (result != DOCA_SUCCESS)
-      return result;
+    if (context->local_ip_rule.entry != NULL) {
+      result = remove_rule(pipeline, &context->local_ip_rule,
+                           "unbind local RIF IPv4");
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
     result = remove_rule(pipeline, &context->return_rule,
                          "unbind SF return context");
     if (result != DOCA_SUCCESS)
       return result;
-    printf("SF RETURN UNBIND: vs=%u\n", vswitch_id);
+    printf("SF RETURN UNBIND: vs=%u context-vlan=%u mode=%s target=%u\n",
+           vswitch_id, context->context_tag,
+           context->directed ? "directed" : "flood",
+           context->directed ? context->target_port_id : UINT16_MAX);
     *context = (struct eswitch_sf_return_context){0};
-    return DOCA_SUCCESS;
   }
   return DOCA_SUCCESS;
 }
@@ -634,12 +678,14 @@ doca_error_t eswitch_pipeline_sf_query_counters(
     if (result != DOCA_SUCCESS)
       return result;
     *context_packets += query.counter.total_pkts;
-    memset(&query, 0, sizeof(query));
-    result = doca_flow_resource_query_entry(context->local_ip_rule.entry,
-                                            &query);
-    if (result != DOCA_SUCCESS)
-      return result;
-    *local_ip_packets += query.counter.total_pkts;
+    if (context->local_ip_rule.entry != NULL) {
+      memset(&query, 0, sizeof(query));
+      result = doca_flow_resource_query_entry(context->local_ip_rule.entry,
+                                              &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *local_ip_packets += query.counter.total_pkts;
+    }
   }
   return DOCA_SUCCESS;
 }

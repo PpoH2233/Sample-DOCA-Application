@@ -17,8 +17,8 @@ are unchanged. The return path is multi-VS capable and fail-closed.
 Software path:
 1. Validate gateway request and current VS ownership.
 2. Learn the requesting VM source MAC in the normal VS FDB.
-3. Bind a private context VLAN to that VS and its virtual RIF MAC in
-   `ESW_SF_RETURN`.
+3. Bind a directed private context VLAN to that VS, target port and virtual
+   RIF MAC in `ESW_SF_RETURN`.
 4. Build a padded 60-byte Ethernet ARP reply.
 5. Replace the wire source with the actual SF MAC, insert the private context
    VLAN, and send through an `AF_PACKET/SOCK_RAW` socket bound to the actual
@@ -28,18 +28,20 @@ Hardware path (DEFAULT domain):
 ```text
 actual Arm SF -> system-SF representor
   -> ESW_INGRESS_CLASSIFIER: SF port -> ESW_SF_RETURN
-     -> known context VLAN: pop VLAN, rewrite source to virtual RIF MAC,
+     -> known directed context VLAN: pop VLAN, rewrite source to virtual RIF MAC,
         set pkt_meta=(VS << 16) | SF_port
-        -> ESW_DEST_FDB: (VS, VM destination MAC)
-           -> ESW_EGRESS_GATE_<VF> -> VF -> VM
+        -> ESW_EGRESS_GATE_<VF> -> VF -> VM
+     -> known flood context VLAN
+        -> ESW_DEST_FDB miss -> per-VS flood selector
      -> unknown context VLAN: DROP
 ```
 
 The private VLAN never leaves the SF return pipe. The SF root entry and
 SF-return miss both fail closed, and the SF cannot be attached as a tenant
-port. A tag/RIF-to-VS binding is installed on the first reply and reused. When
-the configured RIF MAC changes, the next gateway ARP packet removes the old
-return/local-IP entries and binds the new RIF MAC without a daemon restart.
+port. One flood tag per RIF preserves local-IP delivery and broadcast ARP
+probes; directed tags are reused per `(VS, target port)`. When the configured
+RIF MAC changes, the next gateway packet removes every old context for that VS
+and binds the new RIF MAC without a daemon restart.
 
 Launch in doca-dev with the production PF owner stopped:
 ```sh
@@ -79,12 +81,14 @@ The router learns on-link neighbors from validated ARP requests and replies. On
 a neighbor miss it broadcasts a rate-limited ARP request through the egress
 RIF/VS and drops the current packet. A retry is forwarded after resolution.
 Forwarding rewrites destination/source Ethernet addresses, decrements IPv4 TTL,
-recomputes the IPv4 header checksum, and transmits through the egress VS's
-private SF context. Route miss, TTL expiry, unsupported public egress and
-invalid IPv4 fail closed; ICMP error generation is a later milestone.
+recomputes the IPv4 header checksum, and transmits through a directed SF
+context for the neighbor's learned port. Route miss, TTL expiry, unsupported
+public egress and invalid IPv4 fail closed; ICMP error generation is a later
+milestone.
 
 ```text
-VM-A -> VS-A -> ingress RIF -> Arm LPM -> egress RIF -> SF context -> VS-B -> VM-B
+VM-A -> VS-A -> ingress RIF -> Arm LPM -> egress RIF
+     -> directed SF context -> VM-B egress gate -> VM-B
 ```
 
 This is a correctness milestone, not hardware LPM: `status` explicitly reports

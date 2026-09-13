@@ -222,10 +222,11 @@ eswitchctl tx-debug
 ```
 
 `destination_fdb_misses` counts packets which reached `ESW_DEST_FDB` but did
-not match a learned destination. Each `egress_port` line separately counts
-packets forwarded by that port's gate and packets rejected by its
-split-horizon rule. Capture one output before and one after sending a small,
-known packet burst and compare the deltas.
+not match a learned destination. Directed Arm-generated unicast bypasses that
+lookup, while broadcast ARP probes still use it. Each `egress_port` line
+separately counts packets forwarded by that port's gate and packets rejected
+by its split-horizon rule. Capture one output before and one after sending a
+small, known packet burst and compare the deltas.
 
 ### `list-port-available`
 

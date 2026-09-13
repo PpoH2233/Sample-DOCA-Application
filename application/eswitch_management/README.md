@@ -40,21 +40,26 @@ endpoint
 root miss -> DROP
 ```
 
-Gateway packets created on Arm take a separate ingress leg and then join the
-same VS destination path:
+Packets created on Arm take a separate ingress leg. Known unicast output uses
+the target port already resolved by the router; broadcast probes join the VS
+destination/flood path:
 
 ```text
 raw Ethernet frame on actual SF (default enp3s0f0s0)
    -> system-SF representor root entry
       -> private context VLAN: pop tag, restore VS and virtual RIF source MAC
-         -> destination FDB -> target VF egress gate -> VM
+         -> directed context -> target VF egress gate -> VM
+         -> flood context    -> destination FDB/flood selector -> VS members
 unknown SF context VLAN -> DROP
 ```
 
-The daemon learns the requesting VM MAC before transmitting its ARP reply, so
-the reply normally takes a known-unicast FDB entry. This removes the unsupported
-parent-PF software-TX shortcut: a successful raw-socket send only proves that
-the packet entered the SF endpoint; guest capture remains the delivery proof.
+Gateway replies and routed unicast do not perform a second destination-FDB
+lookup after software has already resolved their egress port. ARP neighbor
+probes remain broadcast through the VS flood context. This removes both the
+unsupported parent-PF software-TX shortcut and the return-path dependency on a
+potentially changing learned FDB entry. A successful raw-socket send only
+proves that the packet entered the SF endpoint; guest capture remains the
+delivery proof.
 Treat this SF as a dedicated application endpoint while the daemon owns the
 eSwitch; ordinary host networking on the same SF is outside this design.
 
@@ -79,7 +84,8 @@ For `P` probed ports, `M` attached memberships, `V` non-empty vSwitches and
 ```text
 root classifier entries       M
 system-SF root entries         1
-SF RIF-context entries         <= configured private RIFs used for TX
+SF flood-context entries       <= configured private RIFs used for TX
+SF directed-context entries    <= active (RIF, target port) pairs
 shared egress-gate pipes       <= P       (2 control entries per used port)
 vSwitch flooding HASH pipes   V
 flood member entries          M

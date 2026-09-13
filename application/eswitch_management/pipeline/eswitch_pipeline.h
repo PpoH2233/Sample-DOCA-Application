@@ -43,9 +43,11 @@ struct eswitch_flood_group {
 struct eswitch_sf_return_context {
   uint16_t vswitch_id;
   uint16_t context_tag;
+  uint16_t target_port_id;
   uint8_t rif_mac[6];
   struct eswitch_rule return_rule;
   struct eswitch_rule local_ip_rule;
+  bool directed;
   bool active;
 };
 
@@ -95,6 +97,12 @@ void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     const uint8_t rif_mac[6], uint16_t *context_tag);
+
+/* Bind an SF context directly to one known egress port. */
+doca_error_t eswitch_pipeline_sf_bind_egress(
+    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
+    uint16_t target_port_id, const uint8_t rif_mac[6],
+    uint16_t *context_tag);
 
 /* Remove a previously installed SF return context. This is idempotent. */
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(

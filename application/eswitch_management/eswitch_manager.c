@@ -103,6 +103,24 @@ static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
   return result;
 }
 
+/* Directed router output already has a resolved destination port. Keep one
+ * flood context per VS for local-RIF delivery/broadcast probes, then install
+ * a separate context that jumps directly to the target egress gate. */
+static doca_error_t bind_sf_directed_context(
+    struct eswitch_manager *manager, uint16_t vswitch_id,
+    uint16_t target_port_id, const uint8_t rif_mac[6],
+    uint16_t *context_tag) {
+  uint16_t flood_context_tag;
+  doca_error_t result;
+
+  result = bind_sf_return_context(manager, vswitch_id, rif_mac,
+                                  &flood_context_tag);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return eswitch_pipeline_sf_bind_egress(
+      manager->pipeline, vswitch_id, target_port_id, rif_mac, context_tag);
+}
+
 
 static doca_error_t manager_to_state(const struct eswitch_manager *manager,
                                      struct eswitch_state *state) {
@@ -389,8 +407,8 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_window_replies++;
-  doca_error_t arm_result = bind_sf_return_context(
-      manager, vs, response + 6, &context_tag);
+  doca_error_t arm_result = bind_sf_directed_context(
+      manager, vs, ingress, response + 6, &context_tag);
   if (arm_result != DOCA_SUCCESS) {
     manager->arp_target_drops++; manager->arp_tx_drops++;
     if (debug) printf("SF RETURN BIND FAILED: port=%u error=%s\n",
@@ -466,7 +484,8 @@ static void reply_gateway_icmp(struct eswitch_manager *manager,
     manager->icmp_tx_drops++;
     goto out;
   }
-  result = bind_sf_return_context(manager, vs, response + 6, &context_tag);
+  result = bind_sf_directed_context(manager, vs, ingress, response + 6,
+                                    &context_tag);
   if (result != DOCA_SUCCESS) {
     manager->icmp_tx_drops++;
     fprintf(stderr, "ICMP SF RETURN BIND FAILED: vs=%u error=%s\n", vs,
@@ -609,8 +628,9 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
     manager->route_invalid++;
     goto out;
   }
-  result = bind_sf_return_context(manager, egress->vswitch_id, egress->mac,
-                                  &context_tag);
+  result = bind_sf_directed_context(
+      manager, egress->vswitch_id, neighbor->port_id, egress->mac,
+      &context_tag);
   if (result == DOCA_SUCCESS)
     result = sf_packet_io_send_context(manager->sf_io, output, output_length,
                                        context_tag);
@@ -684,8 +704,9 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
                              &header->src_addr, port_id, now_ns);
   if (result != DOCA_SUCCESS)
     return result;
-  /* The SF reply rejoins at ESW_DEST_FDB, so commit the requesting VM's
-   * destination rule before transmitting the reply. */
+  /* Learn every validated source for ordinary L2 switching and aging. Router
+   * replies use a directed SF context and therefore do not depend on this FDB
+   * entry being visible before transmission. */
   if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
     uint8_t arp_scratch[42];
     const uint8_t *arp = rte_pktmbuf_read(packet, 0, sizeof(arp_scratch),
@@ -814,6 +835,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t assigned_count = 0;
   size_t assignable_port_count = 0;
   size_t sf_return_count = 0;
+  size_t sf_directed_count = 0;
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
@@ -830,8 +852,13 @@ static size_t format_status(const struct eswitch_manager *manager,
     assigned_count += (manager->port_owner[i] != 0 ||
                        router_control_port_reserved(manager, i)) ? 1U : 0U;
   }
-  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
-    sf_return_count += manager->pipeline->sf_return_contexts[i].active ? 1U : 0U;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    const struct eswitch_sf_return_context *context =
+        &manager->pipeline->sf_return_contexts[i];
+
+    sf_return_count += context->active ? 1U : 0U;
+    sf_directed_count += context->active && context->directed ? 1U : 0U;
+  }
   sf_counter_result = eswitch_pipeline_sf_query_counters(
       manager->pipeline, &sf_ingress_hits, &sf_context_hits,
       &local_ip_hits);
@@ -884,9 +911,12 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->neighbors.count, manager->route_neighbor_misses,
       manager->route_arp_probes, manager->route_tx_drops);
   used = append_text(response, size, used,
-      "sf_return_contexts=%zu source_identity=context-vlan "
-      "sf_wire_source=actual-sf rewrite_source=rif-mac destination=vs-fdb\n",
-      sf_return_count);
+      "sf_return_contexts=%zu directed=%zu flood=%zu "
+      "source_identity=context-vlan "
+      "sf_wire_source=actual-sf rewrite_source=rif-mac "
+      "unicast_destination=direct-egress broadcast_destination=vs-flood\n",
+      sf_return_count, sf_directed_count,
+      sf_return_count - sf_directed_count);
   if (sf_counter_result == DOCA_SUCCESS)
     used = append_text(response, size, used,
         "sf_counter_state=ready sf_ingress_hits=%" PRIu64
