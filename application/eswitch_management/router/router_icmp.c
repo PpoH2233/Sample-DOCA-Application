@@ -47,7 +47,8 @@ size_t router_icmp_echo_reply(const struct router_config *config,
                               uint16_t vswitch_id, const uint8_t *packet,
                               size_t length, uint8_t *output,
                               size_t capacity) {
-  const struct router_interface *rif = NULL;
+  const struct router_interface *ingress_rif = NULL;
+  const struct router_interface *local_rif = NULL;
   const uint8_t *ip;
   const uint8_t *icmp;
   uint8_t *output_ip;
@@ -86,13 +87,23 @@ size_t router_icmp_echo_reply(const struct router_config *config,
 
     if (candidate->attachment == ROUTER_VSWITCH &&
         candidate->vswitch_id == vswitch_id && candidate->has_address &&
-        candidate->address == read32(ip + 16) &&
         memcmp(packet, candidate->mac, 6) == 0) {
-      rif = candidate;
+      ingress_rif = candidate;
       break;
     }
   }
-  if (rif == NULL || read32(ip + 12) == rif->address)
+  if (ingress_rif == NULL)
+    return 0;
+  for (size_t i = 0; i < config->interface_count; i++) {
+    const struct router_interface *candidate = &config->interfaces[i];
+
+    if (candidate->vr_id == ingress_rif->vr_id && candidate->has_address &&
+        candidate->address == read32(ip + 16)) {
+      local_rif = candidate;
+      break;
+    }
+  }
+  if (local_rif == NULL || read32(ip + 12) == local_rif->address)
     return 0;
 
   icmp = ip + ip_header_length;
@@ -108,14 +119,17 @@ size_t router_icmp_echo_reply(const struct router_config *config,
 
   memset(output, 0, frame_length);
   memcpy(output, packet + 6, 6);
-  memcpy(output + 6, rif->mac, 6);
+  /* A reply to another local RIF address exits through the ingress link. Its
+   * L2 source is therefore the ingress RIF MAC, while its IPv4 source remains
+   * the exact local address that the peer pinged (weak-host router model). */
+  memcpy(output + 6, ingress_rif->mac, 6);
   output[12] = 0x08;
   output[13] = 0x00;
   memcpy(output + ETH_HEADER_LEN, ip, ip_total_length);
 
   output_ip = output + ETH_HEADER_LEN;
   output_ip[8] = 64;
-  write32(output_ip + 12, rif->address);
+  write32(output_ip + 12, local_rif->address);
   memcpy(output_ip + 16, ip + 12, 4);
   output_ip[10] = 0;
   output_ip[11] = 0;

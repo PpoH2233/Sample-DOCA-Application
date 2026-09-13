@@ -27,6 +27,7 @@ int main(void) {
   uint8_t bad[98];
   const uint8_t vm[6] = {0xa6,0x94,0x27,0xfb,0x6c,0x38};
   const uint8_t rif[6] = {0x02,0x98,0x13,0x43,0x9d,0x40};
+  const uint8_t remote_rif[6] = {0x02,0,0,0x65,0,3};
 
   router_config_init(&config);
   config.interface_count = 1;
@@ -50,6 +51,28 @@ int main(void) {
   assert(reply[34]==0 && reply[35]==0);
   assert(!memcmp(reply+26,request+30,4) && !memcmp(reply+30,request+26,4));
   assert(checksum(reply+14,20)==0 && checksum(reply+34,64)==0);
+
+  /* A router owns every RIF address in the same VR. Ping to a different RIF
+   * IP must return on the ingress link, using ingress L2 identity but the
+   * addressed RIF's IPv4 identity. */
+  config.interface_count = 2;
+  config.interfaces[1] = (struct router_interface){
+      .vr_id=101,.vswitch_id=200,.attachment=ROUTER_VSWITCH,
+      .has_address=true,.address=0xc0a80a01};
+  memcpy(config.interfaces[1].mac,remote_rif,6);
+  request[30]=192;request[31]=168;request[32]=10;request[33]=1;
+  put16(request+24,0);put16(request+24,checksum(request+14,20));
+  assert(router_icmp_echo_reply(&config,100,request,sizeof(request),reply,
+                                sizeof(reply))==98);
+  assert(!memcmp(reply+6,rif,6));
+  assert(reply[26]==192 && reply[27]==168 && reply[28]==10 && reply[29]==1);
+  assert(checksum(reply+14,20)==0 && checksum(reply+34,64)==0);
+  config.interfaces[1].vr_id=202;
+  assert(!router_icmp_echo_reply(&config,100,request,sizeof(request),reply,
+                                 sizeof(reply)));
+
+  request[30]=192;request[31]=168;request[32]=0;request[33]=1;
+  put16(request+24,0);put16(request+24,checksum(request+14,20));
   assert(!router_icmp_echo_reply(&config,200,request,sizeof(request),reply,sizeof(reply)));
   memcpy(bad,request,sizeof(bad)); bad[34]=3;
   assert(!router_icmp_echo_reply(&config,100,bad,sizeof(bad),reply,sizeof(reply)));
@@ -57,6 +80,6 @@ int main(void) {
   put16(bad+24,0); put16(bad+24,checksum(bad+14,20));
   assert(!router_icmp_echo_reply(&config,100,bad,sizeof(bad),reply,sizeof(reply)));
   assert(!router_icmp_echo_reply(&config,100,request,41,reply,sizeof(reply)));
-  puts("PASS: ICMP echo reply, checksums, VR isolation and malformed packets");
+  puts("PASS: ICMP echo reply, cross-RIF local IP, checksums, VR isolation and malformed packets");
   return 0;
 }
