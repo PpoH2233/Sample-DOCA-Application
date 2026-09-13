@@ -56,7 +56,8 @@ bool router_ipv4_prefix(const char *, uint32_t *, uint8_t *);
 bool router_command_valid(const char *, char *, size_t);
 /* Works on a transaction candidate. Caller persists before publishing it.
  * Returns false on failure, with an ERR response. changed means config changed.
- * Configured interfaces are deliberately NOT reported as hardware-ready. */
+ * Private VS interfaces report the implemented Arm LPM milestone; public
+ * interfaces remain pending until their dataplane is implemented. */
 bool router_command(struct router_config *, const struct router_inventory *,
                     const char *, char *, size_t, bool *changed);
 bool router_config_save(const char *, const struct router_config *, char *, size_t);

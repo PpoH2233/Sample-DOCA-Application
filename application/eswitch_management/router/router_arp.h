@@ -6,4 +6,8 @@
  * Returns 60 on reply, zero for malformed, non-request or unowned target. */
 size_t router_arp_reply(const struct router_config *, uint16_t vswitch_id,
                         const uint8_t *, size_t, uint8_t *, size_t);
+
+/* Build a broadcast request used to resolve an on-link route next hop. */
+size_t router_arp_request(const struct router_interface *, uint32_t target_ip,
+                          uint8_t *, size_t);
 #endif

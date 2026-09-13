@@ -34,7 +34,8 @@ static void print_help(FILE *output, const char *program) {
           "  vr route add --id <id> --prefix <cidr> --via <ip> --interface <name>\n"
           "  vr route del --id <id> --prefix <cidr>\n"
           "  vr route show --id <id>\n"
-          "  Private gateway ARP is active; ICMP and IPv4 routing are not implemented.\n"
+          "  Private VS gateway ARP, ICMP echo and Arm LPM routing are active.\n"
+          "  Public-port routing and hardware LPM offload are not implemented.\n"
           "  --help, -h                          Show this help\n\n"
           "Control socket: %s\n"
           "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",

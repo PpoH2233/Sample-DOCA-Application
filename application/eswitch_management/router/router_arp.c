@@ -4,6 +4,10 @@
 static uint32_t read32(const uint8_t *p) {
   return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
 }
+static void write32(uint8_t *p, uint32_t value) {
+  p[0]=(uint8_t)(value>>24);p[1]=(uint8_t)(value>>16);
+  p[2]=(uint8_t)(value>>8);p[3]=(uint8_t)value;
+}
 size_t router_arp_reply(const struct router_config *config,uint16_t vs,
                         const uint8_t *p,size_t len,uint8_t *out,size_t capacity) {
   if (!config || !p || !out || len<42 || capacity<60 || !vs) return 0;
@@ -30,5 +34,27 @@ size_t router_arp_reply(const struct router_config *config,uint16_t vs,
   memcpy(out+12,p+12,10); out[21]=2;
   memcpy(out+22,rif->mac,6); memcpy(out+28,p+38,4);
   memcpy(out+32,p+22,6); memcpy(out+38,p+28,4);
+  return 60;
+}
+
+size_t router_arp_request(const struct router_interface *rif,
+                          uint32_t target_ip, uint8_t *out,
+                          size_t capacity) {
+  static const uint8_t broadcast[6]={255,255,255,255,255,255};
+  uint32_t mask;
+
+  if (!rif || !out || capacity<60 || !target_ip ||
+      rif->attachment!=ROUTER_VSWITCH || !rif->has_address ||
+      (rif->mac[0]&1U)) return 0;
+  mask=rif->prefix==0?0:UINT32_MAX<<(32-rif->prefix);
+  if ((target_ip&mask)!=(rif->address&mask) || target_ip==rif->address)
+    return 0;
+  memset(out,0,60);
+  memcpy(out,broadcast,6);memcpy(out+6,rif->mac,6);
+  out[12]=0x08;out[13]=0x06;
+  out[14]=0;out[15]=1;out[16]=0x08;out[17]=0;
+  out[18]=6;out[19]=4;out[20]=0;out[21]=1;
+  memcpy(out+22,rif->mac,6);write32(out+28,rif->address);
+  write32(out+38,target_ip);
   return 60;
 }

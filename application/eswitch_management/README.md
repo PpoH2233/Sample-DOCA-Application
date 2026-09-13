@@ -4,9 +4,9 @@ Router integration is in progress: [router/README.md](router/README.md) records
 implemented control commands, readiness, SDK prerequisites, and the VF 11–15
 test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
 `pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
-Router commands stage persistent desired configuration. Addressed private
-vs-link RIFs now respond to gateway ARP; public ARP, local ICMP and LPM/CT/NAT
-forwarding are **not implemented** and are never reported READY.
+Router commands persist desired configuration. Addressed private vs-link RIFs
+support gateway ARP, local ICMP and Arm longest-prefix routing between private
+vSwitches. Public routing, hardware LPM, CT and NAT are not implemented.
 The default VF scope is now `7-15`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
 /build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported
@@ -46,9 +46,9 @@ same VS destination path:
 ```text
 raw Ethernet frame on actual SF (default enp3s0f0s0)
    -> system-SF representor root entry
-      -> RIF source-MAC classifier: restore VS in pkt_meta
+      -> private context VLAN: pop tag, restore VS and virtual RIF source MAC
          -> destination FDB -> target VF egress gate -> VM
-unknown SF source MAC -> DROP
+unknown SF context VLAN -> DROP
 ```
 
 The daemon learns the requesting VM MAC before transmitting its ARP reply, so
@@ -236,11 +236,13 @@ sudo docker exec eswitch-management eswitchctl list-port-available
 The status response includes cumulative SF return diagnostics. A zero
 `sf_ingress_hits` means the packet did not match the system-SF root entry. If
 that value increases while `sf_context_hits` remains zero, the packet reached
-the SF root but did not match an active RIF source-MAC context. These counters
+the SF root but did not match an active private context-VLAN entry. These counters
 measure hardware Flow entries; `arp_sf_tx_sent` only measures successful
 submission to the Arm raw socket. `local_ip_hits` counts IPv4 packets addressed
 to a private RIF and delivered to the Arm handler; `icmp_sf_tx_sent` confirms
-that a validated echo reply was submitted through the SF return path.
+that a validated echo reply was submitted through the SF return path. The
+`ipv4_routing=arm-lpm` line reports routed packets, route failures, neighbor
+misses, ARP probes, and successful routed transmissions.
 
 Inspect startup and health status with:
 

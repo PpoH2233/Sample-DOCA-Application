@@ -266,8 +266,10 @@ eswitchctl vs-port-detach --port 1 --id 100
 # Router command group
 
 See [router/README.md](router/README.md) for `eswitchctl vr` commands.
-These stage configuration. Private gateway ARP is implemented through the Arm
-system SF; local ICMP and IPv4 forwarding are not implemented yet.
+Private-vSwitch gateway ARP, local ICMP echo, connected-route LPM, static-route
+LPM, neighbor discovery, and IPv4 forwarding are implemented through the Arm
+system SF. Public-port routing, ICMP routing errors, and hardware LPM offload
+are not implemented yet.
 Existing L2 commands below retain their syntax. A port reserved by a VR cannot
 be attached to a vSwitch, and a router-linked vSwitch cannot be deleted until
 its logical interface is detached.

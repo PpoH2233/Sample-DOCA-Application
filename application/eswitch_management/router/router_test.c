@@ -61,7 +61,8 @@ int main(void) {
   command("vr switch-detach --id 100 --interface p1",false);
   command("vr port-detach --id 100 --interface p1",false);
   command("vr show-interface --id 100",true);
-  assert(strstr(response,"vf=11") && strstr(response,"PENDING_DATAPLANE"));
+  assert(strstr(response,"vf=11") && strstr(response,"PENDING_DATAPLANE") &&
+         strstr(response,"ACTIVE_ARM_LPM"));
   command("vr route show --id 100",true);
   assert(strstr(response,"connected 192.168.0.0/24") && strstr(response,"static 0.0.0.0/0"));
   command("vr nat add --id 100",false);

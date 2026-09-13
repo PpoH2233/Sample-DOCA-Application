@@ -19,6 +19,7 @@
 #include "eswitch_state.h"
 #include "router/router_control.h"
 #include "router/router_arp.h"
+#include "router/router_forward.h"
 #include "router/router_icmp.h"
 #include "l2/l2_switch.h"
 #include "pipeline/tx_build.h"
@@ -63,6 +64,20 @@ static int find_port_index(const struct eswitch_manager *manager,
       return i;
   }
   return -1;
+}
+
+static const struct router_interface *find_router_interface(
+    const struct eswitch_manager *manager, uint16_t vr_id,
+    uint16_t interface_id) {
+  if (manager->router == NULL)
+    return NULL;
+  for (size_t i = 0; i < manager->router->interface_count; i++) {
+    const struct router_interface *rif = &manager->router->interfaces[i];
+
+    if (rif->vr_id == vr_id && rif->interface_id == interface_id)
+      return rif;
+  }
+  return NULL;
 }
 
 /* Keep the hardware return context synchronized with the desired RIF MAC.
@@ -478,6 +493,148 @@ out:
   free(response);
 }
 
+static void send_route_neighbor_probe(
+    struct eswitch_manager *manager, const struct router_interface *egress,
+    uint32_t target_ip, uint64_t now_ns) {
+  uint8_t request[60];
+  uint16_t context_tag = 0;
+  doca_error_t result;
+
+  if (!router_neighbor_should_probe(&manager->neighbors, egress->vr_id,
+                                    egress->interface_id, target_ip, now_ns))
+    return;
+  if (router_arp_request(egress, target_ip, request, sizeof(request)) == 0) {
+    manager->route_tx_drops++;
+    return;
+  }
+  result = bind_sf_return_context(manager, egress->vswitch_id, egress->mac,
+                                  &context_tag);
+  if (result == DOCA_SUCCESS)
+    result = sf_packet_io_send_context(manager->sf_io, request,
+                                       sizeof(request), context_tag);
+  if (result != DOCA_SUCCESS) {
+    manager->route_tx_drops++;
+    fprintf(stderr, "ROUTE ARP PROBE DROP: vr=%u rif=%u error=%s\n",
+            egress->vr_id, egress->interface_id,
+            doca_error_get_descr(result));
+    return;
+  }
+  manager->route_arp_probes++;
+  printf("ROUTE ARP PROBE: vr=%u rif=%u vs=%u target=%u.%u.%u.%u "
+         "context-vlan=%u\n",
+         egress->vr_id, egress->interface_id, egress->vswitch_id,
+         (target_ip >> 24) & 0xffU, (target_ip >> 16) & 0xffU,
+         (target_ip >> 8) & 0xffU, target_ip & 0xffU, context_tag);
+}
+
+static void route_ipv4_packet(struct eswitch_manager *manager,
+                              struct rte_mbuf *packet, uint16_t ingress_vs,
+                              uint16_t ingress_port, uint64_t now_ns) {
+  struct router_ipv4_decision decision;
+  const struct router_interface *egress;
+  const struct router_neighbor *neighbor;
+  size_t length = rte_pktmbuf_pkt_len(packet);
+  size_t capacity = length < 60 ? 60 : length;
+  uint8_t *scratch = NULL;
+  uint8_t *output = NULL;
+  const uint8_t *frame;
+  size_t output_length;
+  uint16_t context_tag = 0;
+  doca_error_t result;
+  enum router_ipv4_disposition disposition;
+
+  scratch = malloc(length);
+  if (scratch == NULL) {
+    manager->route_tx_drops++;
+    return;
+  }
+  frame = rte_pktmbuf_read(packet, 0, length, scratch);
+  if (frame == NULL) {
+    manager->route_invalid++;
+    goto out;
+  }
+  disposition = router_ipv4_lookup(manager->router, ingress_vs, frame, length,
+                                   &decision);
+  if (disposition == ROUTER_IPV4_NOT_FOR_ROUTER)
+    goto out;
+  if (disposition == ROUTER_IPV4_LOCAL) {
+    reply_gateway_icmp(manager, packet, ingress_vs, ingress_port);
+    goto out;
+  }
+  manager->routed_seen++;
+  if (disposition == ROUTER_IPV4_INVALID) {
+    manager->route_invalid++;
+    goto out;
+  }
+  if (disposition == ROUTER_IPV4_TTL_EXPIRED) {
+    manager->route_ttl_expired++;
+    goto out;
+  }
+  if (disposition == ROUTER_IPV4_NO_ROUTE) {
+    manager->route_no_route++;
+    goto out;
+  }
+
+  egress = find_router_interface(manager, decision.vr_id,
+                                 decision.egress_interface_id);
+  if (egress == NULL || egress->attachment != ROUTER_VSWITCH) {
+    manager->route_no_route++;
+    goto out;
+  }
+  neighbor = router_neighbor_lookup(
+      &manager->neighbors, decision.vr_id, decision.egress_interface_id,
+      decision.next_hop_ip, now_ns);
+  if (neighbor == NULL) {
+    manager->route_neighbor_misses++;
+    send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
+    goto out;
+  }
+  {
+    int neighbor_port_index = find_port_index(manager, neighbor->port_id);
+    if (neighbor_port_index < 0 ||
+        manager->port_owner[neighbor_port_index] != egress->vswitch_id) {
+      manager->route_neighbor_misses++;
+      send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
+      goto out;
+    }
+  }
+  output = malloc(capacity);
+  if (output == NULL) {
+    manager->route_tx_drops++;
+    goto out;
+  }
+  output_length = router_ipv4_rewrite(frame, length, egress->mac,
+                                      neighbor->mac, output, capacity);
+  if (output_length == 0) {
+    manager->route_invalid++;
+    goto out;
+  }
+  result = bind_sf_return_context(manager, egress->vswitch_id, egress->mac,
+                                  &context_tag);
+  if (result == DOCA_SUCCESS)
+    result = sf_packet_io_send_context(manager->sf_io, output, output_length,
+                                       context_tag);
+  if (result != DOCA_SUCCESS) {
+    manager->route_tx_drops++;
+    fprintf(stderr, "ROUTE TX DROP: vr=%u rif=%u vs=%u error=%s\n",
+            decision.vr_id, decision.egress_interface_id,
+            decision.egress_vswitch_id, doca_error_get_descr(result));
+    goto out;
+  }
+  manager->routed_forwarded++;
+  printf("ROUTE TX: vr=%u ingress-rif=%u egress-rif=%u egress-vs=%u "
+         "prefix=/%u next-hop=%u.%u.%u.%u context-vlan=%u len=%zu\n",
+         decision.vr_id, decision.ingress_interface_id,
+         decision.egress_interface_id, decision.egress_vswitch_id,
+         decision.prefix_length, (decision.next_hop_ip >> 24) & 0xffU,
+         (decision.next_hop_ip >> 16) & 0xffU,
+         (decision.next_hop_ip >> 8) & 0xffU,
+         decision.next_hop_ip & 0xffU, context_tag, output_length);
+out:
+  free(output);
+  free(scratch);
+}
+
 static doca_error_t process_packet(struct eswitch_manager *manager,
                                    struct rte_mbuf *packet,
                                    uint64_t now_ns) {
@@ -529,10 +686,22 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
     return result;
   /* The SF reply rejoins at ESW_DEST_FDB, so commit the requesting VM's
    * destination rule before transmitting the reply. */
-  if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP))
+  if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+    uint8_t arp_scratch[42];
+    const uint8_t *arp = rte_pktmbuf_read(packet, 0, sizeof(arp_scratch),
+                                          arp_scratch);
+    if (arp != NULL && router_neighbor_learn_arp(
+                           &manager->neighbors, manager->router,
+                           vswitch_id, port_id, arp, sizeof(arp_scratch),
+                           now_ns))
+      printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
+             "%02x:%02x:%02x:%02x:%02x:%02x\n",
+             vswitch_id, port_id, arp[28], arp[29], arp[30], arp[31],
+             arp[22], arp[23], arp[24], arp[25], arp[26], arp[27]);
     reply_gateway_arp(manager, packet, vswitch_id, port_id, now_ns);
-  else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
-    reply_gateway_icmp(manager, packet, vswitch_id, port_id);
+  } else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+    route_ipv4_packet(manager, packet, vswitch_id, port_id, now_ns);
+  }
   return DOCA_SUCCESS;
 }
 
@@ -580,6 +749,7 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
     return DOCA_SUCCESS;
   manager->next_aging_ns = now_ns +
       (uint64_t)SWITCH_AGING_SCAN_SECONDS * 1000000000ULL;
+  router_neighbor_age(&manager->neighbors, now_ns);
   return eswitch_fdb_age(&manager->fdb, now_ns);
 }
 
@@ -684,7 +854,7 @@ static size_t format_status(const struct eswitch_manager *manager,
                      switch_count,
                      manager->fdb.count);
   used = append_text(response, size, used,
-                     "routers=%zu router_dataplane=GATEWAY_ARP_ICMP\n",
+                     "routers=%zu router_dataplane=GATEWAY_ARP_ICMP_ARM_LPM\n",
                      manager->router ? manager->router->vr_count : 0);
   used = append_text(response, size, used,
       "private_gateway_arp=enabled arp_sf_tx_sent=%" PRIu64
@@ -701,6 +871,18 @@ static size_t format_status(const struct eswitch_manager *manager,
       " icmp_sf_tx_sent=%" PRIu64 " icmp_tx_drops=%" PRIu64 "\n",
       manager->icmp_seen, manager->icmp_ignored, manager->icmp_built,
       manager->icmp_replies, manager->icmp_tx_drops);
+  used = append_text(response, size, used,
+      "ipv4_routing=arm-lpm routed_seen=%" PRIu64
+      " routed_forwarded=%" PRIu64 " no_route=%" PRIu64
+      " ttl_expired=%" PRIu64 " invalid=%" PRIu64 "\n",
+      manager->routed_seen, manager->routed_forwarded,
+      manager->route_no_route, manager->route_ttl_expired,
+      manager->route_invalid);
+  used = append_text(response, size, used,
+      "neighbors=%zu neighbor_misses=%" PRIu64 " arp_probes=%" PRIu64
+      " route_tx_drops=%" PRIu64 "\n",
+      manager->neighbors.count, manager->route_neighbor_misses,
+      manager->route_arp_probes, manager->route_tx_drops);
   used = append_text(response, size, used,
       "sf_return_contexts=%zu source_identity=context-vlan "
       "sf_wire_source=actual-sf rewrite_source=rif-mac destination=vs-fdb\n",

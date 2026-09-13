@@ -1,11 +1,11 @@
 # Router implementation status
 
-This change introduces the control-plane foundation, a private gateway ARP
-responder and local IPv4 ICMP echo replies. It does **not** implement IPv4
-router forwarding.
-Interfaces with IPs still report `PENDING_DATAPLANE`, while daemon status
-reports `router_dataplane=GATEWAY_ARP_ICMP`. Public ports are reserved but
-remain root-miss DROP. Private L2 forwarding remains active.
+This change introduces the control-plane foundation, private gateway ARP,
+local IPv4 ICMP echo replies and functional IPv4 routing between vSwitch RIFs
+inside one VR. The current longest-prefix lookup and neighbor handling run on
+Arm; DOCA Flow performs ingress steering and SF return. Public port routing is
+not implemented. Private addressed RIFs report `ACTIVE_ARM_LPM`; public ports
+remain root-miss DROP and report `PENDING_DATAPLANE`.
 No API stub returns a fabricated hardware success.
 
 ## Private gateway ARP through the Arm system SF
@@ -60,13 +60,68 @@ ICMP echo replies whose
 source MAC is the configured RIF MAC; `status` increments `arp_sf_tx_sent` and
 `icmp_sf_tx_sent`, and shows increasing `local_ip_hits`. Then verify ordinary L2 forwarding,
 reject unknown SF source MACs, remove the gateway IP and verify replies stop.
-IPv4 forwarding remains outside this milestone. A successful
-`sendto()` is not delivery proof; the VM capture is authoritative.
+A successful `sendto()` is not delivery proof; the VM capture is authoritative.
 
 For `VM ping gateway`, `ESW_LOCAL_IP` matches `(VS metadata, RIF destination
 MAC, IPv4)` and sends the packet to the Arm RSS queue. The Arm handler validates
 the IPv4 and ICMP checksums, rejects fragments and non-echo traffic, builds the
 echo reply, and reuses `ESW_SF_RETURN` for delivery to the VM.
+
+## IPv4 routing between private vSwitches
+
+An IPv4 packet addressed to the ingress RIF MAC is delivered to Arm by
+`ESW_LOCAL_IP`. The router selects the ingress VR from the vSwitch attachment,
+performs longest-prefix matching across connected and static routes in that VR,
+and chooses the route's egress RIF. Connected routes use the destination IP as
+the next hop; static routes use their configured gateway.
+
+The router learns on-link neighbors from validated ARP requests and replies. On
+a neighbor miss it broadcasts a rate-limited ARP request through the egress
+RIF/VS and drops the current packet. A retry is forwarded after resolution.
+Forwarding rewrites destination/source Ethernet addresses, decrements IPv4 TTL,
+recomputes the IPv4 header checksum, and transmits through the egress VS's
+private SF context. Route miss, TTL expiry, unsupported public egress and
+invalid IPv4 fail closed; ICMP error generation is a later milestone.
+
+```text
+VM-A -> VS-A -> ingress RIF -> Arm LPM -> egress RIF -> SF context -> VS-B -> VM-B
+```
+
+This is a correctness milestone, not hardware LPM: `status` explicitly reports
+`ipv4_routing=arm-lpm`. Moving the same route/adjacency model into per-VR DOCA
+Flow LPM and exact-neighbor pipes is the next acceleration step.
+
+### Two-VM acceptance test
+
+Use the actual DPDK port IDs reported for the two VF representors. The example
+creates VS 100 for VM-A and VS 200 for VM-B, then attaches both networks to VR
+101. Connected `/24` routes are derived from the two interface addresses; no
+static route command is needed.
+
+```sh
+eswitchctl vs-create --id 100
+eswitchctl vs-port-attach --id 100 --port <VM-A-VF-DPDK-port>
+eswitchctl vs-create --id 200
+eswitchctl vs-port-attach --id 200 --port <VM-B-VF-DPDK-port>
+
+eswitchctl vr create --id 101
+eswitchctl vr switch-attach --id 101 --switch-id 100 --name lan-a
+eswitchctl vr switch-attach --id 101 --switch-id 200 --name lan-b
+eswitchctl vr interface set --id 101 --interface lan-a --mac 02:00:00:65:00:01
+eswitchctl vr interface set --id 101 --interface lan-b --mac 02:00:00:65:00:02
+eswitchctl vr ip add --id 101 --interface lan-a --address 192.168.10.1/24
+eswitchctl vr ip add --id 101 --interface lan-b --address 192.168.20.1/24
+eswitchctl vr route show --id 101
+```
+
+Configure VM-A as `192.168.10.10/24` with gateway `192.168.10.1`, and VM-B as
+`192.168.20.10/24` with gateway `192.168.20.1`. First confirm each VM can ping
+its own gateway, then run `ping 192.168.20.10` from VM-A and
+`ping 192.168.10.10` from VM-B. The first routed echo may be lost while the
+router resolves the destination neighbor. Acceptance requires bidirectional
+ping, decremented TTL at the destination, `routed_forwarded` increasing in
+`eswitchctl status`, and no cross-VR forwarding when either vSwitch is attached
+to a different VR.
 
 ## Layout
 
@@ -82,6 +137,8 @@ eswitch_management/
     router_state.c            versioned persistent desired configuration
     router_test.c             model/isolation/persistence tests
     router_icmp.c             validated local ICMP echo reply builder
+    router_forward.c          per-VR IPv4 LPM and forwarding rewrite
+    router_neighbor.c         per-VR/RIF ARP neighbor cache and probe control
 ```
 
 ## Commands implemented

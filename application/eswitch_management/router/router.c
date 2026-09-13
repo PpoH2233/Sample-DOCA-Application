@@ -200,7 +200,7 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
     if(!exists) return error(out,size,"VR not found");
     struct router_interface *rif=interface(c,q.id,q.name);
     if(q.op==SHOW || q.op==ROUTE_SHOW) {
-      size_t used=append(out,size,0,"OK vr=%u dataplane=NOT_IMPLEMENTED\n",q.id);
+      size_t used=append(out,size,0,"OK vr=%u dataplane=ARM_LPM_MVP\n",q.id);
       for(size_t i=0;i<c->interface_count;i++) {
         const struct router_interface *r=&c->interfaces[i]; char ip[INET_ADDRSTRLEN];
         if(r->vr_id!=q.id) continue;
@@ -212,7 +212,8 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           else used=append(out,size,used,"switch=%u ",r->vswitch_id);
           used=append(out,size,used,"mac=%02x:%02x:%02x:%02x:%02x:%02x ",
             r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
-          if(r->has_address) used=append(out,size,used,"address=%s/%u status=PENDING_DATAPLANE arp=%s\n",iptext(r->address,ip),r->prefix,
+          if(r->has_address) used=append(out,size,used,"address=%s/%u status=%s arp=%s\n",iptext(r->address,ip),r->prefix,
+            r->attachment==ROUTER_VSWITCH ? "ACTIVE_ARM_LPM" : "PENDING_DATAPLANE",
             r->attachment==ROUTER_VSWITCH ? "PRIVATE_GATEWAY_ENABLED" : "NOT_IMPLEMENTED");
           else used=append(out,size,used,"address=- status=NO_ADDRESS\n");
         } else if(r->has_address)
@@ -297,6 +298,6 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
     }
   }
   *changed=true;
-  snprintf(out,size,"OK configuration staged; dataplane=NOT_IMPLEMENTED\n");
+  snprintf(out,size,"OK configuration committed; private-vs-dataplane=ARM_LPM public-dataplane=NOT_IMPLEMENTED\n");
   return true;
 }

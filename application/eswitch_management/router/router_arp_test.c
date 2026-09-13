@@ -9,7 +9,7 @@ int main(void) {
   c.interface_count=2;
   c.interfaces[0]=(struct router_interface){.vr_id=101,.vswitch_id=100,
     .attachment=ROUTER_VSWITCH,.has_address=true,.address=0xc0a80001,
-    .mac={2,0,0,0x65,0,1}};
+    .prefix=24,.mac={2,0,0,0x65,0,1}};
   c.interfaces[1]=c.interfaces[0];
   c.interfaces[1].vr_id=102;c.interfaces[1].vswitch_id=200;c.interfaces[1].mac[3]=0x66;
   uint8_t req[60]={
@@ -54,6 +54,15 @@ int main(void) {
   assert(!router_arp_reply(&c,100,req,60,reply,60));
   c.interfaces[0].has_address=true;c.interfaces[0].attachment=ROUTER_PORT;
   assert(!router_arp_reply(&c,100,req,60,reply,60));
+  c.interfaces[0].attachment=ROUTER_VSWITCH;
+  assert(router_arp_request(&c.interfaces[0],0xc0a80032,reply,60)==60);
+  assert(!memcmp(reply,(uint8_t[]){255,255,255,255,255,255},6));
+  assert(!memcmp(reply+6,c.interfaces[0].mac,6));
+  assert(reply[12]==8 && reply[13]==6 && reply[20]==0 && reply[21]==1);
+  assert(!memcmp(reply+22,c.interfaces[0].mac,6));
+  assert(!memcmp(reply+28,(uint8_t[]){192,168,0,1},4));
+  assert(!memcmp(reply+38,(uint8_t[]){192,168,0,50},4));
+  assert(!router_arp_request(&c.interfaces[0],0xc0a80132,reply,60));
   puts("PASS: ARP wire reply, VR isolation, malformed/truncated packets, probes and address removal");
   return 0;
 }
