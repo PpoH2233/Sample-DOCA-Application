@@ -113,6 +113,10 @@ doca_error_t eswitch_pipeline_sf_query_counters(
     const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
     uint64_t *context_packets, uint64_t *local_ip_packets);
 
+/* Query one active SF context entry. */
+doca_error_t eswitch_pipeline_sf_context_query(
+    const struct eswitch_sf_return_context *context, uint64_t *packets);
+
 /* Return-path diagnostics. Counters are cumulative hardware values. */
 doca_error_t eswitch_pipeline_destination_miss_query(
     const struct eswitch_pipeline *pipeline, uint64_t *packets);

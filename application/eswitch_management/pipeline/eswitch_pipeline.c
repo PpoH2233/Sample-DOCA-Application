@@ -690,6 +690,21 @@ doca_error_t eswitch_pipeline_sf_query_counters(
   return DOCA_SUCCESS;
 }
 
+doca_error_t eswitch_pipeline_sf_context_query(
+    const struct eswitch_sf_return_context *context, uint64_t *packets) {
+  struct doca_flow_resource_query query = {0};
+  doca_error_t result;
+
+  if (context == NULL || packets == NULL || !context->active ||
+      context->return_rule.entry == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  result = doca_flow_resource_query_entry(context->return_rule.entry, &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *packets = query.counter.total_pkts;
+  return DOCA_SUCCESS;
+}
+
 doca_error_t eswitch_pipeline_destination_miss_query(
     const struct eswitch_pipeline *pipeline, uint64_t *packets) {
   struct doca_flow_resource_query query = {0};

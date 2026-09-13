@@ -225,8 +225,15 @@ eswitchctl tx-debug
 not match a learned destination. Directed Arm-generated unicast bypasses that
 lookup, while broadcast ARP probes still use it. Each `egress_port` line
 separately counts packets forwarded by that port's gate and packets rejected
-by its split-horizon rule. Capture one output before and one after sending a
-small, known packet burst and compare the deltas.
+by its split-horizon rule. Each `sf_context_tag` line identifies the exact
+private VLAN context programmed for an Arm/SF return path, its vSwitch,
+whether it is a directed or flood context, its target port, and the hardware
+hit count. Capture one output before and one after sending a small, known
+packet burst and compare the deltas. For directed traffic, the selected
+context and its target port's `forward_hits` must increase by the same packet
+count. A context hit without a target-port hit localizes the failure to the
+context-to-egress forwarding chain; a root hit without the expected context
+hit localizes it to the private VLAN classifier.
 
 ### `list-port-available`
 

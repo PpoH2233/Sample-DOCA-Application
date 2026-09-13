@@ -750,6 +750,8 @@ doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
 
 static size_t format_status(const struct eswitch_manager *manager,
                             char *response, size_t size);
+static size_t format_tx_debug(const struct eswitch_manager *manager,
+                              char *response, size_t size);
 
 doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   uint64_t now_ns;
@@ -760,7 +762,7 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   if (manager->arp_seen != manager->tx_snapshot_seen &&
       now_ns - manager->tx_snapshot_ns >= 5000000000ULL) {
     char diagnostic[8192];
-    format_status(manager, diagnostic, sizeof(diagnostic));
+    format_tx_debug(manager, diagnostic, sizeof(diagnostic));
     printf("SF TX DEBUG SNAPSHOT (cumulative; send success is not guest receipt):\n%s",
            diagnostic);
     manager->tx_snapshot_seen = manager->arp_seen;
@@ -944,6 +946,28 @@ static size_t format_tx_debug(const struct eswitch_manager *manager,
     used = append_text(response, size, used,
         "return_path_counter_state=error error=%s\n",
         doca_error_get_descr(result));
+
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    const struct eswitch_sf_return_context *context =
+        &manager->pipeline->sf_return_contexts[i];
+    uint64_t context_hits = 0;
+
+    if (!context->active)
+      continue;
+    result = eswitch_pipeline_sf_context_query(context, &context_hits);
+    if (result != DOCA_SUCCESS) {
+      used = append_text(response, size, used,
+          "sf_context_tag=%u counter_state=error error=%s\n",
+          context->context_tag, doca_error_get_descr(result));
+      continue;
+    }
+    used = append_text(response, size, used,
+        "sf_context_tag=%u vs=%u mode=%s target=%u hits=%" PRIu64 "\n",
+        context->context_tag, context->vswitch_id,
+        context->directed ? "directed" : "flood",
+        context->directed ? context->target_port_id : UINT16_MAX,
+        context_hits);
+  }
 
   for (uint16_t i = 0; i < manager->ports->count; i++) {
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
