@@ -235,6 +235,11 @@ count. A context hit without a target-port hit localizes the failure to the
 context-to-egress forwarding chain; a root hit without the expected context
 hit localizes it to the private VLAN classifier.
 
+The SF return classifier explicitly marks VLAN header 0 as valid before
+matching its TCI. This is required for the private context tag to participate
+in the hardware match; merely filling `eth_vlan[0].tci` does not declare that
+the VLAN header is part of the match format.
+
 ### `list-port-available`
 
 Lists unassigned DPDK ports.

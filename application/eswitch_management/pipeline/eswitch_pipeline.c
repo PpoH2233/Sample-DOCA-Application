@@ -464,7 +464,6 @@ static doca_error_t create_ingress_classifier(
 static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
-  struct doca_flow_match mask = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
   struct doca_flow_monitor monitor = {0};
@@ -472,8 +471,11 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_DROP};
   doca_error_t result;
 
+  /* eth_vlan[] is ignored unless the corresponding valid-header bit is set.
+   * Without it every context entry has an effective wildcard match; the most
+   * recently installed entry then captures packets for the older tags. */
+  match.outer.l2_valid_headers = DOCA_FLOW_L2_VALID_HEADER_VLAN_0;
   match.outer.eth_vlan[0].tci = UINT16_MAX;
-  mask.outer.eth_vlan[0].tci = UINT16_MAX;
   actions.pop_vlan = true;
   memset(actions.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   actions.meta.pkt_meta = UINT32_MAX;
@@ -484,7 +486,7 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
   result = set_pipe_identity(cfg, "ESW_SF_RETURN", DOCA_FLOW_PIPE_BASIC,
                              false, ESWITCH_MAX_SF_RETURN_CONTEXTS);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
   if (result == DOCA_SUCCESS)
@@ -543,6 +545,8 @@ static doca_error_t bind_sf_return_context(
   }
 
   *context_tag = (uint16_t)(free_context - pipeline->sf_return_contexts) + 1;
+  return_match.outer.l2_valid_headers =
+      DOCA_FLOW_L2_VALID_HEADER_VLAN_0;
   return_match.outer.eth_vlan[0].tci = DOCA_HTOBE16(*context_tag);
   memcpy(actions.outer.eth.src_mac, rif_mac, 6);
   actions.meta.pkt_meta = DOCA_HTOBE32(
