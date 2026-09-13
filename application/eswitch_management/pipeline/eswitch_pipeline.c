@@ -199,6 +199,8 @@ static doca_error_t create_destination_pipe(struct eswitch_pipeline *pipeline) {
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
   if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
+  if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, &fwd, &miss,
                                    &pipeline->destination_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
@@ -642,6 +644,54 @@ doca_error_t eswitch_pipeline_sf_query_counters(
   return DOCA_SUCCESS;
 }
 
+doca_error_t eswitch_pipeline_destination_miss_query(
+    const struct eswitch_pipeline *pipeline, uint64_t *packets) {
+  struct doca_flow_resource_query query = {0};
+  doca_error_t result;
+
+  if (pipeline == NULL || packets == NULL || !pipeline->created ||
+      pipeline->destination_pipe == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+
+  result = doca_flow_resource_query_pipe_miss(pipeline->destination_pipe,
+                                              &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *packets = query.counter.total_pkts;
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_egress_query(
+    const struct eswitch_pipeline *pipeline, uint16_t port_id,
+    uint64_t *forward_packets, uint64_t *split_horizon_drops) {
+  struct doca_flow_resource_query query = {0};
+  const struct eswitch_egress_gate *gate;
+  int port_index;
+  doca_error_t result;
+
+  if (pipeline == NULL || forward_packets == NULL ||
+      split_horizon_drops == NULL || !pipeline->created)
+    return DOCA_ERROR_INVALID_VALUE;
+  port_index = find_port_index(pipeline, port_id);
+  if (port_index < 0)
+    return DOCA_ERROR_NOT_FOUND;
+  gate = &pipeline->egress_gates[port_index];
+  if (gate->pipe == NULL || gate->forward.entry == NULL ||
+      gate->drop_self.entry == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+
+  result = doca_flow_resource_query_entry(gate->forward.entry, &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *forward_packets = query.counter.total_pkts;
+  memset(&query, 0, sizeof(query));
+  result = doca_flow_resource_query_entry(gate->drop_self.entry, &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *split_horizon_drops = query.counter.total_pkts;
+  return DOCA_SUCCESS;
+}
+
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      struct eswitch_pipeline *pipeline) {
@@ -776,6 +826,8 @@ static doca_error_t create_egress_gate(struct eswitch_pipeline *pipeline,
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
   struct doca_flow_fwd fwd = {0};
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
   char name[64];
   uint16_t port_id = pipeline->ports->items[port_index].ethernet->port_id;
   doca_error_t result;
@@ -803,7 +855,7 @@ static doca_error_t create_egress_gate(struct eswitch_pipeline *pipeline,
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, gate->pipe, &match, &mask, NULL, NULL,
-      NULL, NULL, NULL, 0, &fwd, &gate->drop_self.cookie,
+      NULL, NULL, &monitor, 0, &fwd, &gate->drop_self.cookie,
       &gate->drop_self.entry);
   if (result != DOCA_SUCCESS)
     goto fail;
@@ -819,7 +871,7 @@ static doca_error_t create_egress_gate(struct eswitch_pipeline *pipeline,
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, gate->pipe, &match, NULL, NULL, NULL,
-      NULL, NULL, NULL, 1, &fwd, &gate->forward.cookie,
+      NULL, NULL, &monitor, 1, &fwd, &gate->forward.cookie,
       &gate->forward.entry);
   if (result != DOCA_SUCCESS)
     goto fail;

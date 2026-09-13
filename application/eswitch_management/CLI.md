@@ -209,6 +209,24 @@ FDB entries: total=2 filter-vs=selected
 vs=100 mac=02:00:00:00:00:0a port=1 packets=42
 ```
 
+The `packets` value is the learned source-guard counter used for aging. It is
+not the destination-FDB hit count.
+
+### `tx-debug`
+
+Shows the normal service status followed by cumulative hardware counters for
+the Arm/SF return path:
+
+```bash
+eswitchctl tx-debug
+```
+
+`destination_fdb_misses` counts packets which reached `ESW_DEST_FDB` but did
+not match a learned destination. Each `egress_port` line separately counts
+packets forwarded by that port's gate and packets rejected by its
+split-horizon rule. Capture one output before and one after sending a small,
+known packet burst and compare the deltas.
+
 ### `list-port-available`
 
 Lists unassigned DPDK ports.

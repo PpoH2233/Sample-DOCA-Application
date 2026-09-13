@@ -899,6 +899,47 @@ static size_t format_status(const struct eswitch_manager *manager,
   return used;
 }
 
+static size_t format_tx_debug(const struct eswitch_manager *manager,
+                              char *response, size_t size) {
+  size_t used = format_status(manager, response, size);
+  uint64_t destination_misses = 0;
+  doca_error_t result = eswitch_pipeline_destination_miss_query(
+      manager->pipeline, &destination_misses);
+
+  if (result == DOCA_SUCCESS)
+    used = append_text(response, size, used,
+        "return_path_counter_state=ready destination_fdb_misses=%" PRIu64
+        "\n", destination_misses);
+  else
+    used = append_text(response, size, used,
+        "return_path_counter_state=error error=%s\n",
+        doca_error_get_descr(result));
+
+  for (uint16_t i = 0; i < manager->ports->count; i++) {
+    const struct ethernet_port *port = manager->ports->items[i].ethernet;
+    uint64_t forward_hits = 0;
+    uint64_t split_horizon_drops = 0;
+
+    result = eswitch_pipeline_egress_query(
+        manager->pipeline, port->port_id, &forward_hits,
+        &split_horizon_drops);
+    if (result == DOCA_ERROR_NOT_FOUND)
+      continue;
+    if (result != DOCA_SUCCESS) {
+      used = append_text(response, size, used,
+          "egress_port=%u counter_state=error error=%s\n", port->port_id,
+          doca_error_get_descr(result));
+      continue;
+    }
+    used = append_text(response, size, used,
+        "egress_port=%u owner_vs=%u forward_hits=%" PRIu64
+        " split_horizon_drops=%" PRIu64 "\n",
+        port->port_id, manager->port_owner[i], forward_hits,
+        split_horizon_drops);
+  }
+  return used;
+}
+
 static size_t format_vswitches(const struct eswitch_manager *manager,
                                char *response, size_t size) {
   size_t used = append_text(response, size, 0, "OK\n");
@@ -989,7 +1030,7 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     (void)format_status(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "tx-debug") == 0 && argument_count == 0) {
-    (void)format_status(manager, response, response_size);
+    (void)format_tx_debug(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
     (void)format_vswitches(manager, response, response_size);

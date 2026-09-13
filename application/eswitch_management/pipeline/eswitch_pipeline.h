@@ -105,6 +105,13 @@ doca_error_t eswitch_pipeline_sf_query_counters(
     const struct eswitch_pipeline *pipeline, uint64_t *ingress_packets,
     uint64_t *context_packets, uint64_t *local_ip_packets);
 
+/* Return-path diagnostics. Counters are cumulative hardware values. */
+doca_error_t eswitch_pipeline_destination_miss_query(
+    const struct eswitch_pipeline *pipeline, uint64_t *packets);
+doca_error_t eswitch_pipeline_egress_query(
+    const struct eswitch_pipeline *pipeline, uint16_t port_id,
+    uint64_t *forward_packets, uint64_t *split_horizon_drops);
+
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      struct eswitch_pipeline *pipeline);
