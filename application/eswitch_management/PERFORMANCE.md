@@ -39,6 +39,9 @@ The HWS action-memory reservation now adds the LPM requirement to the existing
 The LPM constructor retries smaller power-of-two capacities on resource
 exhaustion and falls back to the existing Arm dataplane if hardware routing
 cannot be admitted, so this optional optimization no longer prevents startup.
+The VR exact-match dimension uses `meta.u32[1]`, the metadata field supported
+for combined EM+LPM matching by BF3/DOCA Flow; `pkt_meta` remains dedicated to
+the existing vSwitch and ingress-port identity.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The

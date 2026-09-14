@@ -412,7 +412,9 @@ static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
 
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   match.outer.ip4.dst_ip = UINT32_MAX;
-  mask.meta.u32[0] = UINT32_MAX; /* exact VR routing domain */
+  /* DOCA Flow LPM permits its exact-match companion key in meta.u32[1].
+   * meta.u32[0] is not a supported LPM EM field on BF3/DOCA 3.4. */
+  mask.meta.u32[1] = UINT32_MAX;
   memset(actions.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   memset(actions.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
@@ -577,7 +579,7 @@ static doca_error_t add_route_eligible_rule(
   condition.field_op.b.field_string = NULL;
   condition.field_op.b.bit_offset = 0;
   condition.field_op.width = 8;
-  actions.meta.u32[0] = DOCA_HTOBE32(context->vr_id);
+  actions.meta.u32[1] = DOCA_HTOBE32(context->vr_id);
 
   flow_entry_cookie_prepare(&context->route_eligible_rule.cookie,
                             "private IPv4 hardware eligibility",
@@ -1291,10 +1293,10 @@ static doca_error_t add_hw_route(struct eswitch_pipeline *pipeline,
   result = get_egress_gate(pipeline, spec->target_port_id, &gate);
   if (result != DOCA_SUCCESS)
     return result;
-  match.meta.u32[0] = DOCA_HTOBE32(spec->vr_id);
+  match.meta.u32[1] = DOCA_HTOBE32(spec->vr_id);
   /* The IP mask is variable per prefix, while the VR dimension must always
    * remain an exact part of every LPM key. */
-  match_mask.meta.u32[0] = UINT32_MAX;
+  match_mask.meta.u32[1] = UINT32_MAX;
   match.outer.ip4.dst_ip = DOCA_HTOBE32(spec->prefix);
   match_mask.outer.ip4.dst_ip = DOCA_HTOBE32(
       ipv4_prefix_mask(spec->length));
