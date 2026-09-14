@@ -59,6 +59,12 @@ static void print_inventory(const struct ethernet_ports *ports) {
   printf("\n");
 }
 
+static bool env_enabled(const char *name) {
+  const char *value = getenv(name);
+  return value != NULL && (strcmp(value, "1") == 0 ||
+      strcmp(value, "true") == 0 || strcmp(value, "on") == 0);
+}
+
 int main(int argc, char **argv) {
   struct switch_devices devices = {0};
   struct dpdk_io io = {0};
@@ -75,6 +81,8 @@ int main(int argc, char **argv) {
   doca_error_t result;
   doca_error_t ct_capability;
   bool hardware_ct_supported = false;
+  bool hardware_routing_enabled = env_enabled("ESWITCH_HW_ROUTING");
+  bool packet_debug = env_enabled("ESWITCH_PACKET_DEBUG");
   int separator;
   int exit_status = EXIT_FAILURE;
 
@@ -155,7 +163,10 @@ int main(int argc, char **argv) {
   }
   printf("TX DOMAIN: parent=%u lookup=explicit-parent revision=%s\n",
          flow_ports.items[0].ethernet->port_id, ESWITCH_TX_REVISION);
-  result = eswitch_pipeline_create(&runtime, &flow_ports, &pipeline);
+  printf("HARDWARE ROUTING: configured=%s scope=private-vs-ipv4\n",
+         hardware_routing_enabled ? "enabled" : "disabled");
+  result = eswitch_pipeline_create(&runtime, &flow_ports,
+                                   hardware_routing_enabled, &pipeline);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to create eSwitch pipeline: %s\n",
             doca_error_get_descr(result));
@@ -169,6 +180,7 @@ int main(int argc, char **argv) {
   }
   result = eswitch_manager_init(&io, &flow_ports, &pipeline, &sf_io,
                                 hardware_ct_supported,
+                                packet_debug,
                                 state_path, &manager);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize eSwitch manager: %s\n",

@@ -39,6 +39,7 @@ struct eswitch_manager {
   struct router_neighbor_table neighbors;
   struct router_nat_table *nat;
   bool hardware_ct_supported;
+  bool packet_debug;
   uint64_t routed_seen, routed_forwarded, route_no_route;
   uint64_t route_ttl_expired, route_invalid, route_neighbor_misses;
   uint64_t route_arp_probes, route_tx_drops;
@@ -56,11 +57,14 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct eswitch_pipeline *pipeline,
                                   struct sf_packet_io *sf_io,
                                   bool hardware_ct_supported,
+                                  bool packet_debug,
                                   const char *state_path,
                                   struct eswitch_manager *manager);
 doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
                                           bool *did_work);
 doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager);
+doca_error_t eswitch_manager_hw_routes_sync(
+    struct eswitch_manager *manager, const struct router_config *config);
 doca_error_t eswitch_manager_command(const char *request, char *response,
                                      size_t response_size, void *context);
 doca_error_t eswitch_manager_destroy(struct eswitch_manager *manager);

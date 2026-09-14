@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 bool router_control_port_reserved(const struct eswitch_manager *m,uint16_t index) {
   if(!m->router || index>=m->ports->count) return false;
@@ -53,6 +54,37 @@ static const struct router_interface *port_interface_at(
 }
 static bool state_path(const struct eswitch_manager *m,char *out,size_t size) {
   return snprintf(out,size,"%s.router",m->state_path)<(int)size;
+}
+
+static const struct router_interface *interface_by_id(
+    const struct router_config *config,uint16_t interface_id) {
+  for(size_t i=0;i<config->interface_count;i++)
+    if(config->interfaces[i].interface_id==interface_id)
+      return &config->interfaces[i];
+  return NULL;
+}
+
+/* Remove selectors for a changed private RIF before publishing its new MAC or
+ * address. A later ARP request recreates the local and hardware-eligibility
+ * entries from the committed configuration. */
+static doca_error_t invalidate_changed_private_rifs(
+    struct eswitch_manager *m,const struct router_config *candidate) {
+  for(size_t i=0;i<m->router->interface_count;i++) {
+    const struct router_interface *before=&m->router->interfaces[i];
+    const struct router_interface *after;
+    if(before->attachment!=ROUTER_VSWITCH) continue;
+    after=interface_by_id(candidate,before->interface_id);
+    if(after!=NULL && after->attachment==ROUTER_VSWITCH &&
+       after->vr_id==before->vr_id && after->vswitch_id==before->vswitch_id &&
+       after->has_address==before->has_address &&
+       after->address==before->address && after->prefix==before->prefix &&
+       memcmp(after->mac,before->mac,6)==0)
+      continue;
+    doca_error_t result=eswitch_pipeline_sf_unbind_vswitch(
+        m->pipeline,before->vswitch_id);
+    if(result!=DOCA_SUCCESS) return result;
+  }
+  return DOCA_SUCCESS;
 }
 doca_error_t router_control_restore(struct eswitch_manager *m) {
   char path[PATH_MAX],error[256];
@@ -126,6 +158,22 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       }
     }
     if(ok) {
+      doca_error_t result=invalidate_changed_private_rifs(m,candidate);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR private RIF invalidation failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
+      doca_error_t result=eswitch_manager_hw_routes_sync(m,candidate);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR hardware route transaction failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
       if(!state_path(m,path,sizeof(path))) {
         snprintf(out,size,"ERR router state path too long\n");ok=false;
       } else ok=router_config_save(path,candidate,out,size);
@@ -140,6 +188,7 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       *m->router=*candidate;
     }
     else {
+      (void)eswitch_manager_hw_routes_sync(m,m->router);
       if(added>=0) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
       if(removed>=0) (void)eswitch_pipeline_attach_router_port(
           m->pipeline,(uint16_t)removed,removed_vr);

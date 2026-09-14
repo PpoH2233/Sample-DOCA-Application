@@ -44,6 +44,7 @@ executable(
     'router/router_forward.c',
     'router/router_icmp.c',
     'router/router_neighbor.c',
+    'router/router_hw.c',
     'router/router_nat.c',
     'router/router_state.c',
     'router/router_control.c',
@@ -124,3 +125,16 @@ nat_test = executable(
   install: false,
 )
 test('eswitch-router-nat', nat_test)
+
+hw_plan_test = executable(
+  'eswitch-router-hw-test',
+  [
+    'router/router_hw_test.c',
+    'router/router_hw.c',
+    'router/router_neighbor.c',
+    'router/router.c',
+  ],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-hw', hw_plan_test)

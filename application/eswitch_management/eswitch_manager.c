@@ -18,6 +18,7 @@
 #include "../ethernet_switch/switch_config.h"
 #include "eswitch_state.h"
 #include "router/router_control.h"
+#include "router/router_hw.h"
 #include "router/router_arp.h"
 #include "router/router_forward.h"
 #include "router/router_icmp.h"
@@ -121,8 +122,21 @@ static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
                                            uint16_t vswitch_id,
                                            const uint8_t rif_mac[6],
                                            uint16_t *context_tag) {
+  const struct router_interface *rif = NULL;
+  for (size_t i = 0; manager->router != NULL &&
+                     i < manager->router->interface_count; i++) {
+    const struct router_interface *candidate = &manager->router->interfaces[i];
+    if (candidate->attachment == ROUTER_VSWITCH &&
+        candidate->vswitch_id == vswitch_id && candidate->has_address) {
+      rif = candidate;
+      break;
+    }
+  }
+  if (rif == NULL)
+    return DOCA_ERROR_NOT_FOUND;
   doca_error_t result = eswitch_pipeline_sf_bind_vswitch(
-      manager->pipeline, vswitch_id, rif_mac, context_tag);
+      manager->pipeline, rif->vr_id, vswitch_id, rif->address, rif_mac,
+      context_tag);
 
   if (result != DOCA_ERROR_BAD_STATE)
     return result;
@@ -130,7 +144,8 @@ static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
   if (result != DOCA_SUCCESS)
     return result;
   result = eswitch_pipeline_sf_bind_vswitch(
-      manager->pipeline, vswitch_id, rif_mac, context_tag);
+      manager->pipeline, rif->vr_id, vswitch_id, rif->address, rif_mac,
+      context_tag);
   if (result == DOCA_SUCCESS)
     printf("SF RETURN REBIND: vs=%u context-vlan=%u\n", vswitch_id,
            *context_tag);
@@ -353,6 +368,7 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct eswitch_pipeline *pipeline,
                                   struct sf_packet_io *sf_io,
                                   bool hardware_ct_supported,
+                                  bool packet_debug,
                                   const char *state_path,
                                   struct eswitch_manager *manager) {
   doca_error_t result;
@@ -380,6 +396,7 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   manager->pipeline = pipeline;
   manager->sf_io = sf_io;
   manager->hardware_ct_supported = hardware_ct_supported;
+  manager->packet_debug = packet_debug;
   if (snprintf(manager->state_path, sizeof(manager->state_path), "%s",
                state_path) >= (int)sizeof(manager->state_path)) {
     free(manager->port_owner);
@@ -404,9 +421,44 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   result = restore_manager(manager);
   if (result == DOCA_SUCCESS)
     result = router_control_restore(manager);
+  if (result == DOCA_SUCCESS)
+    result = eswitch_manager_hw_routes_sync(manager, manager->router);
   if (result != DOCA_SUCCESS)
     fprintf(stderr, "Failed to restore eSwitch configuration %s: %s\n",
             manager->state_path, doca_error_get_descr(result));
+  return result;
+}
+
+doca_error_t eswitch_manager_hw_routes_sync(
+    struct eswitch_manager *manager, const struct router_config *config) {
+  struct router_hw_route *routes;
+  size_t route_count;
+  doca_error_t result;
+
+  if (manager == NULL || config == NULL || manager->pipeline == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (!manager->pipeline->hardware_routing_enabled)
+    return DOCA_SUCCESS;
+  routes = calloc(ROUTER_HW_MAX_ROUTES, sizeof(*routes));
+  if (routes == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  route_count = router_hw_routes_build(config, &manager->neighbors,
+                                       monotonic_ns(), routes,
+                                       ROUTER_HW_MAX_ROUTES);
+  /* A neighbor is useful only while its VF remains owned by the expected VS.
+   * This closes the stale-adjacency window across port moves. */
+  for (size_t i = 0; i < route_count;) {
+    int index = find_port_index(manager, routes[i].target_port_id);
+    if (index >= 0 && manager->port_owner[index] ==
+                          routes[i].egress_vswitch_id) {
+      i++;
+      continue;
+    }
+    routes[i] = routes[--route_count];
+  }
+  result = eswitch_pipeline_hw_routes_sync(manager->pipeline, routes,
+                                            route_count);
+  free(routes);
   return result;
 }
 
@@ -415,7 +467,9 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
                               uint16_t ingress, uint64_t now_ns) {
   uint8_t scratch[42], response[60];
   uint16_t context_tag = 0;
-  bool debug = manager->arp_seen < 3 || now_ns - manager->tx_log_ns >= 1000000000ULL;
+  bool debug = manager->packet_debug &&
+               (manager->arp_seen < 3 ||
+                now_ns - manager->tx_log_ns >= 1000000000ULL);
   if (manager->arp_seen == manager->tx_snapshot_seen)
     manager->tx_snapshot_ns = now_ns;
   manager->arp_seen++;
@@ -548,8 +602,9 @@ static void reply_gateway_icmp(struct eswitch_manager *manager,
     goto out;
   }
   manager->icmp_replies++;
-  printf("ICMP ECHO SF TX SENT: vs=%u port=%u context-vlan=%u len=%zu\n",
-         vs, ingress, context_tag, response_length);
+  if (manager->packet_debug)
+    printf("ICMP ECHO SF TX SENT: vs=%u port=%u context-vlan=%u len=%zu\n",
+           vs, ingress, context_tag, response_length);
   goto out;
 
 ignored:
@@ -602,13 +657,14 @@ static void send_route_neighbor_probe(
     return;
   }
   manager->route_arp_probes++;
-  printf("ROUTE ARP PROBE: vr=%u rif=%u attachment=%s vs=%u target=%u.%u.%u.%u "
-         "context-vlan=%u\n",
-         egress->vr_id, egress->interface_id,
-         egress->attachment == ROUTER_PORT ? "port" : "vs",
-         egress->vswitch_id,
-         (target_ip >> 24) & 0xffU, (target_ip >> 16) & 0xffU,
-         (target_ip >> 8) & 0xffU, target_ip & 0xffU, context_tag);
+  if (manager->packet_debug)
+    printf("ROUTE ARP PROBE: vr=%u rif=%u attachment=%s vs=%u "
+           "target=%u.%u.%u.%u context-vlan=%u\n",
+           egress->vr_id, egress->interface_id,
+           egress->attachment == ROUTER_PORT ? "port" : "vs",
+           egress->vswitch_id,
+           (target_ip >> 24) & 0xffU, (target_ip >> 16) & 0xffU,
+           (target_ip >> 8) & 0xffU, target_ip & 0xffU, context_tag);
 }
 
 static bool validate_route_neighbor(
@@ -710,7 +766,7 @@ static void reply_uplink_arp(struct eswitch_manager *manager,
     return;
   }
   manager->arp_replies++;
-  if (debug)
+  if (debug && manager->packet_debug) {
     printf("UPLINK ARP TX: vr=%u rif=%u port=%u address=%u.%u.%u.%u "
            "context-vlan=%u\n",
            ingress->vr_id, ingress->interface_id, ingress_port,
@@ -718,6 +774,7 @@ static void reply_uplink_arp(struct eswitch_manager *manager,
            (ingress->address >> 16) & 0xffU,
            (ingress->address >> 8) & 0xffU, ingress->address & 0xffU,
            context_tag);
+  }
 }
 
 static void route_ipv4_packet(struct eswitch_manager *manager,
@@ -854,7 +911,8 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
     goto out;
   }
   manager->routed_forwarded++;
-  printf("ROUTE TX: vr=%u ingress-rif=%u egress-rif=%u attachment=%s "
+  if (manager->packet_debug)
+    printf("ROUTE TX: vr=%u ingress-rif=%u egress-rif=%u attachment=%s "
          "egress-vs=%u prefix=/%u next-hop=%u.%u.%u.%u "
          "context-vlan=%u len=%zu\n",
          decision.vr_id, decision.ingress_interface_id,
@@ -865,7 +923,7 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
          (decision.next_hop_ip >> 16) & 0xffU,
          (decision.next_hop_ip >> 8) & 0xffU,
          decision.next_hop_ip & 0xffU, context_tag, output_length);
-  if (nat_session != NULL)
+  if (nat_session != NULL && manager->packet_debug) {
     printf("NAT OUT: vr=%u proto=%u inside=%u.%u.%u.%u:%u "
            "public=%u.%u.%u.%u:%u remote=%u.%u.%u.%u:%u\n",
            nat_session->vr_id, nat_session->protocol,
@@ -881,6 +939,7 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
            (nat_session->remote_ip >> 16) & 0xffU,
            (nat_session->remote_ip >> 8) & 0xffU,
            nat_session->remote_ip & 0xffU, nat_session->remote_port);
+  }
 out:
   free(output);
   free(translated);
@@ -984,7 +1043,8 @@ static void route_uplink_ipv4_packet(
     goto out;
   }
   manager->routed_forwarded++;
-  printf("NAT IN: vr=%u ingress-port=%u public=%u.%u.%u.%u:%u "
+  if (manager->packet_debug)
+    printf("NAT IN: vr=%u ingress-port=%u public=%u.%u.%u.%u:%u "
          "inside=%u.%u.%u.%u:%u vs=%u port=%u context-vlan=%u len=%zu\n",
          ingress->vr_id, ingress_port,
          (session->public_ip >> 24) & 0xffU,
@@ -1033,7 +1093,8 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
     return DOCA_SUCCESS; /* v1 is one untagged bridge domain per vSwitch. */
 
   if (uplink != NULL) {
-    printf("ARM RX: vr=%u uplink-rif=%u port=%u len=%u "
+    if (manager->packet_debug)
+      printf("ARM RX: vr=%u uplink-rif=%u port=%u len=%u "
            "src=%02x:%02x:%02x:%02x:%02x:%02x "
            "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
            domain_id, uplink->interface_id, port_id,
@@ -1052,13 +1113,19 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
       if (arp != NULL && router_neighbor_learn_arp_interface(
                              &manager->neighbors, manager->router,
                              uplink->interface_id, port_id, arp,
-                             sizeof(arp_scratch), now_ns))
-        printf("UPLINK NEIGHBOR LEARN: vr=%u rif=%u port=%u "
+                             sizeof(arp_scratch), now_ns)) {
+        if (manager->packet_debug)
+          printf("UPLINK NEIGHBOR LEARN: vr=%u rif=%u port=%u "
                "ip=%u.%u.%u.%u mac="
                "%02x:%02x:%02x:%02x:%02x:%02x\n",
                uplink->vr_id, uplink->interface_id, port_id, arp[28], arp[29],
                arp[30], arp[31], arp[22], arp[23], arp[24], arp[25], arp[26],
                arp[27]);
+        result = eswitch_manager_hw_routes_sync(manager, manager->router);
+        if (result != DOCA_SUCCESS)
+          fprintf(stderr, "Hardware route sync after uplink ARP failed: %s\n",
+                  doca_error_get_descr(result));
+      }
       reply_uplink_arp(manager, packet, uplink, port_id, now_ns);
     } else if (header->ether_type ==
                rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
@@ -1074,7 +1141,8 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
         memcmp(header->src_addr.addr_bytes, rif->mac, 6) == 0)
       return DOCA_SUCCESS;
   }
-  printf("ARM RX: vs=%u port=%u len=%u src=%02x:%02x:%02x:%02x:%02x:%02x "
+  if (manager->packet_debug)
+    printf("ARM RX: vs=%u port=%u len=%u src=%02x:%02x:%02x:%02x:%02x:%02x "
          "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
          domain_id, port_id, rte_pktmbuf_pkt_len(packet),
          header->src_addr.addr_bytes[0], header->src_addr.addr_bytes[1],
@@ -1098,11 +1166,17 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
     if (arp != NULL && router_neighbor_learn_arp(
                            &manager->neighbors, manager->router,
                            domain_id, port_id, arp, sizeof(arp_scratch),
-                           now_ns))
-      printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
+                           now_ns)) {
+      if (manager->packet_debug)
+        printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
              "%02x:%02x:%02x:%02x:%02x:%02x\n",
              domain_id, port_id, arp[28], arp[29], arp[30], arp[31],
              arp[22], arp[23], arp[24], arp[25], arp[26], arp[27]);
+      result = eswitch_manager_hw_routes_sync(manager, manager->router);
+      if (result != DOCA_SUCCESS)
+        fprintf(stderr, "Hardware route sync after private ARP failed: %s\n",
+                doca_error_get_descr(result));
+    }
     reply_gateway_arp(manager, packet, domain_id, port_id, now_ns);
   } else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
     route_ipv4_packet(manager, packet, domain_id, port_id, now_ns);
@@ -1146,7 +1220,8 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   if (manager == NULL || !manager->initialized)
     return DOCA_ERROR_INVALID_VALUE;
   now_ns = monotonic_ns();
-  if (manager->arp_seen != manager->tx_snapshot_seen &&
+  if (manager->packet_debug &&
+      manager->arp_seen != manager->tx_snapshot_seen &&
       now_ns - manager->tx_snapshot_ns >= 5000000000ULL) {
     char diagnostic[8192];
     format_tx_debug(manager, diagnostic, sizeof(diagnostic));
@@ -1161,6 +1236,12 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
       (uint64_t)SWITCH_AGING_SCAN_SECONDS * 1000000000ULL;
   router_neighbor_age(&manager->neighbors, now_ns);
   router_nat_age(manager->nat, now_ns);
+  {
+    doca_error_t result = eswitch_manager_hw_routes_sync(manager,
+                                                          manager->router);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
   return eswitch_fdb_age(&manager->fdb, now_ns);
 }
 
@@ -1229,7 +1310,9 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
+  uint64_t hw_lpm_misses = 0;
   doca_error_t sf_counter_result;
+  doca_error_t hw_counter_result;
   uint64_t uptime = (monotonic_ns() - manager->started_ns) / 1000000000ULL;
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
@@ -1252,6 +1335,8 @@ static size_t format_status(const struct eswitch_manager *manager,
   sf_counter_result = eswitch_pipeline_sf_query_counters(
       manager->pipeline, &sf_ingress_hits, &sf_context_hits,
       &local_ip_hits);
+  hw_counter_result = eswitch_pipeline_hw_route_stats(manager->pipeline,
+                                                       &hw_lpm_misses);
   used = append_text(response, size, used, "OK\n");
   used = append_text(response, size, used,
                      "service=eSwitch Management state=running uptime=%" PRIu64
@@ -1264,6 +1349,9 @@ static size_t format_status(const struct eswitch_manager *manager,
       ESWITCH_TX_REVISION, ESWITCH_TX_FLOW_MODE,
       manager->sf_io->interface_name, manager->pipeline->sf_port_id);
   used = append_text(response, size, used,
+                     "packet_debug=%s\n",
+                     manager->packet_debug ? "enabled" : "disabled");
+  used = append_text(response, size, used,
                      "ports=%u assignable=%zu assigned=%zu available=%zu "
                      "vswitches=%zu fdb=%zu\n",
                      manager->ports->count, assignable_port_count,
@@ -1272,8 +1360,26 @@ static size_t format_status(const struct eswitch_manager *manager,
                      manager->fdb.count);
   used = append_text(response, size, used,
                      "routers=%zu "
-                     "router_dataplane=GATEWAY_ARP_ICMP_ARM_LPM_NAT44\n",
-                     manager->router ? manager->router->vr_count : 0);
+                     "router_dataplane=%s\n",
+                     manager->router ? manager->router->vr_count : 0,
+                     manager->pipeline->hardware_routing_enabled
+                         ? "DOCA_FLOW_LPM_PRIVATE_PLUS_ARM_SLOWPATH_NAT44"
+                         : "GATEWAY_ARP_ICMP_ARM_LPM_NAT44");
+  used = append_text(response, size, used,
+      "hw_routing_configured=%s hw_state=%s hw_scope=private-vs-ipv4 "
+      "hw_routes=%zu promotions=%" PRIu64 " updates=%" PRIu64
+      " removals=%" PRIu64 " failures=%" PRIu64
+      " lpm_misses=%" PRIu64 " counter_state=%s\n",
+      manager->pipeline->hardware_routing_enabled ? "enabled" : "disabled",
+      !manager->pipeline->hardware_routing_enabled ? "off" :
+          (manager->pipeline->hardware_routing_degraded ? "degraded" :
+                                                         "ready"),
+      manager->pipeline->hw_route_count,
+      manager->pipeline->hw_route_promotions,
+      manager->pipeline->hw_route_updates,
+      manager->pipeline->hw_route_removals,
+      manager->pipeline->hw_route_failures, hw_lpm_misses,
+      hw_counter_result == DOCA_SUCCESS ? "ready" : "error");
   used = append_text(response, size, used,
       "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
       "hw_ct_state=NOT_INITIALIZED\n",

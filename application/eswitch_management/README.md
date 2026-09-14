@@ -6,8 +6,9 @@ test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
 `pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
 Router commands persist desired configuration. Addressed private vs-link RIFs
 support gateway ARP, local ICMP and Arm longest-prefix routing between private
-vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active;
-hardware LPM and CT are not implemented.
+vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
+Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
+hardware CT/NAT is not implemented.
 The default VF scope is now `7-15`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
 /build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported
@@ -25,6 +26,17 @@ DROP miss action, so an unassigned VF or uplink cannot exchange traffic through
 this application. A port belongs to at most one virtual switch.
 
 ## Data path
+
+With `ESWITCH_HW_ROUTING=1`, packets addressed to a private RIF MAC first
+separate local router IPs from transit traffic. Valid unfragmented IPv4 with a
+20-byte header and TTL greater than one enters a VR-keyed hardware LPM table.
+Resolved private adjacencies rewrite source/destination MAC, decrement TTL and
+forward directly through the target egress gate. LPM misses, unresolved
+neighbors, options, fragments, invalid checksums, TTL exceptions, public
+uplinks and every NAT flow continue to the existing Arm slow path. The default
+is `0` until the target BF3 passes the smoke test below.
+Successful per-packet traces are disabled by default; set
+`ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
 
 ```text
 endpoint
@@ -186,6 +198,7 @@ its default scope; a deployment may override it without rebuilding:
 sudo docker run ... \
   --env ESWITCH_VF_SCOPE='10-20' \
   --env ESWITCH_SF_IFACE='enp3s0f0s0' \
+  --env ESWITCH_HW_ROUTING='1' \
   eswitch-management:3.4.0 -l 0 -- 03:00.0
 ```
 
@@ -250,6 +263,28 @@ to a private RIF and delivered to the Arm handler; `icmp_sf_tx_sent` confirms
 that a validated echo reply was submitted through the SF return path. The
 `ipv4_routing=arm-lpm` line reports routed packets, route failures, neighbor
 misses, ARP probes, and successful routed transmissions.
+
+The `hw_routing_configured` status line reports active LPM entries,
+promotions, in-place adjacency updates, removals, failures and LPM misses.
+For a steady inter-VS flow, the egress hardware counter must increase while
+`routed_seen` stops increasing. Verify rollout on the BF3 with:
+
+```bash
+# Baseline behavior is unchanged.
+ESWITCH_HW_ROUTING=0 /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
+
+# After stopping the baseline instance, enable the experimental fast path.
+ESWITCH_HW_ROUTING=1 /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
+/build/eswitch-management/eswitchctl status | grep -E 'hw_routing|routed_seen'
+/build/eswitch-management/eswitchctl tx-debug | grep -E 'egress_port|hw_routing'
+```
+
+Test gateway ARP/ICMP, bidirectional inter-VS ping and TCP/UDP, then NAT curl
+and NAT ICMP. The first packet may use Arm while ARP resolves; subsequent
+eligible private traffic must use hardware. Change a neighbor MAC, detach and
+reattach a VF, edit a RIF MAC and remove a route; stale hardware forwarding
+must disappear. Fragments, IPv4 options and TTL 1 must still reach the slow
+path. Do not enable this flag in production until those hardware checks pass.
 
 Inspect startup and health status with:
 

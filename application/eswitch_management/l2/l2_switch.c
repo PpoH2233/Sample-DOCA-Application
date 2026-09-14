@@ -3,6 +3,7 @@
 #include "../router/router_control.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 static struct managed_vswitch *find_vswitch(struct eswitch_manager *manager,
                                             uint16_t id) {
@@ -81,6 +82,7 @@ doca_error_t attach_port(struct eswitch_manager *manager,
 doca_error_t detach_port(struct eswitch_manager *manager,
                                 uint16_t vswitch_id, uint16_t port_id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
+  struct router_neighbor_table *neighbor_backup = NULL;
   int port_index;
   doca_error_t result;
 
@@ -91,18 +93,25 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     return DOCA_ERROR_NOT_FOUND;
   if (manager->port_owner[port_index] != vswitch_id)
     return DOCA_ERROR_INVALID_VALUE;
+  neighbor_backup = malloc(sizeof(*neighbor_backup));
+  if (neighbor_backup == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  *neighbor_backup = manager->neighbors;
 
   /* Close ingress first. If a later hardware mutation fails, restore the
    * classifier and flood member while ownership is still unchanged. */
   result = eswitch_pipeline_detach_port(manager->pipeline,
                                         (uint16_t)port_index);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    free(neighbor_backup);
     return result;
+  }
   result = eswitch_pipeline_flood_remove_port(manager->pipeline, port_id,
                                               &vswitch->flood);
   if (result != DOCA_SUCCESS) {
     doca_error_t rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id);
+    free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
   result = eswitch_fdb_flush_port(&manager->fdb, vswitch_id, port_id,
@@ -113,9 +122,25 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     if (rollback == DOCA_SUCCESS)
       rollback = eswitch_pipeline_attach_port(
           manager->pipeline, (uint16_t)port_index, vswitch_id);
+    free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
   manager->port_owner[port_index] = 0;
+  router_neighbor_invalidate_port(&manager->neighbors, port_id);
+  result = eswitch_manager_hw_routes_sync(manager, manager->router);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t rollback;
+    manager->neighbors = *neighbor_backup;
+    manager->port_owner[port_index] = vswitch_id;
+    rollback = eswitch_pipeline_flood_add_port(
+        manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    if (rollback == DOCA_SUCCESS)
+      rollback = eswitch_pipeline_attach_port(
+          manager->pipeline, (uint16_t)port_index, vswitch_id);
+    free(neighbor_backup);
+    return rollback == DOCA_SUCCESS ? result : rollback;
+  }
+  free(neighbor_backup);
   printf("VSWITCH DETACH: vs=%u dpdk-port=%u\n", vswitch_id, port_id);
   return DOCA_SUCCESS;
 }

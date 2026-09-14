@@ -171,3 +171,15 @@ void router_neighbor_age(struct router_neighbor_table *table, uint64_t now_ns) {
     table->count--;
   }
 }
+
+void router_neighbor_invalidate_port(struct router_neighbor_table *table,
+                                     uint16_t port_id) {
+  if (table == NULL)
+    return;
+  for (size_t i = 0; i < ROUTER_MAX_NEIGHBORS; i++) {
+    if (!table->entries[i].used || table->entries[i].port_id != port_id)
+      continue;
+    table->entries[i] = (struct router_neighbor){0};
+    table->count--;
+  }
+}

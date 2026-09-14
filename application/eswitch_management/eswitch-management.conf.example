@@ -10,3 +10,11 @@ ESWITCH_STATE_FILE="/var/lib/eswitch-management/eswitch.conf"
 
 # VF indexes, not DPDK port IDs. Limit this integration test to VF 7-15.
 ESWITCH_VF_SCOPE="7-15"
+
+# Opt-in private-to-private IPv4 hardware LPM. Keep disabled until the BF3
+# smoke test confirms pipe creation, counters, TTL and exception fallback.
+ESWITCH_HW_ROUTING="0"
+
+# Successful slow-path packet traces are expensive at scale. Errors and
+# counters remain active when this is disabled.
+ESWITCH_PACKET_DEBUG="0"

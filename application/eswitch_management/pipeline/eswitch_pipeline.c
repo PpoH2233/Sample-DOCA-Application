@@ -17,6 +17,10 @@ static doca_error_t get_egress_gate(struct eswitch_pipeline *pipeline,
                                     uint16_t port_id,
                                     struct doca_flow_pipe **gate_pipe);
 
+static uint32_t ipv4_prefix_mask(uint8_t length) {
+  return length == 0 ? 0 : UINT32_MAX << (32 - length);
+}
+
 static doca_error_t set_pipe_identity(struct doca_flow_pipe_cfg *cfg,
                                       const char *name,
                                       enum doca_flow_pipe_type type,
@@ -359,15 +363,20 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->rss_pipe};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-                               .next_pipe = pipeline->source_guard_pipe};
+      .next_pipe = pipeline->hardware_routing_enabled
+          ? pipeline->route_selector_pipe : pipeline->source_guard_pipe};
   doca_error_t result;
 
   match.meta.pkt_meta = UINT32_MAX;
   memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  if (pipeline->hardware_routing_enabled)
+    match.outer.ip4.dst_ip = UINT32_MAX;
   mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.outer.eth.type = UINT16_MAX;
+  if (pipeline->hardware_routing_enabled)
+    mask.outer.ip4.dst_ip = UINT32_MAX;
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
@@ -384,6 +393,186 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
                                    &pipeline->local_ip_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
   return result;
+}
+
+static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_action_desc desc = {0};
+  struct doca_flow_action_descs descs = {.nb_action_desc = 1,
+                                         .desc_array = &desc};
+  struct doca_flow_action_descs *descs_array[1] = {&descs};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = pipeline->rss_pipe};
+  doca_error_t result;
+
+  match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  match.outer.ip4.dst_ip = UINT32_MAX;
+  mask.meta.u32[0] = UINT32_MAX; /* exact VR routing domain */
+  memset(actions.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  memset(actions.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  actions.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  actions.outer.ip4.ttl = UINT8_MAX; /* -1 for DOCA_FLOW_ACTION_ADD */
+  desc.type = DOCA_FLOW_ACTION_ADD;
+  desc.field_op.dst.field_string = "outer.ipv4.ttl";
+  desc.field_op.dst.bit_offset = 0;
+  desc.field_op.width = 8;
+
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_ROUTER_LPM", DOCA_FLOW_PIPE_LPM,
+                             false, ROUTER_HW_MAX_ROUTES);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL,
+                                            descs_array, 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &fwd, &miss,
+                                   &pipeline->route_lpm_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
+}
+
+static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->rss_pipe};
+  doca_error_t result;
+
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_ROUTER_ELIGIBLE",
+                             DOCA_FLOW_PIPE_CONTROL, false,
+                             ROUTER_MAX_INTERFACES + 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL,
+                                   &pipeline->route_control_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  flow_entry_cookie_prepare(&pipeline->route_fallback_rule.cookie,
+                            "router slow-path fallback",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_control_pipe,
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, 7, &fwd,
+      &pipeline->route_fallback_rule.cookie,
+      &pipeline->route_fallback_rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &pipeline->route_fallback_rule, 1);
+}
+
+static doca_error_t create_route_selector(struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->route_control_pipe};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = pipeline->source_guard_pipe};
+  doca_error_t result;
+
+  match.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  mask.outer.eth.type = UINT16_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_ROUTER_SELECTOR",
+                             DOCA_FLOW_PIPE_BASIC, false,
+                             ROUTER_MAX_INTERFACES);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss,
+                                   &pipeline->route_selector_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
+}
+
+static doca_error_t add_route_selector_rule(
+    struct eswitch_pipeline *pipeline,
+    struct eswitch_sf_return_context *context) {
+  struct doca_flow_match match = {0};
+  doca_error_t result;
+
+  match.meta.pkt_meta = DOCA_HTOBE32((uint32_t)context->vswitch_id << 16);
+  memcpy(match.outer.eth.dst_mac, context->rif_mac, RTE_ETHER_ADDR_LEN);
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  flow_entry_cookie_prepare(&context->route_selector_rule.cookie,
+                            "private router MAC selector",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_selector_pipe, &match, 0,
+      NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &context->route_selector_rule.cookie,
+      &context->route_selector_rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &context->route_selector_rule, 1);
+}
+
+static doca_error_t add_route_eligible_rule(
+    struct eswitch_pipeline *pipeline,
+    struct eswitch_sf_return_context *context) {
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_match_condition condition = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->route_lpm_pipe};
+  doca_error_t result;
+
+  match.meta.pkt_meta = DOCA_HTOBE32((uint32_t)context->vswitch_id << 16);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  memcpy(match.outer.eth.dst_mac, context->rif_mac, RTE_ETHER_ADDR_LEN);
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  mask.outer.eth.type = UINT16_MAX;
+  match.outer.ip4.version_ihl = 0x45;
+  mask.outer.ip4.version_ihl = UINT8_MAX;
+  match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+  mask.parser_meta.outer_l3_type = UINT32_MAX;
+  match.parser_meta.outer_ip_fragmented = 0;
+  mask.parser_meta.outer_ip_fragmented = UINT8_MAX;
+  match.parser_meta.outer_l3_ok = 1;
+  mask.parser_meta.outer_l3_ok = UINT8_MAX;
+  match.parser_meta.outer_ip4_checksum_ok = 1;
+  mask.parser_meta.outer_ip4_checksum_ok = UINT8_MAX;
+  match.outer.ip4.ttl = 1;
+  condition.operation = DOCA_FLOW_COMPARE_GT;
+  condition.field_op.a.field_string = "outer.ipv4.ttl";
+  condition.field_op.a.bit_offset = 0;
+  condition.field_op.b.field_string = NULL;
+  condition.field_op.b.bit_offset = 0;
+  condition.field_op.width = 8;
+  actions.meta.u32[0] = DOCA_HTOBE32(context->vr_id);
+
+  flow_entry_cookie_prepare(&context->route_eligible_rule.cookie,
+                            "private IPv4 hardware eligibility",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_control_pipe,
+      &match, &mask, &condition, &actions, NULL, NULL, NULL, 0, &fwd,
+      &context->route_eligible_rule.cookie,
+      &context->route_eligible_rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &context->route_eligible_rule, 1);
 }
 
 static doca_error_t create_ingress_classifier(
@@ -499,9 +688,9 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
 }
 
 static doca_error_t bind_sf_return_context(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    uint16_t target_port_id, bool directed, const uint8_t rif_mac[6],
-    uint16_t *context_tag) {
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t vswitch_id,
+    uint32_t rif_address, uint16_t target_port_id, bool directed,
+    const uint8_t rif_mac[6], uint16_t *context_tag) {
   struct eswitch_sf_return_context *free_context = NULL;
   struct doca_flow_match return_match = {0};
   struct doca_flow_match local_match = {0};
@@ -510,7 +699,8 @@ static doca_error_t bind_sf_return_context(
   struct doca_flow_pipe *gate_pipe = NULL;
   doca_error_t result;
 
-  if (pipeline == NULL || !pipeline->created || vswitch_id == 0 ||
+  if (pipeline == NULL || !pipeline->created || vr_id == 0 ||
+      vswitch_id == 0 ||
       rif_mac == NULL || context_tag == NULL || (rif_mac[0] & 1U) != 0)
     return DOCA_ERROR_INVALID_VALUE;
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
@@ -524,7 +714,9 @@ static doca_error_t bind_sf_return_context(
     if (context->vswitch_id == vswitch_id &&
         context->directed == directed &&
         (!directed || context->target_port_id == target_port_id)) {
-      if (memcmp(context->rif_mac, rif_mac, 6) != 0)
+      if (context->vr_id != vr_id ||
+          (!directed && context->rif_address != rif_address) ||
+          memcmp(context->rif_mac, rif_mac, 6) != 0)
         return DOCA_ERROR_BAD_STATE;
       *context_tag = context->context_tag;
       return DOCA_SUCCESS;
@@ -571,6 +763,8 @@ static doca_error_t bind_sf_return_context(
     local_match.meta.pkt_meta =
         DOCA_HTOBE32((uint32_t)vswitch_id << 16);
     memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
+    if (pipeline->hardware_routing_enabled)
+      local_match.outer.ip4.dst_ip = DOCA_HTOBE32(rif_address);
     flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
                               "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
     result = doca_flow_pipe_basic_add_entry(
@@ -589,9 +783,42 @@ static doca_error_t bind_sf_return_context(
                               "rollback SF return context");
       return cleanup == DOCA_SUCCESS ? original_error : cleanup;
     }
+    if (pipeline->hardware_routing_enabled) {
+      free_context->vr_id = vr_id;
+      free_context->vswitch_id = vswitch_id;
+      free_context->rif_address = rif_address;
+      memcpy(free_context->rif_mac, rif_mac, 6);
+      result = add_route_eligible_rule(pipeline, free_context);
+      if (result != DOCA_SUCCESS) {
+        doca_error_t original_error = result;
+        doca_error_t cleanup = remove_rule(
+            pipeline, &free_context->local_ip_rule,
+            "rollback local RIF IPv4");
+        if (cleanup == DOCA_SUCCESS)
+          cleanup = remove_rule(pipeline, &free_context->return_rule,
+                                "rollback SF return context");
+        return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+      }
+      result = add_route_selector_rule(pipeline, free_context);
+      if (result != DOCA_SUCCESS) {
+        doca_error_t original_error = result;
+        doca_error_t cleanup = remove_rule(
+            pipeline, &free_context->route_eligible_rule,
+            "rollback hardware route eligibility");
+        if (cleanup == DOCA_SUCCESS)
+          cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
+                                "rollback local RIF IPv4");
+        if (cleanup == DOCA_SUCCESS)
+          cleanup = remove_rule(pipeline, &free_context->return_rule,
+                                "rollback SF return context");
+        return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+      }
+    }
   }
 
+  free_context->vr_id = vr_id;
   free_context->vswitch_id = vswitch_id;
+  free_context->rif_address = rif_address;
   free_context->context_tag = *context_tag;
   free_context->target_port_id = target_port_id;
   memcpy(free_context->rif_mac, rif_mac, 6);
@@ -607,18 +834,18 @@ static doca_error_t bind_sf_return_context(
 }
 
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    const uint8_t rif_mac[6], uint16_t *context_tag) {
-  return bind_sf_return_context(pipeline, vswitch_id, UINT16_MAX, false,
-                                rif_mac, context_tag);
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t vswitch_id,
+    uint32_t rif_address, const uint8_t rif_mac[6], uint16_t *context_tag) {
+  return bind_sf_return_context(pipeline, vr_id, vswitch_id, rif_address,
+                                UINT16_MAX, false, rif_mac, context_tag);
 }
 
 doca_error_t eswitch_pipeline_sf_bind_egress(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
     uint16_t target_port_id, const uint8_t rif_mac[6],
     uint16_t *context_tag) {
-  return bind_sf_return_context(pipeline, vswitch_id, target_port_id, true,
-                                rif_mac, context_tag);
+  return bind_sf_return_context(pipeline, vswitch_id, vswitch_id, 0,
+                                target_port_id, true, rif_mac, context_tag);
 }
 
 doca_error_t eswitch_pipeline_sf_unbind_egress(
@@ -659,6 +886,18 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
 
     if (!context->active || context->vswitch_id != vswitch_id)
       continue;
+    if (context->route_selector_rule.entry != NULL) {
+      result = remove_rule(pipeline, &context->route_selector_rule,
+                           "unbind hardware router selector");
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
+    if (context->route_eligible_rule.entry != NULL) {
+      result = remove_rule(pipeline, &context->route_eligible_rule,
+                           "unbind hardware route eligibility");
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
     if (context->local_ip_rule.entry != NULL) {
       result = remove_rule(pipeline, &context->local_ip_rule,
                            "unbind local RIF IPv4");
@@ -786,6 +1025,7 @@ doca_error_t eswitch_pipeline_egress_query(
 
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
+                                     bool hardware_routing_enabled,
                                      struct eswitch_pipeline *pipeline) {
   doca_error_t result;
 
@@ -795,6 +1035,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   pipeline->runtime = runtime;
   pipeline->ports = ports;
   pipeline->switch_port = ports->switch_port;
+  pipeline->hardware_routing_enabled = hardware_routing_enabled;
 
 #define CREATE_STAGE(label, call)                                             \
   do {                                                                        \
@@ -814,6 +1055,11 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   CREATE_STAGE("learning clone", create_learning_clone(pipeline));
   CREATE_STAGE("learning dispatch", create_learning_dispatch(pipeline));
   CREATE_STAGE("source guard", create_source_guard(pipeline));
+  if (pipeline->hardware_routing_enabled) {
+    CREATE_STAGE("router IPv4 LPM", create_route_lpm(pipeline));
+    CREATE_STAGE("router eligibility", create_route_control(pipeline));
+    CREATE_STAGE("router MAC selector", create_route_selector(pipeline));
+  }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
   CREATE_STAGE("ingress classifier", create_ingress_classifier(pipeline));
@@ -837,6 +1083,12 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->arp_dispatch_pipe);
   if (pipeline->local_ip_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->local_ip_pipe);
+  if (pipeline->route_selector_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->route_selector_pipe);
+  if (pipeline->route_control_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->route_control_pipe);
+  if (pipeline->route_lpm_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->route_lpm_pipe);
   if (pipeline->source_guard_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->source_guard_pipe);
   if (pipeline->learning_dispatch_pipe != NULL)
@@ -950,6 +1202,248 @@ doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
     return DOCA_ERROR_INVALID_VALUE;
   return remove_rule(pipeline, &pipeline->classifier_rules[port_index],
                      "detach ingress port");
+}
+
+static bool hw_route_same_key(const struct router_hw_route *left,
+                              const struct router_hw_route *right) {
+  return left->vr_id == right->vr_id && left->prefix == right->prefix &&
+         left->length == right->length;
+}
+
+static bool hw_route_same_action(const struct router_hw_route *left,
+                                 const struct router_hw_route *right) {
+  return left->egress_interface_id == right->egress_interface_id &&
+         left->egress_vswitch_id == right->egress_vswitch_id &&
+         left->target_port_id == right->target_port_id &&
+         memcmp(left->source_mac, right->source_mac, 6) == 0 &&
+         memcmp(left->destination_mac, right->destination_mac, 6) == 0;
+}
+
+static void fill_hw_route_action(const struct router_hw_route *spec,
+                                 struct doca_flow_actions *actions) {
+  *actions = (struct doca_flow_actions){0};
+  memcpy(actions->outer.eth.src_mac, spec->source_mac, 6);
+  memcpy(actions->outer.eth.dst_mac, spec->destination_mac, 6);
+  actions->outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  actions->outer.ip4.ttl = UINT8_MAX;
+}
+
+static doca_error_t add_hw_route(struct eswitch_pipeline *pipeline,
+                                 struct eswitch_hw_route_entry *record,
+                                 const struct router_hw_route *spec) {
+  struct doca_flow_match match = {0};
+  struct doca_flow_match match_mask = {0};
+  struct doca_flow_actions actions;
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
+  struct doca_flow_pipe *gate = NULL;
+  doca_error_t result;
+
+  result = get_egress_gate(pipeline, spec->target_port_id, &gate);
+  if (result != DOCA_SUCCESS)
+    return result;
+  match.meta.u32[0] = DOCA_HTOBE32(spec->vr_id);
+  /* The IP mask is variable per prefix, while the VR dimension must always
+   * remain an exact part of every LPM key. */
+  match_mask.meta.u32[0] = UINT32_MAX;
+  match.outer.ip4.dst_ip = DOCA_HTOBE32(spec->prefix);
+  match_mask.outer.ip4.dst_ip = DOCA_HTOBE32(
+      ipv4_prefix_mask(spec->length));
+  fill_hw_route_action(spec, &actions);
+  fwd.next_pipe = gate;
+  flow_entry_cookie_prepare(&record->rule.cookie, "hardware IPv4 route",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_lpm_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_lpm_pipe, &match,
+      &match_mask, 0, &actions, NULL, &fwd,
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &record->rule.cookie,
+      &record->rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = process_rules(pipeline, &record->rule, 1);
+  if (result != DOCA_SUCCESS) {
+    (void)remove_rule(pipeline, &record->rule,
+                      "rollback hardware IPv4 route");
+    return result;
+  }
+  record->spec = *spec;
+  record->active = true;
+  pipeline->hw_route_count++;
+  pipeline->hw_route_promotions++;
+  return DOCA_SUCCESS;
+}
+
+static doca_error_t update_hw_route(struct eswitch_pipeline *pipeline,
+                                    struct eswitch_hw_route_entry *record,
+                                    const struct router_hw_route *spec) {
+  struct doca_flow_actions actions;
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
+  struct doca_flow_pipe *gate = NULL;
+  struct flow_entry_cookie *cookie = &record->rule.cookie;
+  doca_error_t result;
+
+  result = get_egress_gate(pipeline, spec->target_port_id, &gate);
+  if (result != DOCA_SUCCESS)
+    return result;
+  fill_hw_route_action(spec, &actions);
+  fwd.next_pipe = gate;
+  flow_entry_cookie_prepare(cookie, "update hardware IPv4 adjacency",
+                            DOCA_FLOW_ENTRY_OP_UPD);
+  result = doca_flow_pipe_lpm_update_entry(
+      pipeline->runtime->queue_id, pipeline->route_lpm_pipe, 0, &actions,
+      NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, record->rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = flow_runtime_process(pipeline->runtime, pipeline->switch_port,
+                                &cookie, 1);
+  if (result == DOCA_SUCCESS) {
+    record->spec = *spec;
+    pipeline->hw_route_updates++;
+  }
+  return result;
+}
+
+doca_error_t eswitch_pipeline_hw_routes_sync(
+    struct eswitch_pipeline *pipeline, const struct router_hw_route *routes,
+    size_t route_count) {
+  bool keep[ROUTER_HW_MAX_ROUTES] = {0};
+  doca_error_t first_error = DOCA_SUCCESS;
+
+  if (pipeline == NULL || !pipeline->created ||
+      (route_count != 0 && routes == NULL) ||
+      route_count > ROUTER_HW_MAX_ROUTES)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (!pipeline->hardware_routing_enabled)
+    return DOCA_SUCCESS;
+
+  for (size_t desired = 0; desired < route_count; desired++) {
+    struct eswitch_hw_route_entry *free_record = NULL;
+    struct eswitch_hw_route_entry *record = NULL;
+    size_t slot = 0;
+
+    for (size_t i = 0; i < ROUTER_HW_MAX_ROUTES; i++) {
+      if (!pipeline->hw_routes[i].active) {
+        if (free_record == NULL) {
+          free_record = &pipeline->hw_routes[i];
+          slot = i;
+        }
+      } else if (hw_route_same_key(&pipeline->hw_routes[i].spec,
+                                   &routes[desired])) {
+        record = &pipeline->hw_routes[i];
+        slot = i;
+        break;
+      }
+    }
+    if (record != NULL) {
+      keep[slot] = true;
+      if (!hw_route_same_action(&record->spec, &routes[desired])) {
+        doca_error_t result = update_hw_route(pipeline, record,
+                                               &routes[desired]);
+        if (result != DOCA_SUCCESS) {
+          /* Never retain a known-stale MAC/port after an adjacency update
+           * failure. Removing the old entry turns the packet into an LPM miss
+           * and therefore restores the software slow path. */
+          doca_error_t cleanup = remove_rule(
+              pipeline, &record->rule,
+              "fail closed stale hardware IPv4 adjacency");
+          if (cleanup == DOCA_SUCCESS) {
+            *record = (struct eswitch_hw_route_entry){0};
+            pipeline->hw_route_count--;
+            pipeline->hw_route_removals++;
+          }
+          if (first_error == DOCA_SUCCESS)
+            first_error = cleanup == DOCA_SUCCESS ? result : cleanup;
+        }
+      }
+      continue;
+    }
+    if (free_record == NULL) {
+      if (first_error == DOCA_SUCCESS)
+        first_error = DOCA_ERROR_NO_MEMORY;
+      continue;
+    }
+    {
+      doca_error_t result = add_hw_route(pipeline, free_record,
+                                         &routes[desired]);
+      if (result == DOCA_SUCCESS)
+        keep[slot] = true;
+      else if (first_error == DOCA_SUCCESS)
+        first_error = result;
+    }
+  }
+
+  for (size_t i = 0; i < ROUTER_HW_MAX_ROUTES; i++) {
+    struct eswitch_hw_route_entry *record = &pipeline->hw_routes[i];
+    if (!record->active || keep[i])
+      continue;
+    {
+      doca_error_t result = remove_rule(pipeline, &record->rule,
+                                        "remove stale hardware IPv4 route");
+      if (result == DOCA_SUCCESS) {
+        *record = (struct eswitch_hw_route_entry){0};
+        pipeline->hw_route_count--;
+        pipeline->hw_route_removals++;
+      } else if (first_error == DOCA_SUCCESS) {
+        first_error = result;
+      }
+    }
+  }
+  if (first_error != DOCA_SUCCESS) {
+    pipeline->hw_route_failures++;
+    pipeline->hardware_routing_degraded = true;
+    /* Keep the router-MAC selector installed: with no eligibility entry the
+     * control pipe's fallback sends router traffic to RSS. This disables
+     * acceleration without diverting ordinary L2 IPv4 away from its FDB. */
+    for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+      struct eswitch_sf_return_context *context =
+          &pipeline->sf_return_contexts[i];
+      if (!context->active || context->directed ||
+          context->route_eligible_rule.entry == NULL)
+        continue;
+      {
+        doca_error_t cleanup = remove_rule(
+            pipeline, &context->route_eligible_rule,
+            "disable hardware routing after sync failure");
+        if (cleanup != DOCA_SUCCESS)
+          first_error = cleanup;
+      }
+    }
+  } else {
+    /* Recover automatically after a transient programming failure. */
+    for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+      struct eswitch_sf_return_context *context =
+          &pipeline->sf_return_contexts[i];
+      if (!context->active || context->directed ||
+          context->route_eligible_rule.entry != NULL)
+        continue;
+      {
+        doca_error_t result = add_route_eligible_rule(pipeline, context);
+        if (result != DOCA_SUCCESS) {
+          pipeline->hw_route_failures++;
+          pipeline->hardware_routing_degraded = true;
+          return result;
+        }
+      }
+    }
+    pipeline->hardware_routing_degraded = false;
+  }
+  return first_error;
+}
+
+doca_error_t eswitch_pipeline_hw_route_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *lpm_misses) {
+  struct doca_flow_resource_query query = {0};
+  doca_error_t result;
+
+  if (pipeline == NULL || lpm_misses == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  *lpm_misses = 0;
+  if (!pipeline->hardware_routing_enabled)
+    return DOCA_SUCCESS;
+  result = doca_flow_resource_query_pipe_miss(pipeline->route_lpm_pipe,
+                                               &query);
+  if (result == DOCA_SUCCESS)
+    *lpm_misses = query.counter.total_pkts;
+  return result;
 }
 
 static doca_error_t create_egress_gate(struct eswitch_pipeline *pipeline,

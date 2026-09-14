@@ -51,5 +51,7 @@ bool router_neighbor_should_probe(struct router_neighbor_table *table,
                                   uint32_t ip, uint64_t now_ns);
 
 void router_neighbor_age(struct router_neighbor_table *table, uint64_t now_ns);
+void router_neighbor_invalidate_port(struct router_neighbor_table *table,
+                                     uint16_t port_id);
 
 #endif /* ESW_ROUTER_NEIGHBOR_H */
