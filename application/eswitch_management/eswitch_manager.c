@@ -1126,8 +1126,11 @@ doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
   for (uint16_t i = 0; i < received; i++) {
     doca_error_t result = process_packet(manager, packets[i], now_ns);
     rte_pktmbuf_free(packets[i]);
-    if (result != DOCA_SUCCESS)
+    if (result != DOCA_SUCCESS) {
+      for (uint16_t remaining = i + 1; remaining < received; remaining++)
+        rte_pktmbuf_free(packets[remaining]);
       return result;
+    }
   }
   return DOCA_SUCCESS;
 }

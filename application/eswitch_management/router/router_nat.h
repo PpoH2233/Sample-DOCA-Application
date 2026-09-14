@@ -8,6 +8,7 @@
 #include "router.h"
 
 #define ROUTER_NAT_MAX_SESSIONS 4096U
+#define ROUTER_NAT_BUCKETS 8192U
 #define ROUTER_NAT_TCP_IDLE_NS UINT64_C(300000000000)
 #define ROUTER_NAT_UDP_IDLE_NS UINT64_C(60000000000)
 #define ROUTER_NAT_ICMP_IDLE_NS UINT64_C(30000000000)
@@ -28,6 +29,8 @@ struct router_nat_inside {
 };
 
 struct router_nat_session {
+  /* Intrusive indices are slot + 1; zero terminates a bucket chain. */
+  uint16_t index_next[3];
   bool used;
   uint16_t vr_id;
   uint8_t protocol;
@@ -59,6 +62,8 @@ struct router_nat_stats {
 
 struct router_nat_table {
   struct router_nat_session entries[ROUTER_NAT_MAX_SESSIONS];
+  /* Single dataplane owner, like entries; not safe for concurrent writers. */
+  uint16_t buckets[3][ROUTER_NAT_BUCKETS];
   size_t count;
   uint16_t next_port;
   struct router_nat_stats stats;

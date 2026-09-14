@@ -190,11 +190,59 @@ static void update_checksums(struct packet_view *view) {
   write16(view->l4 + checksum_offset, value);
 }
 
+/* Hash explicit host-order fields, never struct padding. Full key equality
+ * below remains authoritative, including under hash collisions. */
+static size_t tuple_bucket(uint16_t vr, uint8_t protocol, uint32_t ip,
+                           uint16_t port, uint32_t remote, uint16_t remote_port) {
+  uint32_t h = UINT32_C(2166136261);
+  const uint32_t fields[] = {vr, protocol, ip, port, remote, remote_port};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    h ^= fields[i];
+    h *= UINT32_C(16777619);
+    h ^= h >> 16;
+  }
+  return h & (ROUTER_NAT_BUCKETS - 1U);
+}
+
+static size_t session_bucket(const struct router_nat_session *s, unsigned index) {
+  return tuple_bucket(s->vr_id, s->protocol,
+                      index == 0 ? s->inside_ip : s->public_ip,
+                      index == 0 ? s->inside_port : s->public_port,
+                      index == 2 ? 0 : s->remote_ip,
+                      index == 2 ? 0 : s->remote_port);
+}
+
+static void index_insert(struct router_nat_table *table,
+                         struct router_nat_session *s) {
+  uint16_t slot = (uint16_t)(s - table->entries + 1);
+  for (unsigned index = 0; index < 3; index++) {
+    size_t bucket = session_bucket(s, index);
+    s->index_next[index] = table->buckets[index][bucket];
+    table->buckets[index][bucket] = slot;
+  }
+}
+
+static void index_remove(struct router_nat_table *table,
+                         struct router_nat_session *s) {
+  uint16_t slot = (uint16_t)(s - table->entries + 1);
+  for (unsigned index = 0; index < 3; index++) {
+    uint16_t *link = &table->buckets[index][session_bucket(s, index)];
+    while (*link && *link != slot)
+      link = &table->entries[*link - 1].index_next[index];
+    if (*link)
+      *link = s->index_next[index];
+  }
+}
+
 static struct router_nat_session *find_outbound(
     struct router_nat_table *table, uint16_t vr_id,
     const struct packet_view *view) {
-  for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
-    struct router_nat_session *s = &table->entries[i];
+  size_t bucket = tuple_bucket(vr_id, view->protocol, view->source_ip,
+                              view->source_port, view->destination_ip,
+                              view->destination_port);
+  for (uint16_t slot = table->buckets[0][bucket]; slot;
+       slot = table->entries[slot - 1].index_next[0]) {
+    struct router_nat_session *s = &table->entries[slot - 1];
     if (s->used && s->vr_id == vr_id && s->protocol == view->protocol &&
         s->inside_ip == view->source_ip &&
         s->inside_port == view->source_port &&
@@ -208,8 +256,12 @@ static struct router_nat_session *find_outbound(
 static struct router_nat_session *find_inbound(
     struct router_nat_table *table, uint16_t vr_id,
     const struct packet_view *view) {
-  for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
-    struct router_nat_session *s = &table->entries[i];
+  size_t bucket = tuple_bucket(vr_id, view->protocol, view->destination_ip,
+                              view->destination_port, view->source_ip,
+                              view->source_port);
+  for (uint16_t slot = table->buckets[1][bucket]; slot;
+       slot = table->entries[slot - 1].index_next[1]) {
+    struct router_nat_session *s = &table->entries[slot - 1];
     if (s->used && s->vr_id == vr_id && s->protocol == view->protocol &&
         s->public_ip == view->destination_ip &&
         s->public_port == view->destination_port &&
@@ -223,8 +275,10 @@ static struct router_nat_session *find_inbound(
 static bool port_in_use(const struct router_nat_table *table, uint16_t vr_id,
                         uint8_t protocol, uint32_t public_ip,
                         uint16_t public_port) {
-  for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
-    const struct router_nat_session *s = &table->entries[i];
+  size_t bucket = tuple_bucket(vr_id, protocol, public_ip, public_port, 0, 0);
+  for (uint16_t slot = table->buckets[2][bucket]; slot;
+       slot = table->entries[slot - 1].index_next[2]) {
+    const struct router_nat_session *s = &table->entries[slot - 1];
     if (s->used && s->vr_id == vr_id && s->protocol == protocol &&
         s->public_ip == public_ip && s->public_port == public_port)
       return true;
@@ -261,6 +315,7 @@ static struct router_nat_session *allocate_session(
       .created_ns=now_ns,.last_seen_ns=now_ns};
     table->next_port = candidate == policy->port_last ? policy->port_first
                                                        : candidate + 1U;
+    index_insert(table, free_session);
     table->count++;
     table->stats.sessions_created++;
     return free_session;
@@ -376,6 +431,7 @@ void router_nat_age(struct router_nat_table *table, uint64_t now_ns) {
     else
       timeout = ROUTER_NAT_ICMP_IDLE_NS;
     if (now_ns - s->last_seen_ns <= timeout) continue;
+    index_remove(table, s);
     *s = (struct router_nat_session){0};
     table->count--;
     table->stats.sessions_aged++;
@@ -386,6 +442,7 @@ void router_nat_flush(struct router_nat_table *table, uint16_t vr_id) {
   if (!table || !vr_id) return;
   for (size_t i=0;i<ROUTER_NAT_MAX_SESSIONS;i++) {
     if(!table->entries[i].used || table->entries[i].vr_id!=vr_id) continue;
+    index_remove(table, &table->entries[i]);
     table->entries[i]=(struct router_nat_session){0};
     table->count--;
   }

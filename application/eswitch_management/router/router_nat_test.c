@@ -232,6 +232,35 @@ int main(void) {
   assert(table->count==2); /* UDP and ICMP expire before TCP sessions. */
   router_nat_age(table,ROUTER_NAT_TCP_IDLE_NS+ROUTER_NAT_UDP_IDLE_NS+20);
   assert(table->count==0 && table->stats.sessions_aged==5);
+  /* Fill every slot, exercise hash collisions in both directions, flush and
+   * reuse indices. Each reverse lookup must retain the exact inside owner. */
+  policy.port_first=20000;
+  policy.port_last=30000;
+  for (unsigned round=0;round<2;round++) {
+    for (unsigned i=0;i<ROUTER_NAT_MAX_SESSIONS;i++) {
+      length=make_packet(original,17,0x0a000001+i,12345,remote_ip,53);
+      assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,1,
+                                 translated,sizeof(translated),&reply)==
+             ROUTER_NAT_TRANSLATED);
+    }
+    assert(table->count==ROUTER_NAT_MAX_SESSIONS);
+    for (unsigned i=0;i<ROUTER_NAT_MAX_SESSIONS;i++) {
+      length=make_packet(original,17,0x0a000001+i,12345,remote_ip,53);
+      assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,2,
+                                 translated,sizeof(translated),&reply)==
+             ROUTER_NAT_TRANSLATED);
+      uint16_t port=reply->public_port;
+      length=make_packet(original,17,remote_ip,53,public_ip,port);
+      assert(router_nat_inbound(table,101,original,length,3,reverse,
+                                sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+      assert(read32(reverse+30)==0x0a000001+i);
+    }
+    router_nat_flush(table,101);
+    assert(table->count==0);
+    for (unsigned index=0;index<3;index++)
+      for (unsigned bucket=0;bucket<ROUTER_NAT_BUCKETS;bucket++)
+        assert(table->buckets[index][bucket]==0);
+  }
   free(table);
   puts("PASS: TCP/UDP/ICMP Echo NAT, reverse lookup, checksums, isolation and aging");
   return 0;

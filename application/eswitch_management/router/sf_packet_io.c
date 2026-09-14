@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <linux/if_ether.h>
@@ -108,27 +109,39 @@ doca_error_t sf_packet_io_send(struct sf_packet_io *io,
 doca_error_t sf_packet_io_send_context(struct sf_packet_io *io,
                                        const uint8_t *frame, size_t length,
                                        uint16_t context_tag) {
-  uint8_t *tagged;
-  doca_error_t result;
+  uint8_t tagged[16];
+  struct sockaddr_ll destination = {0};
+  struct iovec vectors[2];
+  struct msghdr message = {0};
+  ssize_t written;
 
-  if (io == NULL || !io->started || frame == NULL || length < ETH_HLEN ||
+  if (io == NULL || !io->started || io->fd < 0 || frame == NULL || length < ETH_HLEN ||
       context_tag == 0 || context_tag > 4094 || length > SIZE_MAX - 4)
     return DOCA_ERROR_INVALID_VALUE;
-  tagged = malloc(length + 4);
-  if (tagged == NULL)
-    return DOCA_ERROR_NO_MEMORY;
-
   memcpy(tagged, frame, ETH_ALEN); /* Original VM destination. */
   memcpy(tagged + ETH_ALEN, io->mac, ETH_ALEN); /* SF-enforced source. */
   tagged[12] = 0x81;
   tagged[13] = 0x00;
   tagged[14] = (uint8_t)(context_tag >> 8);
   tagged[15] = (uint8_t)context_tag;
-  memcpy(tagged + 16, frame + 12, length - 12);
-
-  result = sf_packet_io_send(io, tagged, length + 4);
-  free(tagged);
-  return result;
+  /* sendmsg consumes both buffers synchronously. This removes the temporary
+   * allocation and payload copy, not the kernel's socket copy. */
+  vectors[0] = (struct iovec){.iov_base = tagged, .iov_len = sizeof(tagged)};
+  vectors[1] = (struct iovec){.iov_base = (void *)(frame + 12),
+                            .iov_len = length - 12};
+  destination.sll_family = AF_PACKET;
+  destination.sll_protocol = htons(ETH_P_8021Q);
+  destination.sll_ifindex = (int)io->ifindex;
+  destination.sll_halen = ETH_ALEN;
+  memcpy(destination.sll_addr, frame, ETH_ALEN);
+  message.msg_name = &destination;
+  message.msg_namelen = sizeof(destination);
+  message.msg_iov = vectors;
+  message.msg_iovlen = 2;
+  written = sendmsg(io->fd, &message, 0);
+  if (written != (ssize_t)(length + 4))
+    return DOCA_ERROR_DRIVER;
+  return DOCA_SUCCESS;
 }
 
 void sf_packet_io_stop(struct sf_packet_io *io) {
