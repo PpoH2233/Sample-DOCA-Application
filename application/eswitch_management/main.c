@@ -98,6 +98,9 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
                 1024U;
   while (rounded < required)
     rounded <<= 1;
+  if (hardware_routing_enabled &&
+      rounded < ESWITCH_HW_ACTIONS_MEM_MIN_SIZE)
+    rounded = ESWITCH_HW_ACTIONS_MEM_MIN_SIZE;
   return rounded;
 }
 

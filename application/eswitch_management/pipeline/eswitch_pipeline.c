@@ -746,8 +746,12 @@ static doca_error_t bind_sf_return_context(
 
   if (directed) {
     result = get_egress_gate(pipeline, target_port_id, &gate_pipe);
-    if (result != DOCA_SUCCESS)
+    if (result != DOCA_SUCCESS) {
+      fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=egress-gate vs=%u "
+                      "target=%u error=%s\n",
+              vswitch_id, target_port_id, doca_error_get_descr(result));
       return result;
+    }
     fwd.type = DOCA_FLOW_FWD_PIPE;
     fwd.next_pipe = gate_pipe;
   } else {
@@ -768,11 +772,22 @@ static doca_error_t bind_sf_return_context(
       pipeline->runtime->queue_id, pipeline->sf_return_pipe, &return_match, 0,
       &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
       &free_context->return_rule.cookie, &free_context->return_rule.entry);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=entry-add vs=%u "
+                    "mode=%s target=%u error=%s\n",
+            vswitch_id, directed ? "directed" : "flood",
+            directed ? target_port_id : UINT16_MAX,
+            doca_error_get_descr(result));
     return result;
+  }
   result = process_rules(pipeline, &free_context->return_rule, 1);
   if (result != DOCA_SUCCESS) {
     doca_error_t original_error = result;
+    fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=entry-commit vs=%u "
+                    "mode=%s target=%u error=%s\n",
+            vswitch_id, directed ? "directed" : "flood",
+            directed ? target_port_id : UINT16_MAX,
+            doca_error_get_descr(result));
     doca_error_t cleanup = remove_rule(pipeline, &free_context->return_rule,
                                        "rollback SF return context");
     return cleanup == DOCA_SUCCESS ? original_error : cleanup;

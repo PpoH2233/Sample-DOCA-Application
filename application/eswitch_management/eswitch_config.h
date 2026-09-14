@@ -10,6 +10,7 @@
 #define ESWITCH_RESPONSE_SIZE (128U * 1024U)
 #define ESWITCH_HW_ROUTE_DEFAULT_CAPACITY 1024U
 #define ESWITCH_HW_ROUTE_MIN_CAPACITY 64U
+#define ESWITCH_HW_ACTIONS_MEM_MIN_SIZE (256U * 1024U)
 
 /* 0 means "not assigned" and is never a valid virtual-switch ID. */
 #define ESWITCH_MIN_VSWITCH_ID 1U
