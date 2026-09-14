@@ -6,7 +6,8 @@ test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
 `pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
 Router commands persist desired configuration. Addressed private vs-link RIFs
 support gateway ARP, local ICMP and Arm longest-prefix routing between private
-vSwitches. Public routing, hardware LPM, CT and NAT are not implemented.
+vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active;
+hardware LPM and CT are not implemented.
 The default VF scope is now `7-15`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
 /build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported

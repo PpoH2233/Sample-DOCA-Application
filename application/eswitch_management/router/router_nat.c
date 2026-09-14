@@ -6,8 +6,17 @@
 #define IPV4_MIN_HEADER_LEN 20U
 #define TCP_MIN_HEADER_LEN 20U
 #define UDP_HEADER_LEN 8U
+#define ICMP_ECHO_HEADER_LEN 8U
+#define IPPROTO_ICMP_VALUE 1U
 #define IPPROTO_TCP_VALUE 6U
 #define IPPROTO_UDP_VALUE 17U
+#define ICMP_ECHO_REPLY 0U
+#define ICMP_ECHO_REQUEST 8U
+
+enum packet_direction {
+  PACKET_OUTBOUND,
+  PACKET_INBOUND,
+};
 
 struct packet_view {
   uint8_t *ip;
@@ -77,9 +86,13 @@ static uint16_t transport_checksum(const struct packet_view *view) {
   return checksum_finish(sum);
 }
 
+static uint16_t icmp_checksum(const struct packet_view *view) {
+  return checksum_finish(checksum_add(0, view->l4, view->l4_length));
+}
+
 static enum router_nat_result packet_copy_and_parse(
     const uint8_t *frame, size_t length, uint8_t *output, size_t capacity,
-    struct packet_view *view) {
+    enum packet_direction direction, struct packet_view *view) {
   uint16_t total_length;
   uint16_t fragment;
 
@@ -108,9 +121,12 @@ static enum router_nat_result packet_copy_and_parse(
   if ((view->protocol == IPPROTO_TCP_VALUE &&
        view->l4_length < TCP_MIN_HEADER_LEN) ||
       (view->protocol == IPPROTO_UDP_VALUE &&
-       view->l4_length < UDP_HEADER_LEN))
+       view->l4_length < UDP_HEADER_LEN) ||
+      (view->protocol == IPPROTO_ICMP_VALUE &&
+       view->l4_length < ICMP_ECHO_HEADER_LEN))
     return ROUTER_NAT_INVALID;
-  if (view->protocol != IPPROTO_TCP_VALUE &&
+  if (view->protocol != IPPROTO_ICMP_VALUE &&
+      view->protocol != IPPROTO_TCP_VALUE &&
       view->protocol != IPPROTO_UDP_VALUE)
     return ROUTER_NAT_UNSUPPORTED;
   if (view->protocol == IPPROTO_TCP_VALUE) {
@@ -119,31 +135,56 @@ static enum router_nat_result packet_copy_and_parse(
     if (tcp_header_length < TCP_MIN_HEADER_LEN ||
         tcp_header_length > view->l4_length || transport_checksum(view) != 0)
       return ROUTER_NAT_INVALID;
-  } else if (read16(view->l4 + 4) != view->l4_length ||
-             (read16(view->l4 + 6) != 0 && transport_checksum(view) != 0)) {
-    return ROUTER_NAT_INVALID;
+  } else if (view->protocol == IPPROTO_UDP_VALUE) {
+    if (read16(view->l4 + 4) != view->l4_length ||
+        (read16(view->l4 + 6) != 0 && transport_checksum(view) != 0))
+      return ROUTER_NAT_INVALID;
+  } else {
+    uint8_t expected_type = direction == PACKET_OUTBOUND
+                                ? ICMP_ECHO_REQUEST
+                                : ICMP_ECHO_REPLY;
+
+    if (view->l4[0] != expected_type || view->l4[1] != 0)
+      return ROUTER_NAT_UNSUPPORTED;
+    if (icmp_checksum(view) != 0)
+      return ROUTER_NAT_INVALID;
   }
   view->frame_length = ETH_HEADER_LEN + total_length;
   view->source_ip = read32(view->ip + 12);
   view->destination_ip = read32(view->ip + 16);
-  view->source_port = read16(view->l4);
-  view->destination_port = read16(view->l4 + 2);
+  if (view->protocol == IPPROTO_ICMP_VALUE) {
+    uint16_t identifier = read16(view->l4 + 4);
+
+    view->source_port = direction == PACKET_OUTBOUND ? identifier : 0;
+    view->destination_port = direction == PACKET_INBOUND ? identifier : 0;
+  } else {
+    view->source_port = read16(view->l4);
+    view->destination_port = read16(view->l4 + 2);
+  }
   return ROUTER_NAT_TRANSLATED;
 }
 
 static void update_checksums(struct packet_view *view) {
-  uint16_t checksum_offset = view->protocol == IPPROTO_TCP_VALUE ? 16U : 6U;
+  uint16_t checksum_offset;
+  uint16_t value;
   bool udp_checksum_disabled = view->protocol == IPPROTO_UDP_VALUE &&
-                               read16(view->l4 + checksum_offset) == 0;
+                               read16(view->l4 + 6) == 0;
 
   view->ip[10] = 0;
   view->ip[11] = 0;
   write16(view->ip + 10, ipv4_checksum(view->ip, view->ip_header_length));
+  if (view->protocol == IPPROTO_ICMP_VALUE) {
+    view->l4[2] = 0;
+    view->l4[3] = 0;
+    write16(view->l4 + 2, icmp_checksum(view));
+    return;
+  }
   if (udp_checksum_disabled)
     return;
+  checksum_offset = view->protocol == IPPROTO_TCP_VALUE ? 16U : 6U;
   view->l4[checksum_offset] = 0;
   view->l4[checksum_offset + 1] = 0;
-  uint16_t value = transport_checksum(view);
+  value = transport_checksum(view);
   if (view->protocol == IPPROTO_UDP_VALUE && value == 0)
     value = UINT16_MAX;
   write16(view->l4 + checksum_offset, value);
@@ -246,7 +287,8 @@ enum router_nat_result router_nat_outbound(
   if (!table || !policy || !inside || !public_ip || !policy->vr_id ||
       policy->port_first < 1024 || policy->port_first > policy->port_last)
     return ROUTER_NAT_INVALID;
-  result = packet_copy_and_parse(frame, length, output, capacity, &view);
+  result = packet_copy_and_parse(frame, length, output, capacity,
+                                 PACKET_OUTBOUND, &view);
   if (result != ROUTER_NAT_TRANSLATED) {
     if (result == ROUTER_NAT_UNSUPPORTED) table->stats.unsupported_packets++;
     else table->stats.invalid_packets++;
@@ -260,7 +302,10 @@ enum router_nat_result router_nat_outbound(
     return ROUTER_NAT_FULL;
   }
   write32(view.ip + 12, s->public_ip);
-  write16(view.l4, s->public_port);
+  if (view.protocol == IPPROTO_ICMP_VALUE)
+    write16(view.l4 + 4, s->public_port);
+  else
+    write16(view.l4, s->public_port);
   view.source_ip = s->public_ip;
   view.source_port = s->public_port;
   update_checksums(&view);
@@ -271,6 +316,8 @@ enum router_nat_result router_nat_outbound(
   s->last_seen_ns = now_ns;
   s->original_packets++;
   table->stats.outbound_packets++;
+  if (view.protocol == IPPROTO_ICMP_VALUE)
+    table->stats.icmp_echo_outbound_packets++;
   if (session) *session = s;
   return ROUTER_NAT_TRANSLATED;
 }
@@ -287,7 +334,8 @@ enum router_nat_result router_nat_inbound(
   if (session) *session = NULL;
   if (!table || !vr_id)
     return ROUTER_NAT_INVALID;
-  result = packet_copy_and_parse(frame, length, output, capacity, &view);
+  result = packet_copy_and_parse(frame, length, output, capacity,
+                                 PACKET_INBOUND, &view);
   if (result != ROUTER_NAT_TRANSLATED) {
     if (result == ROUTER_NAT_UNSUPPORTED) table->stats.unsupported_packets++;
     else table->stats.invalid_packets++;
@@ -299,13 +347,18 @@ enum router_nat_result router_nat_inbound(
     return ROUTER_NAT_NOT_APPLICABLE;
   }
   write32(view.ip + 16, s->inside_ip);
-  write16(view.l4 + 2, s->inside_port);
+  if (view.protocol == IPPROTO_ICMP_VALUE)
+    write16(view.l4 + 4, s->inside_port);
+  else
+    write16(view.l4 + 2, s->inside_port);
   view.destination_ip = s->inside_ip;
   view.destination_port = s->inside_port;
   update_checksums(&view);
   s->last_seen_ns = now_ns;
   s->reply_packets++;
   table->stats.inbound_packets++;
+  if (view.protocol == IPPROTO_ICMP_VALUE)
+    table->stats.icmp_echo_inbound_packets++;
   if (session) *session = s;
   return ROUTER_NAT_TRANSLATED;
 }
@@ -316,8 +369,12 @@ void router_nat_age(struct router_nat_table *table, uint64_t now_ns) {
     struct router_nat_session *s = &table->entries[i];
     uint64_t timeout;
     if (!s->used) continue;
-    timeout = s->protocol == IPPROTO_TCP_VALUE ? ROUTER_NAT_TCP_IDLE_NS
-                                               : ROUTER_NAT_UDP_IDLE_NS;
+    if (s->protocol == IPPROTO_TCP_VALUE)
+      timeout = ROUTER_NAT_TCP_IDLE_NS;
+    else if (s->protocol == IPPROTO_UDP_VALUE)
+      timeout = ROUTER_NAT_UDP_IDLE_NS;
+    else
+      timeout = ROUTER_NAT_ICMP_IDLE_NS;
     if (now_ns - s->last_seen_ns <= timeout) continue;
     *s = (struct router_nat_session){0};
     table->count--;

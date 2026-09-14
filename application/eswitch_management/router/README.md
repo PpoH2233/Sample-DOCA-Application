@@ -1,8 +1,8 @@
 # Router implementation status
 
 This implementation provides private gateway ARP, local IPv4 ICMP echo,
-IPv4 routing between vSwitch RIFs, and stateful TCP/UDP NAPT through one public
-port per VR. Longest-prefix lookup, neighbor handling and NAT sessions currently
+IPv4 routing between vSwitch RIFs, and stateful TCP/UDP plus ICMP Echo NAT
+through one public port per VR. Longest-prefix lookup, neighbor handling and NAT sessions currently
 run on Arm; DOCA Flow performs ingress classification and directed SF return.
 Private addressed RIFs report `ACTIVE_ARM_LPM`. An addressed public RIF reports
 `ACTIVE_ARM_UPLINK`, or `ACTIVE_ARM_NAT` while its NAT policy is enabled. No API
@@ -82,9 +82,9 @@ a neighbor miss it sends a rate-limited ARP request through the egress RIF and
 drops the current packet. A retry is forwarded after resolution.
 Forwarding rewrites destination/source Ethernet addresses, decrements IPv4 TTL,
 recomputes the IPv4 header checksum, and transmits through a directed SF
-context for the neighbor's learned port. Route miss, TTL expiry, unsupported
-NAT protocols/fragments and invalid IPv4 fail closed; ICMP error generation is
-a later milestone.
+context for the neighbor's learned port. Route miss, TTL expiry, IPv4
+fragments, ICMP messages other than Echo, unsupported protocols and invalid
+IPv4 fail closed; ICMP error generation is a later milestone.
 
 ```text
 VM-A -> VS-A -> ingress RIF -> Arm LPM -> egress RIF
@@ -143,7 +143,7 @@ eswitch_management/
     router_icmp.c             validated local ICMP echo reply builder
     router_forward.c          per-VR IPv4 LPM and forwarding rewrite
     router_neighbor.c         per-VR/RIF ARP neighbor cache and probe control
-    router_nat.c              TCP/UDP NAPT sessions and checksum translation
+    router_nat.c              TCP/UDP/ICMP Echo NAT sessions and checksums
 ```
 
 ## Commands implemented
@@ -181,7 +181,7 @@ rejected; identical subnets in different VRs are permitted.
 The generated RIF MAC is a locally administered placeholder; configure the
 public VF's accepted MAC before enabling its dataplane.
 
-The NAT control plane accepts one TCP/UDP SNAT/PAT policy per VR once an
+The NAT control plane accepts one TCP/UDP/ICMP Echo NAT policy per VR once an
 addressed public port owns the default route:
 
 ```sh
@@ -193,13 +193,14 @@ eswitchctl vr nat disable --id 100
 
 The policy is persisted, validated transactionally, and blocks removal of its
 uplink address/default route. `router_nat.c` implements a bounded 4096-entry
-5-tuple session table, collision-free PAT allocation within the configured
-range, TCP/UDP checksum repair, reverse translation, and idle aging. The public
+session table, collision-free translated endpoint allocation within the
+configured range, TCP/UDP checksum repair, ICMP Echo Identifier translation,
+reverse translation, and protocol-specific idle aging. The public
 representor is classified directly to the Arm RSS path with `(VR, port)`
 metadata; it is not allowed into tenant L2 learning. Public ARP is RIF-scoped.
 
 ```text
-VM -> private VS/RIF -> Arm LPM -> TCP/UDP SNAT/PAT
+VM -> private VS/RIF -> Arm LPM -> TCP/UDP SNAT/PAT or ICMP Echo ID NAT
    -> public RIF/next-hop rewrite -> directed SF context -> uplink representor
 
 uplink representor -> Arm reverse-session lookup -> DNAT
@@ -210,11 +211,15 @@ The first outbound packet may be dropped while the public next-hop ARP entry is
 resolved; retrying the connection should then create a NAT session. Reverse
 traffic is accepted only when its VR, protocol, public tuple and remote tuple
 match an active session, and is returned only to the private VS/port recorded by
-that session. IPv4 fragments and protocols other than TCP/UDP fail closed in
-this MVP. ICMP echo through NAT, hairpin NAT, static DNAT/port-forwarding and
-hardware CT are not implemented yet.
+that session. ICMP Echo Request (`type 8/code 0`) maps the original Identifier
+to an Identifier from the configured port range; the corresponding Echo Reply
+(`type 0/code 0`) restores it. IPv4 fragments, other ICMP message types, and
+protocols other than TCP/UDP/ICMP fail closed. Hairpin NAT, static
+DNAT/port-forwarding, ICMP error-message translation and hardware CT are not
+implemented yet.
 
-Example acceptance test, using a reachable TCP service beyond the uplink:
+Example acceptance test, using a reachable target and TCP service beyond the
+uplink:
 
 ```sh
 # DPU
@@ -222,16 +227,18 @@ eswitchctl vr nat show --id 100
 eswitchctl status | grep -E 'nat_dataplane|nat_sessions|nat_out|nat_in'
 
 # private VM; the first attempt may only trigger next-hop ARP
+ping -c 5 <remote-ip>
 nc -vz -w 2 <remote-ip> <tcp-port>
 nc -vz -w 2 <remote-ip> <tcp-port>
 
 # DPU/public endpoint captures
-tcpdump -eni <public-endpoint> -nn 'tcp or udp or arp'
+tcpdump -eni <public-endpoint> -nn 'icmp or tcp or udp or arp'
 ```
 
 Acceptance requires the public capture to show source IP equal to the public
-RIF address and source port in the configured PAT range; reply traffic must
-reach the originating VM. `nat_sessions`, `nat_out`, `nat_in`,
+RIF address and a source port or ICMP Echo Identifier in the configured range;
+reply traffic must reach the originating VM. `nat_sessions`, `nat_out`,
+`nat_in`, `nat_icmp_echo_out`, `nat_icmp_echo_in`,
 `routed_forwarded`, and the target egress-gate counter should increase. A
 successful SF `sendto()` alone is not delivery proof.
 
@@ -267,8 +274,8 @@ families in `doca-samples/samples/doca_flow/`:
 
 Remaining work: DOCA Flow CT initialization and per-VR zones, hardware
 LPM/adjacency programming, CT/session synchronization, route invalidation,
-first-packet promotion, ICMP NAT, checksum/TTL/MTU exception generation, and
-durable config/hardware rollback. The daemon probes
+first-packet promotion, ICMP error-message NAT, checksum/TTL/MTU exception
+generation, and durable config/hardware rollback. The daemon probes
 `doca_flow_ct_cap_is_dev_supported()` and reports the result, but deliberately
 keeps `hw_ct_state=NOT_INITIALIZED` until the CT lifecycle and both directions
 can be installed atomically.

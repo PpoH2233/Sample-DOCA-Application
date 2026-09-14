@@ -1272,7 +1272,7 @@ static size_t format_status(const struct eswitch_manager *manager,
                      "router_dataplane=GATEWAY_ARP_ICMP_ARM_LPM_NAT44\n",
                      manager->router ? manager->router->vr_count : 0);
   used = append_text(response, size, used,
-      "nat_dataplane=ARM_NAPT_TCP_UDP hw_ct_capability=%s "
+      "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
       "hw_ct_state=NOT_INITIALIZED\n",
       manager->hardware_ct_supported ? "supported" : "unsupported");
   used = append_text(response, size, used,
@@ -1291,6 +1291,10 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->nat ? manager->nat->stats.unsupported_packets : 0,
       manager->nat ? manager->nat->stats.invalid_packets : 0,
       manager->nat ? manager->nat->stats.port_allocation_failures : 0);
+  used = append_text(response, size, used,
+      "nat_icmp_echo_out=%" PRIu64 " nat_icmp_echo_in=%" PRIu64 "\n",
+      manager->nat ? manager->nat->stats.icmp_echo_outbound_packets : 0,
+      manager->nat ? manager->nat->stats.icmp_echo_inbound_packets : 0);
   used = append_text(response, size, used,
       "private_gateway_arp=enabled arp_sf_tx_sent=%" PRIu64
       " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",

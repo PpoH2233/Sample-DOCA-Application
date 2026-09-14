@@ -68,7 +68,8 @@ bool router_command_valid(const char *, char *, size_t);
 /* Works on a transaction candidate. Caller persists before publishing it.
  * Returns false on failure, with an ERR response. changed means config changed.
  * Private VS interfaces report the Arm LPM milestone. Public interfaces are
- * steered to Arm and become active for TCP/UDP NAPT when a policy exists. */
+ * steered to Arm and become active for TCP/UDP/ICMP Echo NAT when a policy
+ * exists. */
 bool router_command(struct router_config *, const struct router_inventory *,
                     const char *, char *, size_t, bool *changed);
 bool router_config_save(const char *, const struct router_config *, char *, size_t);

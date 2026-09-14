@@ -10,6 +10,7 @@
 #define ROUTER_NAT_MAX_SESSIONS 4096U
 #define ROUTER_NAT_TCP_IDLE_NS UINT64_C(300000000000)
 #define ROUTER_NAT_UDP_IDLE_NS UINT64_C(60000000000)
+#define ROUTER_NAT_ICMP_IDLE_NS UINT64_C(30000000000)
 
 enum router_nat_result {
   ROUTER_NAT_NOT_APPLICABLE = 0,
@@ -46,6 +47,8 @@ struct router_nat_session {
 struct router_nat_stats {
   uint64_t outbound_packets;
   uint64_t inbound_packets;
+  uint64_t icmp_echo_outbound_packets;
+  uint64_t icmp_echo_inbound_packets;
   uint64_t sessions_created;
   uint64_t sessions_aged;
   uint64_t port_allocation_failures;
@@ -63,9 +66,11 @@ struct router_nat_table {
 
 void router_nat_init(struct router_nat_table *table);
 
-/* Translate one untagged IPv4 TCP/UDP packet. Both functions copy input to
- * output and recompute IPv4 and L4 checksums. All IP/port values stored in
- * sessions are host byte order. IPv4 fragments fail closed in this MVP. */
+/* Translate one untagged IPv4 TCP, UDP, or ICMP Echo packet. ICMP sessions
+ * store the original/translated Echo Identifier in inside_port/public_port;
+ * remote_port is zero. Both functions copy input to output and recompute IPv4
+ * and transport/ICMP checksums. All stored values are host byte order. IPv4
+ * fragments and ICMP messages other than Echo Request/Reply fail closed. */
 enum router_nat_result router_nat_outbound(
     struct router_nat_table *table, const struct router_nat_policy *policy,
     uint32_t public_ip, const struct router_nat_inside *inside,
