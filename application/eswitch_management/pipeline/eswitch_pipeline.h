@@ -88,6 +88,8 @@ struct eswitch_pipeline {
   uint64_t hw_route_updates;
   uint64_t hw_route_removals;
   uint64_t hw_route_failures;
+  uint32_t hw_route_capacity;
+  bool hardware_routing_requested;
   bool hardware_routing_enabled;
   bool hardware_routing_degraded;
   struct eswitch_rule sf_root_rule;
@@ -156,6 +158,7 @@ doca_error_t eswitch_pipeline_egress_query(
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      bool hardware_routing_enabled,
+                                     uint32_t hardware_route_capacity,
                                      struct eswitch_pipeline *pipeline);
 void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline);
 

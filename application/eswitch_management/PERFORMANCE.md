@@ -33,6 +33,11 @@ decrements TTL and forwards through the resolved egress gate. Connected
 neighbors are promoted as /32 entries; private static routes are promoted only
 when their gateway is resolved. Neighbor MAC changes use in-place entry
 updates, and route/RIF/port/neighbor changes reconcile incrementally.
+The HWS action-memory reservation now scales with
+`ESWITCH_HW_ROUTE_CAPACITY` instead of the former fixed 64 KiB allocation.
+The LPM constructor retries smaller power-of-two capacities on resource
+exhaustion and falls back to the existing Arm dataplane if hardware routing
+cannot be admitted, so this optional optimization no longer prevents startup.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The

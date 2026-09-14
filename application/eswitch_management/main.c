@@ -65,6 +65,42 @@ static bool env_enabled(const char *name) {
       strcmp(value, "true") == 0 || strcmp(value, "on") == 0);
 }
 
+static bool parse_hw_route_capacity(uint32_t *capacity) {
+  const char *value = getenv("ESWITCH_HW_ROUTE_CAPACITY");
+  char *end = NULL;
+  unsigned long parsed;
+
+  if (capacity == NULL)
+    return false;
+  if (value == NULL || *value == '\0') {
+    *capacity = ESWITCH_HW_ROUTE_DEFAULT_CAPACITY;
+    return true;
+  }
+  parsed = strtoul(value, &end, 10);
+  if (*value == '-' || end == value || *end != '\0' ||
+      parsed < ESWITCH_HW_ROUTE_MIN_CAPACITY ||
+      parsed > ROUTER_HW_MAX_ROUTES || (parsed & (parsed - 1)) != 0)
+    return false;
+  *capacity = (uint32_t)parsed;
+  return true;
+}
+
+static uint32_t actions_mem_size(bool hardware_routing_enabled,
+                                 uint32_t route_capacity) {
+  uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
+  uint32_t rounded = 1;
+
+  if (hardware_routing_enabled) {
+    uint32_t route_actions =
+        route_capacity * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE + 1024U;
+    if (route_actions > required)
+      required = route_actions;
+  }
+  while (rounded < required)
+    rounded <<= 1;
+  return rounded;
+}
+
 int main(int argc, char **argv) {
   struct switch_devices devices = {0};
   struct dpdk_io io = {0};
@@ -83,6 +119,8 @@ int main(int argc, char **argv) {
   bool hardware_ct_supported = false;
   bool hardware_routing_enabled = env_enabled("ESWITCH_HW_ROUTING");
   bool packet_debug = env_enabled("ESWITCH_PACKET_DEBUG");
+  uint32_t hardware_route_capacity;
+  uint32_t flow_actions_mem_size;
   int separator;
   int exit_status = EXIT_FAILURE;
 
@@ -100,6 +138,14 @@ int main(int argc, char **argv) {
     vf_scope = ESWITCH_DEFAULT_VF_SCOPE;
   if (sf_interface == NULL || *sf_interface == '\0')
     sf_interface = ESWITCH_DEFAULT_SF_INTERFACE;
+  if (!parse_hw_route_capacity(&hardware_route_capacity)) {
+    fprintf(stderr, "ESWITCH_HW_ROUTE_CAPACITY must be a power of two "
+                    "between %u and %u\n",
+            ESWITCH_HW_ROUTE_MIN_CAPACITY, ROUTER_HW_MAX_ROUTES);
+    return EXIT_FAILURE;
+  }
+  flow_actions_mem_size = actions_mem_size(hardware_routing_enabled,
+                                            hardware_route_capacity);
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -138,7 +184,8 @@ int main(int argc, char **argv) {
   printf("TX BUILD: revision=%s compiled=%s %s\n",
          ESWITCH_TX_REVISION, __DATE__, __TIME__);
   printf("TX CONFIG: path=arm-sf-return mode=%s context=rif-mac-to-vswitch "
-         "debug=first-3-then-1/s snapshots=5s\n", ESWITCH_TX_FLOW_MODE);
+         "packet-debug=%s\n", ESWITCH_TX_FLOW_MODE,
+         packet_debug ? "enabled" : "disabled");
   result = flow_runtime_init_with_mode(&runtime, SWITCH_FLOW_COUNTER_COUNT,
                                        ESWITCH_TX_FLOW_MODE);
   if (result != DOCA_SUCCESS) {
@@ -146,7 +193,8 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_io;
   }
-  result = switch_flow_ports_start(&devices.ethernet_ports, &flow_ports);
+  result = switch_flow_ports_start_with_actions_mem(
+      &devices.ethernet_ports, flow_actions_mem_size, &flow_ports);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start DOCA Flow ports: %s\n",
             doca_error_get_descr(result));
@@ -163,10 +211,13 @@ int main(int argc, char **argv) {
   }
   printf("TX DOMAIN: parent=%u lookup=explicit-parent revision=%s\n",
          flow_ports.items[0].ethernet->port_id, ESWITCH_TX_REVISION);
-  printf("HARDWARE ROUTING: configured=%s scope=private-vs-ipv4\n",
-         hardware_routing_enabled ? "enabled" : "disabled");
+  printf("HARDWARE ROUTING: configured=%s requested-capacity=%u "
+         "actions-mem=%u scope=private-vs-ipv4\n",
+         hardware_routing_enabled ? "enabled" : "disabled",
+         hardware_route_capacity, flow_actions_mem_size);
   result = eswitch_pipeline_create(&runtime, &flow_ports,
-                                   hardware_routing_enabled, &pipeline);
+                                   hardware_routing_enabled,
+                                   hardware_route_capacity, &pipeline);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to create eSwitch pipeline: %s\n",
             doca_error_get_descr(result));

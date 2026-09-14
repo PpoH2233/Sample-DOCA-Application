@@ -15,6 +15,12 @@ ESWITCH_VF_SCOPE="7-15"
 # smoke test confirms pipe creation, counters, TTL and exception fallback.
 ESWITCH_HW_ROUTING="0"
 
+# Maximum private hardware routes requested from the HWS LPM table. It must be
+# a power of two from 64 through 1024. The application reserves matching
+# actions memory before starting Flow ports and may admit a smaller table if
+# the device cannot allocate the requested LPM size.
+ESWITCH_HW_ROUTE_CAPACITY="1024"
+
 # Successful slow-path packet traces are expensive at scale. Errors and
 # counters remain active when this is disabled.
 ESWITCH_PACKET_DEBUG="0"

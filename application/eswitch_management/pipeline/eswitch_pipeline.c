@@ -422,23 +422,40 @@ static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
   desc.field_op.dst.bit_offset = 0;
   desc.field_op.width = 8;
 
-  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
-  if (result != DOCA_SUCCESS)
-    return result;
-  result = set_pipe_identity(cfg, "ESW_ROUTER_LPM", DOCA_FLOW_PIPE_LPM,
-                             false, ROUTER_HW_MAX_ROUTES);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL,
-                                            descs_array, 1);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, &fwd, &miss,
-                                   &pipeline->route_lpm_pipe);
-  doca_flow_pipe_cfg_destroy(cfg);
-  return result;
+  for (;;) {
+    result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+    if (result != DOCA_SUCCESS)
+      return result;
+    result = set_pipe_identity(cfg, "ESW_ROUTER_LPM", DOCA_FLOW_PIPE_LPM,
+                               false, pipeline->hw_route_capacity);
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL,
+                                              descs_array, 1);
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
+    if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_create(cfg, &fwd, &miss,
+                                     &pipeline->route_lpm_pipe);
+    doca_flow_pipe_cfg_destroy(cfg);
+    cfg = NULL;
+    if (result == DOCA_SUCCESS) {
+      printf("Hardware IPv4 LPM admitted capacity=%u\n",
+             pipeline->hw_route_capacity);
+      return DOCA_SUCCESS;
+    }
+    if (pipeline->route_lpm_pipe != NULL) {
+      doca_flow_pipe_destroy(pipeline->route_lpm_pipe);
+      pipeline->route_lpm_pipe = NULL;
+    }
+    if (result != DOCA_ERROR_NO_MEMORY ||
+        pipeline->hw_route_capacity <= ESWITCH_HW_ROUTE_MIN_CAPACITY)
+      return result;
+    pipeline->hw_route_capacity >>= 1;
+    fprintf(stderr, "Hardware IPv4 LPM resource retry: capacity=%u\n",
+            pipeline->hw_route_capacity);
+  }
 }
 
 static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
@@ -1026,16 +1043,24 @@ doca_error_t eswitch_pipeline_egress_query(
 doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      bool hardware_routing_enabled,
+                                     uint32_t hardware_route_capacity,
                                      struct eswitch_pipeline *pipeline) {
   doca_error_t result;
 
   if (runtime == NULL || ports == NULL || pipeline == NULL ||
       !runtime->initialized || !ports->started || ports->count < 2)
     return DOCA_ERROR_INVALID_VALUE;
+  if (hardware_routing_enabled &&
+      (hardware_route_capacity < ESWITCH_HW_ROUTE_MIN_CAPACITY ||
+       hardware_route_capacity > ROUTER_HW_MAX_ROUTES ||
+       (hardware_route_capacity & (hardware_route_capacity - 1)) != 0))
+    return DOCA_ERROR_INVALID_VALUE;
   pipeline->runtime = runtime;
   pipeline->ports = ports;
   pipeline->switch_port = ports->switch_port;
+  pipeline->hardware_routing_requested = hardware_routing_enabled;
   pipeline->hardware_routing_enabled = hardware_routing_enabled;
+  pipeline->hw_route_capacity = hardware_route_capacity;
 
 #define CREATE_STAGE(label, call)                                             \
   do {                                                                        \
@@ -1056,9 +1081,32 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   CREATE_STAGE("learning dispatch", create_learning_dispatch(pipeline));
   CREATE_STAGE("source guard", create_source_guard(pipeline));
   if (pipeline->hardware_routing_enabled) {
-    CREATE_STAGE("router IPv4 LPM", create_route_lpm(pipeline));
-    CREATE_STAGE("router eligibility", create_route_control(pipeline));
-    CREATE_STAGE("router MAC selector", create_route_selector(pipeline));
+    printf("Creating eSwitch stage: router IPv4 LPM\n");
+    result = create_route_lpm(pipeline);
+    if (result == DOCA_SUCCESS) {
+      printf("Creating eSwitch stage: router eligibility\n");
+      result = create_route_control(pipeline);
+    }
+    if (result == DOCA_SUCCESS) {
+      printf("Creating eSwitch stage: router MAC selector\n");
+      result = create_route_selector(pipeline);
+    }
+    if (result != DOCA_SUCCESS) {
+      fprintf(stderr, "Hardware routing unavailable (%s); continuing with "
+                      "Arm slow path\n",
+              doca_error_get_descr(result));
+      if (pipeline->route_selector_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->route_selector_pipe);
+      if (pipeline->route_control_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->route_control_pipe);
+      if (pipeline->route_lpm_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->route_lpm_pipe);
+      pipeline->route_selector_pipe = NULL;
+      pipeline->route_control_pipe = NULL;
+      pipeline->route_lpm_pipe = NULL;
+      pipeline->hardware_routing_enabled = false;
+      pipeline->hardware_routing_degraded = true;
+    }
   }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
@@ -1310,7 +1358,7 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
 
   if (pipeline == NULL || !pipeline->created ||
       (route_count != 0 && routes == NULL) ||
-      route_count > ROUTER_HW_MAX_ROUTES)
+      route_count > pipeline->hw_route_capacity)
     return DOCA_ERROR_INVALID_VALUE;
   if (!pipeline->hardware_routing_enabled)
     return DOCA_SUCCESS;

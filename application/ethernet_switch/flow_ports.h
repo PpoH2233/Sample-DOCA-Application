@@ -24,6 +24,9 @@ struct switch_flow_ports {
 /* Bind every probed parent/representor ethdev to a DOCA Flow port. */
 doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
                                      struct switch_flow_ports *ports);
+doca_error_t switch_flow_ports_start_with_actions_mem(
+    struct ethernet_ports *ethernet_ports, uint32_t actions_mem_size,
+    struct switch_flow_ports *ports);
 
 /* Flush and stop endpoint ports in reverse order, proxy/parent last. */
 doca_error_t switch_flow_ports_stop(struct switch_flow_ports *ports);

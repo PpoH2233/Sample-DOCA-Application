@@ -439,12 +439,12 @@ doca_error_t eswitch_manager_hw_routes_sync(
     return DOCA_ERROR_INVALID_VALUE;
   if (!manager->pipeline->hardware_routing_enabled)
     return DOCA_SUCCESS;
-  routes = calloc(ROUTER_HW_MAX_ROUTES, sizeof(*routes));
+  routes = calloc(manager->pipeline->hw_route_capacity, sizeof(*routes));
   if (routes == NULL)
     return DOCA_ERROR_NO_MEMORY;
   route_count = router_hw_routes_build(config, &manager->neighbors,
                                        monotonic_ns(), routes,
-                                       ROUTER_HW_MAX_ROUTES);
+                                       manager->pipeline->hw_route_capacity);
   /* A neighbor is useful only while its VF remains owned by the expected VS.
    * This closes the stale-adjacency window across port moves. */
   for (size_t i = 0; i < route_count;) {
@@ -1367,13 +1367,15 @@ static size_t format_status(const struct eswitch_manager *manager,
                          : "GATEWAY_ARP_ICMP_ARM_LPM_NAT44");
   used = append_text(response, size, used,
       "hw_routing_configured=%s hw_state=%s hw_scope=private-vs-ipv4 "
-      "hw_routes=%zu promotions=%" PRIu64 " updates=%" PRIu64
+      "hw_capacity=%u hw_routes=%zu promotions=%" PRIu64 " updates=%" PRIu64
       " removals=%" PRIu64 " failures=%" PRIu64
       " lpm_misses=%" PRIu64 " counter_state=%s\n",
-      manager->pipeline->hardware_routing_enabled ? "enabled" : "disabled",
-      !manager->pipeline->hardware_routing_enabled ? "off" :
-          (manager->pipeline->hardware_routing_degraded ? "degraded" :
-                                                         "ready"),
+      manager->pipeline->hardware_routing_requested ? "enabled" : "disabled",
+      !manager->pipeline->hardware_routing_requested ? "off" :
+          (!manager->pipeline->hardware_routing_enabled ? "fallback-arm" :
+           (manager->pipeline->hardware_routing_degraded ? "degraded" :
+                                                          "ready")),
+      manager->pipeline->hw_route_capacity,
       manager->pipeline->hw_route_count,
       manager->pipeline->hw_route_promotions,
       manager->pipeline->hw_route_updates,

@@ -6,6 +6,7 @@
 #include "switch_config.h"
 
 static doca_error_t start_one_port(struct ethernet_port *ethernet,
+                                   uint32_t actions_mem_size,
                                    struct doca_flow_port **flow_port) {
   struct doca_flow_port_cfg *cfg = NULL;
   doca_error_t result;
@@ -25,7 +26,7 @@ static doca_error_t start_one_port(struct ethernet_port *ethernet,
    * the DOCA Flow Tune tool once the pipeline is stable.
    */
   result = doca_flow_port_cfg_set_actions_mem_size(
-      cfg, SWITCH_ACTIONS_MEM_SIZE);
+      cfg, actions_mem_size);
   if (result != DOCA_SUCCESS)
     goto destroy_cfg;
 
@@ -63,11 +64,18 @@ destroy_cfg:
 
 doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
                                      struct switch_flow_ports *ports) {
+  return switch_flow_ports_start_with_actions_mem(
+      ethernet_ports, SWITCH_ACTIONS_MEM_SIZE, ports);
+}
+
+doca_error_t switch_flow_ports_start_with_actions_mem(
+    struct ethernet_ports *ethernet_ports, uint32_t actions_mem_size,
+    struct switch_flow_ports *ports) {
   struct ethernet_port *parent;
   uint16_t total_count;
   doca_error_t result;
 
-  if (ethernet_ports == NULL || ports == NULL ||
+  if (ethernet_ports == NULL || ports == NULL || actions_mem_size == 0 ||
       !ethernet_ports->is_probed || ethernet_ports->count == 0)
     return DOCA_ERROR_INVALID_VALUE;
   if (ports->started)
@@ -90,7 +98,7 @@ doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
 
   ports->items[0].ethernet = parent;
   printf("Starting DOCA Flow parent port %u\n", parent->port_id);
-  result = start_one_port(parent, &ports->items[0].flow);
+  result = start_one_port(parent, actions_mem_size, &ports->items[0].flow);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start parent DPDK port %u: %s\n",
             parent->port_id, doca_error_get_descr(result));
@@ -116,7 +124,7 @@ doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
              ethernet->port_id, ethernet->host_index, ethernet->pf_index,
              ethernet->vf_index);
 
-    result = start_one_port(ethernet, &flow_port->flow);
+    result = start_one_port(ethernet, actions_mem_size, &flow_port->flow);
     if (result != DOCA_SUCCESS) {
       fprintf(stderr, "Failed to start representor DPDK port %u: %s\n",
               ethernet->port_id, doca_error_get_descr(result));
