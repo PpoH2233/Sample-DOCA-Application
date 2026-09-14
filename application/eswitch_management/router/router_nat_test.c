@@ -5,29 +5,66 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint16_t read16(const uint8_t *p) {
-  return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
+static uint16_t read16(const uint8_t *p)
+{
+	return (uint16_t)((uint16_t)p[0] << 8 | p[1]);
 }
-static uint32_t read32(const uint8_t *p) {
-  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
-         (uint32_t)p[2] << 8 | p[3];
+
+static uint32_t read32(const uint8_t *p)
+{
+	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+	       (uint32_t)p[2] << 8 | p[3];
 }
-static void write16(uint8_t *p,uint16_t v) {p[0]=(uint8_t)(v>>8);p[1]=(uint8_t)v;}
-static void write32(uint8_t *p,uint32_t v) {
-  p[0]=(uint8_t)(v>>24);p[1]=(uint8_t)(v>>16);p[2]=(uint8_t)(v>>8);p[3]=(uint8_t)v;
+
+static void write16(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)(v >> 8);
+	p[1] = (uint8_t)v;
 }
-static uint32_t add(uint32_t sum,const uint8_t *p,size_t n) {
-  while(n>=2){sum+=read16(p);p+=2;n-=2;}if(n)sum+=(uint16_t)*p<<8;return sum;
+
+static void write32(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)(v >> 24);
+	p[1] = (uint8_t)(v >> 16);
+	p[2] = (uint8_t)(v >> 8);
+	p[3] = (uint8_t)v;
 }
-static uint16_t finish(uint32_t sum) {
-  while(sum>>16)sum=(sum&UINT16_MAX)+(sum>>16);return (uint16_t)~sum;
+
+static uint32_t add(uint32_t sum, const uint8_t *p, size_t n)
+{
+	while (n >= 2) {
+		sum += read16(p);
+		p += 2;
+		n -= 2;
+	}
+	if (n != 0)
+		sum += (uint16_t)*p << 8;
+	return sum;
 }
-static uint16_t checksum(const uint8_t *p,size_t n) {return finish(add(0,p,n));}
-static uint16_t l4_checksum(const uint8_t *ip) {
-  uint16_t total=read16(ip+2),ihl=(uint16_t)(ip[0]&15U)*4U,l4len=total-ihl;
-  uint8_t pseudo[4]={0,ip[9],(uint8_t)(l4len>>8),(uint8_t)l4len};
-  uint32_t sum=add(0,ip+12,8);sum=add(sum,pseudo,4);sum=add(sum,ip+ihl,l4len);
-  return finish(sum);
+
+static uint16_t finish(uint32_t sum)
+{
+	while ((sum >> 16) != 0)
+		sum = (sum & UINT16_MAX) + (sum >> 16);
+	return (uint16_t)~sum;
+}
+
+static uint16_t checksum(const uint8_t *p, size_t n)
+{
+	return finish(add(0, p, n));
+}
+
+static uint16_t l4_checksum(const uint8_t *ip)
+{
+	uint16_t total = read16(ip + 2);
+	uint16_t ihl = (uint16_t)(ip[0] & 15U) * 4U;
+	uint16_t l4len = total - ihl;
+	uint8_t pseudo[4] = {0, ip[9], (uint8_t)(l4len >> 8), (uint8_t)l4len};
+	uint32_t sum = add(0, ip + 12, 8);
+
+	sum = add(sum, pseudo, 4);
+	sum = add(sum, ip + ihl, l4len);
+	return finish(sum);
 }
 static size_t make_packet(uint8_t *frame,uint8_t protocol,uint32_t src,
                           uint16_t sport,uint32_t dst,uint16_t dport) {
