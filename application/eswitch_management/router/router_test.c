@@ -57,11 +57,20 @@ int main(void) {
   command("vr route add --id 100 --prefix 10.0.0.1/8 --via 200.20.0.1 --interface p1",false);
   command("vr route add --id 100 --prefix 0.0.0.0/0 --via 200.20.0.1 --interface p1",true);
   command("vr route add --id 100 --prefix 0.0.0.0/0 --via 200.20.0.2 --interface p1",false);
+  command("vr nat enable --id 100 --interface p2 --address interface --port-range 20000-60999",false);
+  command("vr nat enable --id 100 --interface p1 --address 200.20.0.5 --port-range 20000-60999",false);
+  command("vr nat enable --id 100 --interface p1 --address interface --port-range 1-65535",false);
+  command("vr nat enable --id 100 --interface p1 --address interface --port-range 20000-60999",true);
+  command("vr nat enable --id 100 --interface p1 --address interface --port-range 20000-60999",false);
+  command("vr nat show --id 100",true);
+  assert(strstr(response,"nat=enabled") && strstr(response,"address=200.20.0.4") &&
+         strstr(response,"ports=20000-60999"));
+  command("vr route del --id 100 --prefix 0.0.0.0/0",false);
   command("vr ip del --id 100 --interface p1 --address 200.20.0.4/16",false);
   command("vr switch-detach --id 100 --interface p1",false);
   command("vr port-detach --id 100 --interface p1",false);
   command("vr show-interface --id 100",true);
-  assert(strstr(response,"vf=11") && strstr(response,"PENDING_DATAPLANE") &&
+  assert(strstr(response,"vf=11") && strstr(response,"ACTIVE_ARM_NAT") &&
          strstr(response,"ACTIVE_ARM_LPM"));
   command("vr route show --id 100",true);
   assert(strstr(response,"connected 192.168.0.0/24") && strstr(response,"static 0.0.0.0/0"));
@@ -74,11 +83,14 @@ int main(void) {
   struct router_config loaded;router_config_init(&loaded);
   assert(router_config_load(path,&loaded,response,sizeof(response)));
   assert(loaded.vr_count==config.vr_count && loaded.route_count==config.route_count);
+  assert(loaded.nat_policy_count==config.nat_policy_count);
   assert(loaded.interface_count==config.interface_count && loaded.next_interface_id==config.next_interface_id);
   for(size_t i=0;i<config.interface_count;i++)
     assert(!memcmp(&loaded.interfaces[i],&config.interfaces[i],sizeof(config.interfaces[i])));
   for(size_t i=0;i<config.route_count;i++)
     assert(!memcmp(&loaded.routes[i],&config.routes[i],sizeof(config.routes[i])));
+  for(size_t i=0;i<config.nat_policy_count;i++)
+    assert(!memcmp(&loaded.nat_policies[i],&config.nat_policies[i],sizeof(config.nat_policies[i])));
   /* Malformed restore must not publish partial configuration. */
   FILE *file=fopen(path,"a");assert(file);assert(fputs("vr delete --id 101\n",file)>=0);assert(fclose(file)==0);
   struct router_config before=loaded;
@@ -86,6 +98,9 @@ int main(void) {
   assert(!memcmp(&before,&loaded,sizeof(loaded)));
   assert(unlink(path)==0);assert(rmdir(dir)==0);
 
+  command("vr nat disable --id 100",true);
+  command("vr nat show --id 100",true);
+  assert(strstr(response,"nat=disabled"));
   command("vr route del --id 100 --prefix 0.0.0.0/0",true);
   command("vr ip del --id 100 --interface p1 --address 200.20.0.4/16",true);
   command("vr port-detach --id 100 --interface p1",true);

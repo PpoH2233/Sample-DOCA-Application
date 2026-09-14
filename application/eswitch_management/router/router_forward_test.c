@@ -41,13 +41,16 @@ int main(void) {
   const uint8_t vm_b[6]={0x52,0x54,0,0x12,0x34,0x56};
 
   router_config_init(&config);config.vr_ids[0]=101;config.vr_count=1;
-  config.interface_count=2;
+  config.interface_count=3;
   config.interfaces[0]=(struct router_interface){.vr_id=101,.interface_id=1,
     .attachment=ROUTER_VSWITCH,.vswitch_id=100,.has_address=true,
     .address=0xc0a80001,.prefix=24};memcpy(config.interfaces[0].mac,mac_a,6);
   config.interfaces[1]=(struct router_interface){.vr_id=101,.interface_id=2,
     .attachment=ROUTER_VSWITCH,.vswitch_id=200,.has_address=true,
     .address=0xc0a80101,.prefix=24};memcpy(config.interfaces[1].mac,mac_b,6);
+  config.interfaces[2]=(struct router_interface){.vr_id=101,.interface_id=3,
+    .attachment=ROUTER_PORT,.has_address=true,.address=0xc8140004,
+    .prefix=16};memcpy(config.interfaces[2].mac,mac_b,6);
 
   make_ipv4(frame,mac_a,0xc0a80032,0xc0a80132,64);
   assert(router_ipv4_lookup(&config,100,frame,sizeof(frame),&decision)==
@@ -63,6 +66,21 @@ int main(void) {
          ROUTER_IPV4_FORWARD);
   assert(!decision.connected && decision.prefix_length==25 &&
          decision.next_hop_ip==0xc0a801fe);
+  config.route_count=0;
+
+  config.routes[0]=(struct router_route){.vr_id=101,.interface_id=3,
+    .prefix=0,.gateway=0xc8140001,.length=0};config.route_count=1;
+  make_ipv4(frame,mac_a,0xc0a80032,0x08080808,64);
+  assert(router_ipv4_lookup(&config,100,frame,sizeof(frame),&decision)==
+         ROUTER_IPV4_FORWARD);
+  assert(decision.egress_interface_id==3 && decision.egress_vswitch_id==0 &&
+         decision.next_hop_ip==0xc8140001 && decision.prefix_length==0 &&
+         !decision.connected);
+  make_ipv4(frame,mac_b,0x08080808,0xc0a80032,64);
+  assert(router_ipv4_lookup_interface(&config,3,frame,sizeof(frame),&decision)==
+         ROUTER_IPV4_FORWARD);
+  assert(decision.ingress_interface_id==3 && decision.egress_interface_id==1 &&
+         decision.egress_vswitch_id==100 && decision.connected);
   config.route_count=0;
 
   make_ipv4(frame,mac_a,0xc0a80032,0xc0a80001,64);
@@ -103,6 +121,19 @@ int main(void) {
                                        UINT64_C(3500000000)));
   assert(router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,
                                       UINT64_C(4100000000)));
+  {
+    const uint8_t public_neighbor_mac[6]={0x02,0xaa,0xbb,0xcc,0xdd,0xee};
+
+    memcpy(arp+6,public_neighbor_mac,6);memcpy(arp+22,public_neighbor_mac,6);
+    ip(arp+28,0xc8140001);memcpy(arp+32,config.interfaces[2].mac,6);
+    ip(arp+38,config.interfaces[2].address);
+    assert(router_neighbor_learn_arp_interface(
+        &neighbors,&config,3,9,arp,42,UINT64_C(5000000000)));
+    neighbor=router_neighbor_lookup(&neighbors,101,3,0xc8140001,
+                                    UINT64_C(6000000000));
+    assert(neighbor && neighbor->port_id==9 &&
+           !memcmp(neighbor->mac,public_neighbor_mac,6));
+  }
   router_neighbor_age(&neighbors,UINT64_C(400000000000));
   assert(neighbors.count==0);
   puts("PASS: VR LPM, connected/static selection, TTL/checksum rewrite and ARP neighbors");

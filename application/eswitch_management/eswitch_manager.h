@@ -13,6 +13,7 @@
 #include "l2/eswitch_fdb.h"
 #include "router/router.h"
 #include "router/router_neighbor.h"
+#include "router/router_nat.h"
 #include "router/sf_packet_io.h"
 
 struct managed_vswitch {
@@ -36,6 +37,8 @@ struct eswitch_manager {
   uint64_t icmp_seen, icmp_ignored, icmp_built, icmp_replies;
   uint64_t icmp_tx_drops;
   struct router_neighbor_table neighbors;
+  struct router_nat_table *nat;
+  bool hardware_ct_supported;
   uint64_t routed_seen, routed_forwarded, route_no_route;
   uint64_t route_ttl_expired, route_invalid, route_neighbor_misses;
   uint64_t route_arp_probes, route_tx_drops;
@@ -52,6 +55,7 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
                                   struct switch_flow_ports *ports,
                                   struct eswitch_pipeline *pipeline,
                                   struct sf_packet_io *sf_io,
+                                  bool hardware_ct_supported,
                                   const char *state_path,
                                   struct eswitch_manager *manager);
 doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,

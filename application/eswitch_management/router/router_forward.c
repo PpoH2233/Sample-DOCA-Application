@@ -51,11 +51,10 @@ static const struct router_interface *interface_by_id(
   return NULL;
 }
 
-enum router_ipv4_disposition router_ipv4_lookup(
-    const struct router_config *config, uint16_t ingress_vswitch_id,
+static enum router_ipv4_disposition lookup_with_ingress(
+    const struct router_config *config, const struct router_interface *ingress,
     const uint8_t *frame, size_t length,
     struct router_ipv4_decision *decision) {
-  const struct router_interface *ingress = NULL;
   const struct router_interface *egress = NULL;
   const uint8_t *ip;
   size_t ip_header_length;
@@ -66,25 +65,12 @@ enum router_ipv4_disposition router_ipv4_lookup(
   bool best_connected = false;
   uint32_t best_next_hop = 0;
 
-  if (decision != NULL)
-    *decision = (struct router_ipv4_decision){0};
-  if (config == NULL || frame == NULL || decision == NULL ||
-      ingress_vswitch_id == 0 || length < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN)
+  if (frame == NULL || decision == NULL || ingress == NULL ||
+      length < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN)
     return ROUTER_IPV4_INVALID;
   if (frame[12] != 0x08 || frame[13] != 0x00)
     return ROUTER_IPV4_NOT_FOR_ROUTER;
-
-  for (size_t i = 0; i < config->interface_count; i++) {
-    const struct router_interface *candidate = &config->interfaces[i];
-
-    if (candidate->attachment == ROUTER_VSWITCH && candidate->has_address &&
-        candidate->vswitch_id == ingress_vswitch_id &&
-        memcmp(frame, candidate->mac, 6) == 0) {
-      ingress = candidate;
-      break;
-    }
-  }
-  if (ingress == NULL)
+  if (!ingress->has_address || memcmp(frame, ingress->mac, 6) != 0)
     return ROUTER_IPV4_NOT_FOR_ROUTER;
 
   ip = frame + ETH_HEADER_LEN;
@@ -123,8 +109,7 @@ enum router_ipv4_disposition router_ipv4_lookup(
     const struct router_interface *candidate = &config->interfaces[i];
     uint32_t mask;
 
-    if (candidate->vr_id != ingress->vr_id || !candidate->has_address ||
-        candidate->attachment != ROUTER_VSWITCH)
+    if (candidate->vr_id != ingress->vr_id || !candidate->has_address)
       continue;
     mask = prefix_mask(candidate->prefix);
     if ((destination & mask) != (candidate->address & mask))
@@ -149,8 +134,7 @@ enum router_ipv4_disposition router_ipv4_lookup(
         (have_route && route->length <= best_length))
       continue;
     egress = interface_by_id(config, ingress->vr_id, route->interface_id);
-    if (egress == NULL || !egress->has_address ||
-        egress->attachment != ROUTER_VSWITCH)
+    if (egress == NULL || !egress->has_address)
       continue;
     have_route = true;
     best_connected = false;
@@ -166,6 +150,44 @@ enum router_ipv4_disposition router_ipv4_lookup(
   decision->prefix_length = best_length;
   decision->connected = best_connected;
   return decision->disposition = ROUTER_IPV4_FORWARD;
+}
+
+enum router_ipv4_disposition router_ipv4_lookup(
+    const struct router_config *config, uint16_t ingress_vswitch_id,
+    const uint8_t *frame, size_t length,
+    struct router_ipv4_decision *decision) {
+  const struct router_interface *ingress = NULL;
+
+  if (decision) *decision = (struct router_ipv4_decision){0};
+  if (!config || !decision || !ingress_vswitch_id)
+    return ROUTER_IPV4_INVALID;
+  for (size_t i=0;i<config->interface_count;i++) {
+    const struct router_interface *candidate=&config->interfaces[i];
+    if(candidate->attachment==ROUTER_VSWITCH && candidate->has_address &&
+       candidate->vswitch_id==ingress_vswitch_id && frame &&
+       length>=ETH_HEADER_LEN && !memcmp(frame,candidate->mac,6)) {
+      ingress=candidate;break;
+    }
+  }
+  if (!ingress)
+    return ROUTER_IPV4_NOT_FOR_ROUTER;
+  return lookup_with_ingress(config,ingress,frame,length,decision);
+}
+
+enum router_ipv4_disposition router_ipv4_lookup_interface(
+    const struct router_config *config, uint16_t ingress_interface_id,
+    const uint8_t *frame, size_t length,
+    struct router_ipv4_decision *decision) {
+  const struct router_interface *ingress = NULL;
+
+  if (decision) *decision = (struct router_ipv4_decision){0};
+  if (!config || !decision || !ingress_interface_id)
+    return ROUTER_IPV4_INVALID;
+  for(size_t i=0;i<config->interface_count;i++)
+    if(config->interfaces[i].interface_id==ingress_interface_id) {
+      ingress=&config->interfaces[i];break;
+    }
+  return lookup_with_ingress(config,ingress,frame,length,decision);
 }
 
 size_t router_ipv4_rewrite(const uint8_t *frame, size_t length,

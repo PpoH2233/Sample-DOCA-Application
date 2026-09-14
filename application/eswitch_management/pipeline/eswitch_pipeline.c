@@ -621,6 +621,33 @@ doca_error_t eswitch_pipeline_sf_bind_egress(
                                 rif_mac, context_tag);
 }
 
+doca_error_t eswitch_pipeline_sf_unbind_egress(
+    struct eswitch_pipeline *pipeline, uint16_t domain_id,
+    uint16_t target_port_id) {
+  if (pipeline == NULL || !pipeline->created || domain_id == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+    doca_error_t result;
+
+    if (!context->active || !context->directed ||
+        context->vswitch_id != domain_id ||
+        context->target_port_id != target_port_id)
+      continue;
+    result = remove_rule(pipeline, &context->return_rule,
+                         "unbind directed SF return context");
+    if (result != DOCA_SUCCESS)
+      return result;
+    printf("SF RETURN UNBIND: domain=%u context-vlan=%u mode=directed "
+           "target=%u\n",
+           domain_id, context->context_tag, target_port_id);
+    *context = (struct eswitch_sf_return_context){0};
+    return DOCA_SUCCESS;
+  }
+  return DOCA_SUCCESS;
+}
+
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id) {
   if (pipeline == NULL || !pipeline->created || vswitch_id == 0)
@@ -872,6 +899,47 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                        "rollback ingress attach");
     return cleanup == DOCA_SUCCESS ? original_error : cleanup;
   }
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_attach_router_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_index, uint16_t vr_id) {
+  struct doca_flow_match match = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
+  struct eswitch_rule *rule;
+  uint16_t port_id;
+  doca_error_t result;
+
+  if (pipeline == NULL || !pipeline->created ||
+      port_index >= pipeline->ports->count || vr_id == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (pipeline->ports->items[port_index].ethernet->role !=
+      ETHERNET_PORT_ROLE_REPRESENTOR)
+    return DOCA_ERROR_NOT_SUPPORTED;
+  rule = &pipeline->classifier_rules[port_index];
+  if (rule->entry != NULL)
+    return DOCA_ERROR_BAD_STATE;
+  port_id = pipeline->ports->items[port_index].ethernet->port_id;
+  match.parser_meta.port_id = port_id;
+  actions.meta.pkt_meta = DOCA_HTOBE32(eswitch_metadata_encode(vr_id, port_id));
+  fwd.next_pipe = pipeline->rss_pipe;
+  flow_entry_cookie_prepare(&rule->cookie, "attach router uplink",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_basic_add_entry(
+      pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe, &match,
+      0, &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie,
+      &rule->entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = process_rules(pipeline, rule, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = remove_rule(pipeline, rule,
+                                       "rollback router uplink attach");
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
+  printf("ROUTER UPLINK ATTACH: vr=%u port=%u path=RSS\n", vr_id, port_id);
   return DOCA_SUCCESS;
 }
 

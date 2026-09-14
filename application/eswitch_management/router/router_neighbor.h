@@ -36,6 +36,11 @@ bool router_neighbor_learn_arp(struct router_neighbor_table *table,
                                const uint8_t *frame, size_t length,
                                uint64_t now_ns);
 
+bool router_neighbor_learn_arp_interface(
+    struct router_neighbor_table *table, const struct router_config *config,
+    uint16_t ingress_interface_id, uint16_t ingress_port_id,
+    const uint8_t *frame, size_t length, uint64_t now_ns);
+
 const struct router_neighbor *router_neighbor_lookup(
     const struct router_neighbor_table *table, uint16_t vr_id,
     uint16_t interface_id, uint32_t ip, uint64_t now_ns);

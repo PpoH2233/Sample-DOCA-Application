@@ -104,6 +104,12 @@ doca_error_t eswitch_pipeline_sf_bind_egress(
     uint16_t target_port_id, const uint8_t rif_mac[6],
     uint16_t *context_tag);
 
+/* Remove one directed context without disturbing the other egresses that use
+ * the same metadata domain. This is used when a public RIF MAC changes. */
+doca_error_t eswitch_pipeline_sf_unbind_egress(
+    struct eswitch_pipeline *pipeline, uint16_t domain_id,
+    uint16_t target_port_id);
+
 /* Remove a previously installed SF return context. This is idempotent. */
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id);
@@ -132,6 +138,10 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline);
 doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index,
                                           uint16_t vswitch_id);
+/* Router-owned uplinks bypass L2 learning and go directly to the Arm RSS
+ * slow path. The high metadata half carries the VR id for ingress isolation. */
+doca_error_t eswitch_pipeline_attach_router_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_index, uint16_t vr_id);
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index);
 

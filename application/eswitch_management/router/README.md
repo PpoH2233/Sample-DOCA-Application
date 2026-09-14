@@ -1,12 +1,12 @@
 # Router implementation status
 
-This change introduces the control-plane foundation, private gateway ARP,
-local IPv4 ICMP echo replies and functional IPv4 routing between vSwitch RIFs
-inside one VR. The current longest-prefix lookup and neighbor handling run on
-Arm; DOCA Flow performs ingress steering and SF return. Public port routing is
-not implemented. Private addressed RIFs report `ACTIVE_ARM_LPM`; public ports
-remain root-miss DROP and report `PENDING_DATAPLANE`.
-No API stub returns a fabricated hardware success.
+This implementation provides private gateway ARP, local IPv4 ICMP echo,
+IPv4 routing between vSwitch RIFs, and stateful TCP/UDP NAPT through one public
+port per VR. Longest-prefix lookup, neighbor handling and NAT sessions currently
+run on Arm; DOCA Flow performs ingress classification and directed SF return.
+Private addressed RIFs report `ACTIVE_ARM_LPM`. An addressed public RIF reports
+`ACTIVE_ARM_UPLINK`, or `ACTIVE_ARM_NAT` while its NAT policy is enabled. No API
+stub reports fabricated hardware-CT success.
 
 ## Private gateway ARP through the Arm system SF
 
@@ -78,13 +78,13 @@ and chooses the route's egress RIF. Connected routes use the destination IP as
 the next hop; static routes use their configured gateway.
 
 The router learns on-link neighbors from validated ARP requests and replies. On
-a neighbor miss it broadcasts a rate-limited ARP request through the egress
-RIF/VS and drops the current packet. A retry is forwarded after resolution.
+a neighbor miss it sends a rate-limited ARP request through the egress RIF and
+drops the current packet. A retry is forwarded after resolution.
 Forwarding rewrites destination/source Ethernet addresses, decrements IPv4 TTL,
 recomputes the IPv4 header checksum, and transmits through a directed SF
 context for the neighbor's learned port. Route miss, TTL expiry, unsupported
-public egress and invalid IPv4 fail closed; ICMP error generation is a later
-milestone.
+NAT protocols/fragments and invalid IPv4 fail closed; ICMP error generation is
+a later milestone.
 
 ```text
 VM-A -> VS-A -> ingress RIF -> Arm LPM -> egress RIF
@@ -143,6 +143,7 @@ eswitch_management/
     router_icmp.c             validated local ICMP echo reply builder
     router_forward.c          per-VR IPv4 LPM and forwarding rewrite
     router_neighbor.c         per-VR/RIF ARP neighbor cache and probe control
+    router_nat.c              TCP/UDP NAPT sessions and checksum translation
 ```
 
 ## Commands implemented
@@ -178,8 +179,61 @@ require an on-link next hop. Overlapping interface subnets inside one VR are
 rejected; identical subnets in different VRs are permitted.
 
 The generated RIF MAC is a locally administered placeholder; configure the
-public VF's accepted MAC before enabling a future dataplane. NAT and admin-up
-commands are explicitly rejected until that backend exists.
+public VF's accepted MAC before enabling its dataplane.
+
+The NAT control plane accepts one TCP/UDP SNAT/PAT policy per VR once an
+addressed public port owns the default route:
+
+```sh
+eswitchctl vr nat enable --id 100 --interface p1 \
+  --address interface --port-range 20000-60999
+eswitchctl vr nat show --id 100
+eswitchctl vr nat disable --id 100
+```
+
+The policy is persisted, validated transactionally, and blocks removal of its
+uplink address/default route. `router_nat.c` implements a bounded 4096-entry
+5-tuple session table, collision-free PAT allocation within the configured
+range, TCP/UDP checksum repair, reverse translation, and idle aging. The public
+representor is classified directly to the Arm RSS path with `(VR, port)`
+metadata; it is not allowed into tenant L2 learning. Public ARP is RIF-scoped.
+
+```text
+VM -> private VS/RIF -> Arm LPM -> TCP/UDP SNAT/PAT
+   -> public RIF/next-hop rewrite -> directed SF context -> uplink representor
+
+uplink representor -> Arm reverse-session lookup -> DNAT
+   -> original private RIF/VM identity -> directed SF context -> VM
+```
+
+The first outbound packet may be dropped while the public next-hop ARP entry is
+resolved; retrying the connection should then create a NAT session. Reverse
+traffic is accepted only when its VR, protocol, public tuple and remote tuple
+match an active session, and is returned only to the private VS/port recorded by
+that session. IPv4 fragments and protocols other than TCP/UDP fail closed in
+this MVP. ICMP echo through NAT, hairpin NAT, static DNAT/port-forwarding and
+hardware CT are not implemented yet.
+
+Example acceptance test, using a reachable TCP service beyond the uplink:
+
+```sh
+# DPU
+eswitchctl vr nat show --id 100
+eswitchctl status | grep -E 'nat_dataplane|nat_sessions|nat_out|nat_in'
+
+# private VM; the first attempt may only trigger next-hop ARP
+nc -vz -w 2 <remote-ip> <tcp-port>
+nc -vz -w 2 <remote-ip> <tcp-port>
+
+# DPU/public endpoint captures
+tcpdump -eni <public-endpoint> -nn 'tcp or udp or arp'
+```
+
+Acceptance requires the public capture to show source IP equal to the public
+RIF address and source port in the configured PAT range; reply traffic must
+reach the originating VM. `nat_sessions`, `nat_out`, `nat_in`,
+`routed_forwarded`, and the target egress-gate counter should increase. A
+successful SF `sendto()` alone is not delivery proof.
 
 ## Persistence and ownership
 
@@ -197,23 +251,27 @@ are included in daemon status and excluded from available-port output.
 
 ## DOCA 3.4 backend work remaining
 
-The local sample bundle identifies itself as `3.4.0012`. The existing Dockerfile
-targets DOCA `devel-3.4.0` / `full-rt-3.4.0`. SDK headers were not found in this
-Mac workspace or `/opt/mellanox`, and Docker daemon was unavailable during
-implementation. No DPU build or packet test has been performed.
+The local sample bundle identifies itself as `3.4.0012`, while the target DPU
+reported `3.4.0112`. The existing Dockerfile targets DOCA `devel-3.4.0` /
+`full-rt-3.4.0`. A header snapshot exists under `.deps`, but it is not a complete
+Linux SDK/sysroot; the local Docker daemon was also unavailable. Therefore the
+DOCA-linked binary and packet path still require build and acceptance testing
+in the DPU's `doca-devel` container.
 
-Remaining integration must use the installed 3.4 headers and these sample
+Hardware acceleration must use the installed 3.4 headers and these sample
 families in `doca-samples/samples/doca_flow/`:
 
 - `flow_lpm` / `flow_lpm_em`: non-root hardware route lookup.
 - `flow_ct_tcp_actions` and CT common code: directional NAT, lifetime, callbacks.
 - `applications/psp_gateway` in the sample bundle: Arm ARP and reinjection.
 
-Required work: typed Arm RSS reasons, public ARP,
-RIF-scoped neighbors, LPM/adjacency programming, CT/NAT
-initialization and per-VR zones, route invalidation, first-packet handling,
-checksum/TTL/MTU exception paths, and durable config/hardware rollback.
-Do not treat this private-ARP milestone as the completed router implementation.
+Remaining work: DOCA Flow CT initialization and per-VR zones, hardware
+LPM/adjacency programming, CT/session synchronization, route invalidation,
+first-packet promotion, ICMP NAT, checksum/TTL/MTU exception generation, and
+durable config/hardware rollback. The daemon probes
+`doca_flow_ct_cap_is_dev_supported()` and reports the result, but deliberately
+keeps `hw_ct_state=NOT_INITIALIZED` until the CT lifecycle and both directions
+can be installed atomically.
 
 ## Verification and VF 11–15 build handoff
 

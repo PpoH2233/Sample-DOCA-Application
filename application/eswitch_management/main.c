@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include <rte_pause.h>
+#include <doca_dev.h>
+#include <doca_flow_ct.h>
 
 #include "../../ethernet_device_discovery/dpdk_runtime.h"
 #include "../ethernet_switch/dpdk_io.h"
@@ -71,6 +73,8 @@ int main(int argc, char **argv) {
   const char *vf_scope = getenv("ESWITCH_VF_SCOPE");
   const char *sf_interface = getenv("ESWITCH_SF_IFACE");
   doca_error_t result;
+  doca_error_t ct_capability;
+  bool hardware_ct_supported = false;
   int separator;
   int exit_status = EXIT_FAILURE;
 
@@ -107,6 +111,15 @@ int main(int argc, char **argv) {
     goto cleanup_runtime;
   }
   print_inventory(&devices.ethernet_ports);
+
+  /* Runtime capability is authoritative. CT remains disabled until the
+   * uplink pipeline can install both directions atomically. */
+  ct_capability = doca_flow_ct_cap_is_dev_supported(
+      doca_dev_as_devinfo(devices.parent));
+  hardware_ct_supported = ct_capability == DOCA_SUCCESS;
+  printf("DOCA FLOW CT CAPABILITY: state=%s result=%s\n",
+         hardware_ct_supported ? "supported" : "unsupported",
+         doca_error_get_descr(ct_capability));
 
   result = dpdk_io_start(&devices.ethernet_ports, &io);
   if (result != DOCA_SUCCESS) {
@@ -155,6 +168,7 @@ int main(int argc, char **argv) {
     goto cleanup_pipeline;
   }
   result = eswitch_manager_init(&io, &flow_ports, &pipeline, &sf_io,
+                                hardware_ct_supported,
                                 state_path, &manager);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to initialize eSwitch manager: %s\n",

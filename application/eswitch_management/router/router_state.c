@@ -45,6 +45,16 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
     fprintf(f,"vr route add --id %u --interface %s --prefix %s/%u --via %s\n",
       r->vr_id,name,ipstr(r->prefix,ip),r->length,ipstr(r->gateway,gw));
   }
+  for(size_t i=0;i<c->nat_policy_count;i++) {
+    const struct router_nat_policy *p=&c->nat_policies[i];
+    const char *name=NULL; char ip[INET_ADDRSTRLEN];
+    for(size_t j=0;j<c->interface_count;j++)
+      if(c->interfaces[j].interface_id==p->interface_id) name=c->interfaces[j].name;
+    if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling NAT interface reference");}
+    fprintf(f,"vr nat enable --id %u --interface %s --address %s --port-range %u-%u\n",
+      p->vr_id,name,p->public_address?ipstr(p->public_address,ip):"interface",
+      p->port_first,p->port_last);
+  }
   bool ok=!ferror(f) && fflush(f)==0 && fsync(fd)==0;
   if(fclose(f)!=0) ok=false;
   if(!ok || rename(tmp,path)!=0) {unlink(tmp);return fail(out,size,strerror(errno));}
@@ -99,7 +109,8 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
     }
     bool attachment=!strncmp(line,"vr port-attach ",15) || !strncmp(line,"vr switch-attach ",17);
     bool permitted=attachment || !strncmp(line,"vr create ",10) ||
-      !strncmp(line,"vr interface set ",17) || !strncmp(line,"vr ip add ",10) || !strncmp(line,"vr route add ",13);
+      !strncmp(line,"vr interface set ",17) || !strncmp(line,"vr ip add ",10) ||
+      !strncmp(line,"vr route add ",13) || !strncmp(line,"vr nat enable ",14);
     if(!permitted || (attachment!=(identity!=0))) {ok=false;break;}
     if(attachment) c->next_interface_id=identity;
     bool changed=false;

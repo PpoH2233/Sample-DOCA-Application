@@ -34,8 +34,11 @@ static void print_help(FILE *output, const char *program) {
           "  vr route add --id <id> --prefix <cidr> --via <ip> --interface <name>\n"
           "  vr route del --id <id> --prefix <cidr>\n"
           "  vr route show --id <id>\n"
+          "  vr nat enable --id <id> --interface <name> --address <interface|ip>\n"
+          "      --port-range <first-last>       Enable outbound TCP/UDP SNAT\n"
+          "  vr nat disable|show --id <id>       Manage/show the NAT policy\n"
           "  Private VS gateway ARP, ICMP echo and Arm LPM routing are active.\n"
-          "  Public-port routing and hardware LPM offload are not implemented.\n"
+          "  Arm TCP/UDP NAPT and uplink ARP are active; hardware CT is pending.\n"
           "  --help, -h                          Show this help\n\n"
           "Control socket: %s\n"
           "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",

@@ -7,11 +7,13 @@ int main(void) {
   struct router_config c;
   router_config_init(&c);
   c.interface_count=2;
-  c.interfaces[0]=(struct router_interface){.vr_id=101,.vswitch_id=100,
+  c.interfaces[0]=(struct router_interface){.vr_id=101,.interface_id=1,
+    .vswitch_id=100,
     .attachment=ROUTER_VSWITCH,.has_address=true,.address=0xc0a80001,
     .prefix=24,.mac={2,0,0,0x65,0,1}};
   c.interfaces[1]=c.interfaces[0];
-  c.interfaces[1].vr_id=102;c.interfaces[1].vswitch_id=200;c.interfaces[1].mac[3]=0x66;
+  c.interfaces[1].vr_id=102;c.interfaces[1].interface_id=2;
+  c.interfaces[1].vswitch_id=200;c.interfaces[1].mac[3]=0x66;
   uint8_t req[60]={
     255,255,255,255,255,255, 0x7e,0x83,0xa5,0x77,0x11,6, 8,6,
     0,1,8,0,6,4,0,1, 0x7e,0x83,0xa5,0x77,0x11,6, 192,168,0,10,
@@ -54,7 +56,7 @@ int main(void) {
   assert(!router_arp_reply(&c,100,req,60,reply,60));
   c.interfaces[0].has_address=true;c.interfaces[0].attachment=ROUTER_PORT;
   assert(!router_arp_reply(&c,100,req,60,reply,60));
-  c.interfaces[0].attachment=ROUTER_VSWITCH;
+  assert(router_arp_reply_interface(&c,1,req,60,reply,60)==60);
   assert(router_arp_request(&c.interfaces[0],0xc0a80032,reply,60)==60);
   assert(!memcmp(reply,(uint8_t[]){255,255,255,255,255,255},6));
   assert(!memcmp(reply+6,c.interfaces[0].mac,6));

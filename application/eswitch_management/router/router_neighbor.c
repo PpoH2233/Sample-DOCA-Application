@@ -53,20 +53,18 @@ static struct router_neighbor *allocate_neighbor(
   return NULL;
 }
 
-bool router_neighbor_learn_arp(struct router_neighbor_table *table,
-                               const struct router_config *config,
-                               uint16_t ingress_vswitch_id,
+static bool learn_on_interface(struct router_neighbor_table *table,
+                               const struct router_interface *rif,
                                uint16_t ingress_port_id,
                                const uint8_t *frame, size_t length,
                                uint64_t now_ns) {
-  const struct router_interface *rif = NULL;
   struct router_neighbor *neighbor;
   uint32_t sender_ip;
   uint32_t mask;
   uint8_t nonzero = 0;
 
-  if (table == NULL || config == NULL || frame == NULL ||
-      ingress_vswitch_id == 0 || length < ARP_FRAME_LEN ||
+  if (table == NULL || rif == NULL || frame == NULL ||
+      !rif->has_address || length < ARP_FRAME_LEN ||
       frame[12] != 0x08 || frame[13] != 0x06 || read16(frame + 14) != 1 ||
       read16(frame + 16) != 0x0800 || frame[18] != 6 || frame[19] != 4 ||
       (read16(frame + 20) != 1 && read16(frame + 20) != 2) ||
@@ -80,21 +78,8 @@ bool router_neighbor_learn_arp(struct router_neighbor_table *table,
   sender_ip = read32(frame + 28);
   if (sender_ip == 0)
     return false; /* Do not create neighbors from RFC 5227 probes. */
-  for (size_t i = 0; i < config->interface_count; i++) {
-    const struct router_interface *candidate = &config->interfaces[i];
-
-    if (candidate->attachment != ROUTER_VSWITCH ||
-        candidate->vswitch_id != ingress_vswitch_id ||
-        !candidate->has_address)
-      continue;
-    mask = prefix_mask(candidate->prefix);
-    if ((sender_ip & mask) == (candidate->address & mask) &&
-        sender_ip != candidate->address) {
-      rif = candidate;
-      break;
-    }
-  }
-  if (rif == NULL)
+  mask = prefix_mask(rif->prefix);
+  if ((sender_ip & mask) != (rif->address & mask) || sender_ip == rif->address)
     return false;
 
   neighbor = allocate_neighbor(table, rif->vr_id, rif->interface_id,
@@ -106,6 +91,34 @@ bool router_neighbor_learn_arp(struct router_neighbor_table *table,
   memcpy(neighbor->mac, frame + 22, 6);
   neighbor->last_seen_ns = now_ns;
   return true;
+}
+
+bool router_neighbor_learn_arp(struct router_neighbor_table *table,
+                               const struct router_config *config,
+                               uint16_t ingress_vswitch_id,
+                               uint16_t ingress_port_id,
+                               const uint8_t *frame, size_t length,
+                               uint64_t now_ns) {
+  if (!config || !ingress_vswitch_id) return false;
+  for(size_t i=0;i<config->interface_count;i++) {
+    const struct router_interface *rif=&config->interfaces[i];
+    if(rif->attachment==ROUTER_VSWITCH &&
+       rif->vswitch_id==ingress_vswitch_id)
+      return learn_on_interface(table,rif,ingress_port_id,frame,length,now_ns);
+  }
+  return false;
+}
+
+bool router_neighbor_learn_arp_interface(
+    struct router_neighbor_table *table, const struct router_config *config,
+    uint16_t ingress_interface_id, uint16_t ingress_port_id,
+    const uint8_t *frame, size_t length, uint64_t now_ns) {
+  if(!config || !ingress_interface_id) return false;
+  for(size_t i=0;i<config->interface_count;i++)
+    if(config->interfaces[i].interface_id==ingress_interface_id)
+      return learn_on_interface(table,&config->interfaces[i],ingress_port_id,
+                                frame,length,now_ns);
+  return false;
 }
 
 const struct router_neighbor *router_neighbor_lookup(

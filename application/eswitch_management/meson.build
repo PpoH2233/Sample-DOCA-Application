@@ -44,6 +44,7 @@ executable(
     'router/router_forward.c',
     'router/router_icmp.c',
     'router/router_neighbor.c',
+    'router/router_nat.c',
     'router/router_state.c',
     'router/router_control.c',
     'router/sf_packet_io.c',
@@ -115,3 +116,11 @@ forward_test = executable(
   install: false,
 )
 test('eswitch-router-forward', forward_test)
+
+nat_test = executable(
+  'eswitch-router-nat-test',
+  ['router/router_nat_test.c', 'router/router_nat.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-nat', nat_test)

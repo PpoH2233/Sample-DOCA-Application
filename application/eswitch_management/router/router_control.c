@@ -28,6 +28,29 @@ static bool inventory_switch(void *context,uint16_t id) {
     if(m->switches[i].exists && m->switches[i].id==id) return true;
   return false;
 }
+static int interface_port_index(const struct eswitch_manager *m,
+                                const struct router_interface *rif) {
+  if(!m || !rif || rif->attachment!=ROUTER_PORT) return -1;
+  for(uint16_t i=0;i<m->ports->count;i++) {
+    const struct ethernet_port *p=m->ports->items[i].ethernet;
+    if(p->role==ETHERNET_PORT_ROLE_REPRESENTOR &&
+       p->host_index==rif->port.host && p->pf_index==rif->port.pf &&
+       p->vf_index==rif->port.vf) return i;
+  }
+  return -1;
+}
+static const struct router_interface *port_interface_at(
+    const struct router_config *config,const struct eswitch_manager *m,
+    uint16_t index) {
+  if(!config || !m || index>=m->ports->count) return NULL;
+  const struct ethernet_port *p=m->ports->items[index].ethernet;
+  for(size_t i=0;i<config->interface_count;i++) {
+    const struct router_interface *rif=&config->interfaces[i];
+    if(rif->attachment==ROUTER_PORT && rif->port.host==p->host_index &&
+       rif->port.pf==p->pf_index && rif->port.vf==p->vf_index) return rif;
+  }
+  return NULL;
+}
 static bool state_path(const struct eswitch_manager *m,char *out,size_t size) {
   return snprintf(out,size,"%s.router",m->state_path)<(int)size;
 }
@@ -54,6 +77,15 @@ doca_error_t router_control_restore(struct eswitch_manager *m) {
       return DOCA_ERROR_NOT_FOUND;
     }
   }
+  for(size_t r=0;r<m->router->interface_count;r++) {
+    const struct router_interface *rif=&m->router->interfaces[r];
+    int index=interface_port_index(m,rif);
+    if(rif->attachment!=ROUTER_PORT) continue;
+    if(index<0) return DOCA_ERROR_NOT_FOUND;
+    doca_error_t result=eswitch_pipeline_attach_router_port(
+        m->pipeline,(uint16_t)index,rif->vr_id);
+    if(result!=DOCA_SUCCESS) return result;
+  }
   return DOCA_SUCCESS;
 }
 doca_error_t router_control_command(struct eswitch_manager *m,const char *request,char *out,size_t size) {
@@ -64,15 +96,54 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
   struct router_config *candidate=malloc(sizeof(*candidate));
   if(!candidate) {snprintf(out,size,"ERR out of memory\n");return DOCA_ERROR_NO_MEMORY;}
   *candidate=*m->router;
+  size_t previous_nat_policy_count=m->router->nat_policy_count;
   struct router_inventory inventory={m,inventory_port,inventory_switch};
   bool changed=false;
   bool ok=router_command(candidate,&inventory,request,out,size,&changed);
   if(ok && changed) {
     char path[PATH_MAX];
-    if(!state_path(m,path,sizeof(path))) {
-      snprintf(out,size,"ERR router state path too long\n");ok=false;
-    } else ok=router_config_save(path,candidate,out,size);
-    if(ok) *m->router=*candidate;
+    int removed=-1,added=-1;
+    uint16_t removed_vr=0,added_vr=0;
+    for(uint16_t i=0;i<m->ports->count;i++) {
+      const struct router_interface *before=port_interface_at(m->router,m,i);
+      const struct router_interface *after=port_interface_at(candidate,m,i);
+      if(before && !after) {removed=i;removed_vr=before->vr_id;}
+      if(!before && after) {added=i;added_vr=after->vr_id;}
+    }
+    if(removed>=0) {
+      doca_error_t result=eswitch_pipeline_detach_port(m->pipeline,(uint16_t)removed);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR router uplink detach failed: %s\n",doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok && added>=0) {
+      doca_error_t result=eswitch_pipeline_attach_router_port(
+          m->pipeline,(uint16_t)added,added_vr);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR router uplink attach failed: %s\n",doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
+      if(!state_path(m,path,sizeof(path))) {
+        snprintf(out,size,"ERR router state path too long\n");ok=false;
+      } else ok=router_config_save(path,candidate,out,size);
+    }
+    if(ok) {
+      if(previous_nat_policy_count!=candidate->nat_policy_count) {
+        for(size_t i=0;i<m->router->nat_policy_count;i++) {
+          uint16_t vr=m->router->nat_policies[i].vr_id;
+          if(!router_nat_policy_find(candidate,vr)) router_nat_flush(m->nat,vr);
+        }
+      }
+      *m->router=*candidate;
+    }
+    else {
+      if(added>=0) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
+      if(removed>=0) (void)eswitch_pipeline_attach_router_port(
+          m->pipeline,(uint16_t)removed,removed_vr);
+    }
   }
   free(candidate);
   return ok ? DOCA_SUCCESS : DOCA_ERROR_INVALID_VALUE;

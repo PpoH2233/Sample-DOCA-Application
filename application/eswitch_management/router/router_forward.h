@@ -34,6 +34,12 @@ enum router_ipv4_disposition router_ipv4_lookup(
     const struct router_config *config, uint16_t ingress_vswitch_id,
     const uint8_t *frame, size_t length, struct router_ipv4_decision *decision);
 
+/* Same lookup for traffic arriving on a router-owned public port. This is
+ * used after reverse NAT changes the destination back to an inside address. */
+enum router_ipv4_disposition router_ipv4_lookup_interface(
+    const struct router_config *config, uint16_t ingress_interface_id,
+    const uint8_t *frame, size_t length, struct router_ipv4_decision *decision);
+
 /* Apply the IPv4 forwarding mutations after neighbor resolution. */
 size_t router_ipv4_rewrite(const uint8_t *frame, size_t length,
                            const uint8_t source_mac[6],

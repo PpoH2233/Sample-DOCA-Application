@@ -9,13 +9,15 @@
 
 enum operation { CREATE, DELETE, SHOW, ATTACH_PORT, ATTACH_SWITCH,
   DETACH_PORT, DETACH_SWITCH, IP_ADD, IP_DEL, ROUTE_ADD, ROUTE_DEL,
-  ROUTE_SHOW, MAC_SET };
+  ROUTE_SHOW, MAC_SET, NAT_ENABLE, NAT_DISABLE, NAT_SHOW };
 struct command {
   enum operation op;
   uint16_t id, port, vswitch;
   char name[ROUTER_NAME_SIZE];
   uint32_t address, gateway;
   uint8_t prefix, mac[6];
+  bool address_from_interface;
+  uint16_t port_first, port_last;
 };
 
 static bool error(char *out, size_t size, const char *message) {
@@ -47,6 +49,19 @@ static bool address(const char *s, uint32_t *value) {
   struct in_addr a;
   if (inet_pton(AF_INET, s, &a) != 1) return false;
   *value = ntohl(a.s_addr);
+  return true;
+}
+static bool port_range(const char *s, uint16_t *first, uint16_t *last) {
+  char copy[32], *dash;
+  uint16_t a, b;
+  if (!s || strlen(s) >= sizeof(copy)) return false;
+  strcpy(copy, s);
+  dash = strchr(copy, '-');
+  if (!dash || strchr(dash + 1, '-')) return false;
+  *dash++ = 0;
+  if (!number(copy, &a) || !number(dash, &b) || a < 1024 || a > b)
+    return false;
+  *first = a; *last = b;
   return true;
 }
 bool router_ipv4_prefix(const char *s, uint32_t *ip, uint8_t *prefix) {
@@ -81,7 +96,8 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
   char text[ROUTER_COMMAND_SIZE], *tokens[32], *save = NULL;
   size_t count = 0, start = 2;
   unsigned allowed = 0, required = 0, found = 0;
-  enum { ID=1, NAME=2, PORT=4, SWITCH=8, ADDRESS=16, PREFIX=32, VIA=64, MAC=128 };
+  enum { ID=1, NAME=2, PORT=4, SWITCH=8, ADDRESS=16, PREFIX=32,
+         VIA=64, MAC=128, PORT_RANGE=256 };
   if (!request || strlen(request) >= sizeof(text))
     return error(out, size, "command too long");
   strcpy(text, request);
@@ -117,6 +133,15 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
     else return error(out,size,"expected route add|del|show");
   } else if (count > 2 && !strcmp(verb,"interface") && !strcmp(tokens[2],"set")) {
     start=3; c->op=MAC_SET; required=ID|NAME|MAC;
+  } else if (count > 2 && !strcmp(verb,"nat")) {
+    start=3;
+    if (!strcmp(tokens[2],"enable")) {
+      c->op=NAT_ENABLE; required=ID|NAME|ADDRESS|PORT_RANGE;
+    } else if (!strcmp(tokens[2],"disable")) {
+      c->op=NAT_DISABLE; required=ID;
+    } else if (!strcmp(tokens[2],"show")) {
+      c->op=NAT_SHOW; required=ID;
+    } else return error(out,size,"expected nat enable|disable|show");
   } else return error(out,size,"unsupported vr operation (see router/README.md)");
   allowed=required;
   if ((count-start)%2) return error(out,size,"options require values");
@@ -130,10 +155,19 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
       bit=NAME; valid=valid_name(v); if(valid) strcpy(c->name,v);
     } else if (!strcmp(k,"--port")) { bit=PORT; valid=number(v,&c->port); }
     else if (!strcmp(k,"--switch-id")) { bit=SWITCH; valid=number(v,&c->vswitch) && c->vswitch; }
-    else if (!strcmp(k,"--address")) { bit=ADDRESS; valid=router_ipv4_prefix(v,&c->address,&c->prefix); }
+    else if (!strcmp(k,"--address")) {
+      bit=ADDRESS;
+      if(c->op==NAT_ENABLE && !strcmp(v,"interface")) {
+        c->address_from_interface=true; c->address=0; valid=true;
+      } else if(c->op==NAT_ENABLE) valid=address(v,&c->address);
+      else valid=router_ipv4_prefix(v,&c->address,&c->prefix);
+    }
     else if (!strcmp(k,"--prefix")) { bit=PREFIX; valid=router_ipv4_prefix(v,&c->address,&c->prefix); }
     else if (!strcmp(k,"--via")) { bit=VIA; valid=address(v,&c->gateway); }
     else if (!strcmp(k,"--mac")) { bit=MAC; valid=mac_address(v,c->mac); }
+    else if (!strcmp(k,"--port-range")) {
+      bit=PORT_RANGE; valid=port_range(v,&c->port_first,&c->port_last);
+    }
     if (!bit || !(allowed&bit) || (found&bit) || !valid)
       return error(out,size,"unknown, duplicate or invalid option");
     found|=bit;
@@ -152,6 +186,23 @@ void router_config_init(struct router_config *c) {
 bool router_has_vr(const struct router_config *c, uint16_t id) {
   for(size_t i=0;i<c->vr_count;i++) if(c->vr_ids[i]==id) return true;
   return false;
+}
+const struct router_nat_policy *router_nat_policy_find(
+    const struct router_config *c, uint16_t vr_id) {
+  if (!c) return NULL;
+  for (size_t i=0;i<c->nat_policy_count;i++)
+    if(c->nat_policies[i].vr_id==vr_id) return &c->nat_policies[i];
+  return NULL;
+}
+uint32_t router_nat_policy_address(const struct router_config *c,
+                                   const struct router_nat_policy *p) {
+  if(!c || !p) return 0;
+  if(p->public_address) return p->public_address;
+  for(size_t i=0;i<c->interface_count;i++)
+    if(c->interfaces[i].vr_id==p->vr_id &&
+       c->interfaces[i].interface_id==p->interface_id &&
+       c->interfaces[i].has_address) return c->interfaces[i].address;
+  return 0;
 }
 static bool same_port(const struct router_port_identity *a,const struct router_port_identity *b) {
   return a->host==b->host && a->pf==b->pf && a->vf==b->vf;
@@ -187,6 +238,18 @@ static bool routes_reference(const struct router_config *c,uint16_t rif) {
   for(size_t i=0;i<c->route_count;i++) if(c->routes[i].interface_id==rif) return true;
   return false;
 }
+static bool nat_references(const struct router_config *c,uint16_t rif) {
+  for(size_t i=0;i<c->nat_policy_count;i++)
+    if(c->nat_policies[i].interface_id==rif) return true;
+  return false;
+}
+static bool default_route_uses(const struct router_config *c,uint16_t vr,
+                               uint16_t rif) {
+  for(size_t i=0;i<c->route_count;i++)
+    if(c->routes[i].vr_id==vr && c->routes[i].interface_id==rif &&
+       c->routes[i].prefix==0 && c->routes[i].length==0) return true;
+  return false;
+}
 bool router_command(struct router_config *c,const struct router_inventory *inv,
                     const char *request,char *out,size_t size,bool *changed) {
   struct command q={0}; *changed=false;
@@ -199,8 +262,25 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
   } else {
     if(!exists) return error(out,size,"VR not found");
     struct router_interface *rif=interface(c,q.id,q.name);
-    if(q.op==SHOW || q.op==ROUTE_SHOW) {
-      size_t used=append(out,size,0,"OK vr=%u dataplane=ARM_LPM_MVP\n",q.id);
+    if(q.op==SHOW || q.op==ROUTE_SHOW || q.op==NAT_SHOW) {
+      size_t used=append(out,size,0,
+                         "OK vr=%u dataplane=ARM_LPM_NAT_MVP\n",q.id);
+      if(q.op==NAT_SHOW) {
+        const struct router_nat_policy *p=router_nat_policy_find(c,q.id);
+        if(!p) used=append(out,size,used,"nat=disabled\n");
+        else {
+          const char *name="?"; char ip[INET_ADDRSTRLEN];
+          for(size_t i=0;i<c->interface_count;i++)
+            if(c->interfaces[i].interface_id==p->interface_id) name=c->interfaces[i].name;
+          used=append(out,size,used,
+            "nat=enabled mode=snat-pat protocols=tcp,udp interface=%s "
+            "address=%s ports=%u-%u dataplane=ARM_ACTIVE "
+            "hw-ct=PENDING\n",name,
+            iptext(router_nat_policy_address(c,p),ip),p->port_first,p->port_last);
+        }
+        if(used>=size) return error(out,size,"response too large");
+        return true;
+      }
       for(size_t i=0;i<c->interface_count;i++) {
         const struct router_interface *r=&c->interfaces[i]; char ip[INET_ADDRSTRLEN];
         if(r->vr_id!=q.id) continue;
@@ -212,9 +292,17 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           else used=append(out,size,used,"switch=%u ",r->vswitch_id);
           used=append(out,size,used,"mac=%02x:%02x:%02x:%02x:%02x:%02x ",
             r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
-          if(r->has_address) used=append(out,size,used,"address=%s/%u status=%s arp=%s\n",iptext(r->address,ip),r->prefix,
-            r->attachment==ROUTER_VSWITCH ? "ACTIVE_ARM_LPM" : "PENDING_DATAPLANE",
-            r->attachment==ROUTER_VSWITCH ? "PRIVATE_GATEWAY_ENABLED" : "NOT_IMPLEMENTED");
+          if(r->has_address) {
+            const struct router_nat_policy *p=router_nat_policy_find(c,q.id);
+            bool nat_active=r->attachment==ROUTER_PORT && p!=NULL &&
+                            p->interface_id==r->interface_id;
+            used=append(out,size,used,
+              "address=%s/%u status=%s arp=%s\n",iptext(r->address,ip),r->prefix,
+              r->attachment==ROUTER_VSWITCH ? "ACTIVE_ARM_LPM" :
+                (nat_active ? "ACTIVE_ARM_NAT" : "ACTIVE_ARM_UPLINK"),
+              r->attachment==ROUTER_VSWITCH ? "PRIVATE_GATEWAY_ENABLED" :
+                                               "PUBLIC_RIF_ENABLED");
+          }
           else used=append(out,size,used,"address=- status=NO_ADDRESS\n");
         } else if(r->has_address)
           used=append(out,size,used,"connected %s/%u interface=%s\n",iptext(r->address&mask(r->prefix),ip),r->prefix,r->name);
@@ -231,6 +319,13 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
       for(size_t i=0;i<c->vr_count;i++) if(c->vr_ids[i]==q.id) {
         memmove(&c->vr_ids[i],&c->vr_ids[i+1],(--c->vr_count-i)*sizeof(c->vr_ids[0])); break;
       }
+    } else if(q.op==NAT_DISABLE) {
+      size_t i;
+      for(i=0;i<c->nat_policy_count;i++)
+        if(c->nat_policies[i].vr_id==q.id) break;
+      if(i==c->nat_policy_count) return error(out,size,"NAT is not enabled");
+      memmove(&c->nat_policies[i],&c->nat_policies[i+1],
+              (--c->nat_policy_count-i)*sizeof(c->nat_policies[0]));
     } else if(q.op==ATTACH_PORT || q.op==ATTACH_SWITCH) {
       if(rif) return error(out,size,"interface name already exists in VR");
       if(c->interface_count==ROUTER_MAX_INTERFACES || c->next_interface_id>UINT16_MAX)
@@ -258,12 +353,18 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
       size_t i;
       for(i=0;i<c->route_count;i++) if(c->routes[i].vr_id==q.id && c->routes[i].prefix==q.address && c->routes[i].length==q.prefix) break;
       if(i==c->route_count) return error(out,size,"static route not found (connected routes follow interface IP)");
+      if(q.address==0 && q.prefix==0 &&
+         router_nat_policy_find(c,q.id)!=NULL &&
+         router_nat_policy_find(c,q.id)->interface_id==c->routes[i].interface_id)
+        return error(out,size,"disable NAT before removing its default route");
       memmove(&c->routes[i],&c->routes[i+1],(--c->route_count-i)*sizeof(c->routes[0]));
     } else {
       if(!rif) return error(out,size,"interface not found in VR");
       if(q.op==DETACH_PORT || q.op==DETACH_SWITCH) {
         if((q.op==DETACH_PORT)!=(rif->attachment==ROUTER_PORT)) return error(out,size,"attachment type mismatch");
-        if(rif->has_address || routes_reference(c,rif->interface_id)) return error(out,size,"remove IP and route dependencies before detach");
+        if(rif->has_address || routes_reference(c,rif->interface_id) ||
+           nat_references(c,rif->interface_id))
+          return error(out,size,"remove NAT, IP and route dependencies before detach");
         size_t i=(size_t)(rif-c->interfaces);
         memmove(rif,rif+1,(--c->interface_count-i)*sizeof(*rif));
       } else if(q.op==IP_ADD) {
@@ -278,7 +379,8 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         rif->has_address=true; rif->address=q.address; rif->prefix=q.prefix;
       } else if(q.op==IP_DEL) {
         if(!rif->has_address || rif->address!=q.address || rif->prefix!=q.prefix) return error(out,size,"address not found");
-        if(routes_reference(c,rif->interface_id)) return error(out,size,"remove dependent static routes first");
+        if(routes_reference(c,rif->interface_id) || nat_references(c,rif->interface_id))
+          return error(out,size,"remove dependent NAT policy and static routes first");
         rif->has_address=false; rif->address=0; rif->prefix=0;
       } else if(q.op==MAC_SET) {
         for(size_t i=0;i<c->interface_count;i++)
@@ -294,10 +396,26 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           return error(out,size,"static route already exists");
         c->routes[c->route_count++]=(struct router_route){.vr_id=q.id,.interface_id=rif->interface_id,
           .prefix=q.address,.gateway=q.gateway,.length=q.prefix};
+      } else if(q.op==NAT_ENABLE) {
+        if(router_nat_policy_find(c,q.id)) return error(out,size,"NAT already enabled");
+        if(rif->attachment!=ROUTER_PORT || !rif->has_address)
+          return error(out,size,"NAT interface must be an addressed public port-link");
+        if(!default_route_uses(c,q.id,rif->interface_id))
+          return error(out,size,"NAT interface must own the VR default route");
+        if(!q.address_from_interface && q.address!=rif->address)
+          return error(out,size,"MVP NAT address must equal the uplink interface address");
+        if(c->nat_policy_count==ROUTER_MAX_NAT_POLICIES)
+          return error(out,size,"NAT policy capacity reached");
+        c->nat_policies[c->nat_policy_count++]=(struct router_nat_policy){
+          .vr_id=q.id,.interface_id=rif->interface_id,
+          .public_address=q.address_from_interface?0:q.address,
+          .port_first=q.port_first,.port_last=q.port_last};
       }
     }
   }
   *changed=true;
-  snprintf(out,size,"OK configuration committed; private-vs-dataplane=ARM_LPM public-dataplane=NOT_IMPLEMENTED\n");
+  snprintf(out,size,
+           "OK configuration committed; private-vs-dataplane=ARM_LPM "
+           "public-dataplane=ARM_NAT_MVP\n");
   return true;
 }
