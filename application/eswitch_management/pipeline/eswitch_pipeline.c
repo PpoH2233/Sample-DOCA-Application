@@ -1060,6 +1060,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   pipeline->switch_port = ports->switch_port;
   pipeline->hardware_routing_requested = hardware_routing_enabled;
   pipeline->hardware_routing_enabled = hardware_routing_enabled;
+  pipeline->hw_route_requested_capacity = hardware_route_capacity;
   pipeline->hw_route_capacity = hardware_route_capacity;
 
 #define CREATE_STAGE(label, call)                                             \
@@ -1106,6 +1107,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
       pipeline->route_lpm_pipe = NULL;
       pipeline->hardware_routing_enabled = false;
       pipeline->hardware_routing_degraded = true;
+      pipeline->hw_route_failures++;
     }
   }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));

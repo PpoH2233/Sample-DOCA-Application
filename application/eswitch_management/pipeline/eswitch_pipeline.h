@@ -88,6 +88,7 @@ struct eswitch_pipeline {
   uint64_t hw_route_updates;
   uint64_t hw_route_removals;
   uint64_t hw_route_failures;
+  uint32_t hw_route_requested_capacity;
   uint32_t hw_route_capacity;
   bool hardware_routing_requested;
   bool hardware_routing_enabled;

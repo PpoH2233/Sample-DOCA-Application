@@ -1367,7 +1367,8 @@ static size_t format_status(const struct eswitch_manager *manager,
                          : "GATEWAY_ARP_ICMP_ARM_LPM_NAT44");
   used = append_text(response, size, used,
       "hw_routing_configured=%s hw_state=%s hw_scope=private-vs-ipv4 "
-      "hw_capacity=%u hw_routes=%zu promotions=%" PRIu64 " updates=%" PRIu64
+      "hw_requested_capacity=%u hw_capacity=%u hw_routes=%zu "
+      "promotions=%" PRIu64 " updates=%" PRIu64
       " removals=%" PRIu64 " failures=%" PRIu64
       " lpm_misses=%" PRIu64 " counter_state=%s\n",
       manager->pipeline->hardware_routing_requested ? "enabled" : "disabled",
@@ -1375,13 +1376,15 @@ static size_t format_status(const struct eswitch_manager *manager,
           (!manager->pipeline->hardware_routing_enabled ? "fallback-arm" :
            (manager->pipeline->hardware_routing_degraded ? "degraded" :
                                                           "ready")),
+      manager->pipeline->hw_route_requested_capacity,
       manager->pipeline->hw_route_capacity,
       manager->pipeline->hw_route_count,
       manager->pipeline->hw_route_promotions,
       manager->pipeline->hw_route_updates,
       manager->pipeline->hw_route_removals,
       manager->pipeline->hw_route_failures, hw_lpm_misses,
-      hw_counter_result == DOCA_SUCCESS ? "ready" : "error");
+      !manager->pipeline->hardware_routing_enabled ? "off" :
+          (hw_counter_result == DOCA_SUCCESS ? "ready" : "error"));
   used = append_text(response, size, used,
       "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
       "hw_ct_state=NOT_INITIALIZED\n",

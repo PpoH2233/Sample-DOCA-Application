@@ -90,12 +90,12 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
   uint32_t rounded = 1;
 
-  if (hardware_routing_enabled) {
-    uint32_t route_actions =
-        route_capacity * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE + 1024U;
-    if (route_actions > required)
-      required = route_actions;
-  }
+  /* The private LPM shares the port action pool with the existing L2, SF
+   * return and router-selector pipes. Its reservation is additive; taking
+   * max(base, LPM) leaves no room once those earlier pipes are created. */
+  if (hardware_routing_enabled)
+    required += route_capacity * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
+                1024U;
   while (rounded < required)
     rounded <<= 1;
   return rounded;

@@ -39,7 +39,8 @@ Successful per-packet traces are disabled by default; set
 `ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
 `ESWITCH_HW_ROUTE_CAPACITY` selects a power-of-two capacity from 64 to 1024
 (default 1024). The requested capacity is included when actions memory is
-reserved before Flow ports start. If the LPM allocation is still too large,
+reserved before Flow ports start, in addition to the existing L2/SF action
+pool. If the LPM allocation is still too large,
 the application retries smaller tables; if none can be admitted it remains
 available on the Arm dataplane with `hw_state=fallback-arm`.
 
