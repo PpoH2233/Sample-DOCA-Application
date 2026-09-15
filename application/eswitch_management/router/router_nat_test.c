@@ -232,6 +232,24 @@ int main(void) {
   assert(table->count==2); /* UDP and ICMP expire before TCP sessions. */
   router_nat_age(table,ROUTER_NAT_TCP_IDLE_NS+ROUTER_NAT_UDP_IDLE_NS+20);
   assert(table->count==0 && table->stats.sessions_aged==5);
+
+  /* A global control-plane flush must preserve hardware-owned entries until
+   * the CT pipe removes them, then remove their software owners. */
+  length=make_packet(original,6,0xc0a80032,51001,remote_ip,443);
+  assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,1,
+                             translated,sizeof(translated),&s1)==
+         ROUTER_NAT_TRANSLATED);
+  length=make_packet(original,17,0xc0a80a0a,53001,remote_ip,53);
+  assert(router_nat_outbound(table,&policy,public_ip,&vm2,original,length,1,
+                             translated,sizeof(translated),&s2)==
+         ROUTER_NAT_TRANSLATED);
+  router_nat_session_set_hardware_active(s1,true);
+  router_nat_flush(table,0);
+  assert(table->count==1 && s1->used && s1->hardware_active);
+  router_nat_session_set_hardware_active(s1,false);
+  router_nat_flush(table,0);
+  assert(table->count==0);
+
   /* Fill every slot, exercise hash collisions in both directions, flush and
    * reuse indices. Each reverse lookup must retain the exact inside owner. */
   policy.port_first=20000;

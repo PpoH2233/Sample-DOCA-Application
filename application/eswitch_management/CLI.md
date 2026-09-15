@@ -419,9 +419,12 @@ Contract-level notes:
 Implemented today: private-vSwitch gateway ARP, local ICMP echo, connected and
 static route LPM, neighbor discovery, IPv4 forwarding, and Arm-side TCP/UDP/ICMP
 Echo NAT with uplink ARP, all through the Arm system SF. Eligible private IPv4
-routes can be promoted to the DOCA Flow hardware LPM fast path; unsupported or
-resource-constrained cases fail open to the Arm slow path. Not implemented:
-hardware connection tracking and ICMP routing error generation. Status strings
+routes can be promoted to the DOCA Flow hardware LPM fast path. When
+`ESWITCH_HW_CT=1` is combined with `ESWITCH_HW_ROUTING=1`, established TCP/UDP
+NAT sessions can be promoted to bidirectional DOCA Flow CT; misses and ICMP
+remain on Arm. Unsupported or resource-constrained cases fail open to the Arm
+slow path. Hardware CT aging/counters and ICMP routing error generation are not
+implemented. Status strings
 in `status`, `vr show` and `vr nat show` report the active/fallback stage, so a
 client should surface them rather than assume full offload.
 
@@ -654,7 +657,10 @@ printf 'vs show --id 100\n' | socat - UNIX-CONNECT:/run/eswitch-management/contr
 - At most 254 ports per vSwitch.
 - At most 64 vSwitches and 64 VRs.
 - One public uplink RIF per VR, one IPv4 address per RIF, one NAT policy per VR.
-- NAT is SNAT/PAT for TCP, UDP and ICMP Echo, executed on the Arm cores.
-  Hardware connection tracking is not initialized; the daemon probes
-  `doca_flow_ct_cap_is_dev_supported()` and reports `hw_ct_state` but keeps it
-  `NOT_INITIALIZED` until both directions can be installed atomically.
+- NAT is SNAT/PAT for TCP, UDP and ICMP Echo. The first packet is translated on
+  Arm. With `ESWITCH_HW_CT=1`, TCP/UDP sessions are then installed atomically
+  in both DOCA Flow CT directions; CT misses and ICMP stay on Arm.
+- `ESWITCH_HW_CT_CAPACITY` is a power of two from 64 through 4096 (default
+  4096), matching the software NAT table ceiling. This first implementation
+  uses explicit flush at router mutation and shutdown and has no hardware aging
+  or per-session CT counters.

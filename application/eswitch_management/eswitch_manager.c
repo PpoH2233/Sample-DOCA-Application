@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,7 +322,25 @@ static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
 static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t vswitch_id,
                                           uint16_t port_id) {
-  doca_error_t result = detach_port(manager, vswitch_id, port_id);
+  int port_index;
+  doca_error_t result;
+
+  /* Validate first so an invalid CLI request cannot tear down live NAT
+   * sessions. The dataplane mutation below repeats these checks. */
+  if (find_vswitch(manager, vswitch_id) == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+  port_index = find_port_index(manager, port_id);
+  if (port_index < 0)
+    return DOCA_ERROR_NOT_FOUND;
+  if (manager->port_owner[port_index] != vswitch_id)
+    return DOCA_ERROR_INVALID_VALUE;
+
+  result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
+
+  if (result == DOCA_SUCCESS) {
+    router_nat_flush(manager->nat, 0);
+    result = detach_port(manager, vswitch_id, port_id);
+  }
 
   if (result == DOCA_SUCCESS) {
     doca_error_t save_result = persist_manager(manager);
@@ -966,6 +985,25 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
            (nat_session->remote_ip >> 8) & 0xffU,
            nat_session->remote_ip & 0xffU, nat_session->remote_port);
   }
+  if (nat_session != NULL && manager->pipeline->hardware_ct_enabled &&
+      manager->pipeline->hardware_routing_enabled &&
+      (nat_session->protocol == IPPROTO_TCP ||
+       nat_session->protocol == IPPROTO_UDP)) {
+    const struct router_interface *inside_rif = find_router_interface(
+        manager, decision.vr_id, decision.ingress_interface_id);
+
+    if (inside_rif != NULL) {
+      result = eswitch_pipeline_ct_promote(
+          manager->pipeline, nat_session, neighbor->port_id, egress->mac,
+          neighbor->mac, nat_session->inside.port_id, inside_rif->mac,
+          nat_session->inside.mac);
+      if (result != DOCA_SUCCESS && manager->packet_debug)
+        fprintf(stderr, "NAT CT PROMOTION DEFERRED: vr=%u proto=%u "
+                        "error=%s fallback=arm\n",
+                nat_session->vr_id, nat_session->protocol,
+                doca_error_get_descr(result));
+    }
+  }
 out:
   free(output);
   free(translated);
@@ -1405,9 +1443,20 @@ static size_t format_status(const struct eswitch_manager *manager,
       !manager->pipeline->uplink_arp_filter_enabled ? "off" :
           (uplink_arp_counter_result == DOCA_SUCCESS ? "ready" : "error"));
   used = append_text(response, size, used,
-      "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
-      "hw_ct_state=NOT_INITIALIZED\n",
-      manager->hardware_ct_supported ? "supported" : "unsupported");
+      "nat_dataplane=%s hw_ct_capability=%s hw_ct_state=%s "
+      "hw_ct_capacity=%u hw_ct_active=%zu hw_ct_promotions=%" PRIu64
+      " hw_ct_failures=%" PRIu64 " hw_ct_full=%" PRIu64 "\n",
+      manager->pipeline->hardware_ct_enabled
+          ? "DOCA_FLOW_CT_TCP_UDP_PLUS_ARM_ICMP_SLOWPATH"
+          : "ARM_NAPT_TCP_UDP_ICMP_ECHO",
+      manager->hardware_ct_supported ? "supported" : "unsupported",
+      !manager->pipeline->hardware_ct_requested ? "off" :
+          (!manager->pipeline->hardware_ct_enabled ? "fallback-arm" :
+           (manager->pipeline->hardware_ct_degraded ? "degraded" :
+                                                      "ready")),
+      manager->pipeline->ct_capacity, manager->pipeline->ct_active,
+      manager->pipeline->ct_promotions, manager->pipeline->ct_failures,
+      manager->pipeline->ct_full);
   used = append_text(response, size, used,
       "nat_policies=%zu nat_sessions=%zu nat_out=%" PRIu64
       " nat_in=%" PRIu64 " nat_reverse_misses=%" PRIu64
@@ -1679,6 +1728,7 @@ doca_error_t eswitch_manager_destroy(struct eswitch_manager *manager) {
     *manager = (struct eswitch_manager){0};
     return DOCA_SUCCESS;
   }
+  first_error = eswitch_pipeline_ct_flush(manager->pipeline, 0);
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
     doca_error_t result;
     if (!manager->switches[i].exists)
@@ -1704,6 +1754,10 @@ doca_error_t eswitch_manager_destroy(struct eswitch_manager *manager) {
 void eswitch_manager_release(struct eswitch_manager *manager) {
   if (manager == NULL)
     return;
+  if (manager->pipeline != NULL) {
+    for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++)
+      manager->pipeline->ct_sessions[i].software = NULL;
+  }
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
     struct eswitch_flood_group *group = &manager->switches[i].flood;
     if (group->pipe != NULL)

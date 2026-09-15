@@ -128,7 +128,6 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
   struct router_config *candidate=malloc(sizeof(*candidate));
   if(!candidate) {snprintf(out,size,"ERR out of memory\n");return DOCA_ERROR_NO_MEMORY;}
   *candidate=*m->router;
-  size_t previous_nat_policy_count=m->router->nat_policy_count;
   struct router_inventory inventory={m,inventory_port,inventory_switch};
   bool changed=false;
   bool ok=router_command(candidate,&inventory,request,out,size,&changed);
@@ -136,18 +135,33 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
     char path[PATH_MAX];
     int removed=-1,added=-1;
     uint16_t removed_vr=0,added_vr=0;
+    bool removed_detached=false,added_attached=false;
+
+    /* Any router mutation can invalidate a CT zone, adjacency, or NAT
+     * tuple. Remove hardware entries before changing reachable dataplane
+     * objects, then remove their software owners. */
+    {
+      doca_error_t result=eswitch_pipeline_ct_flush(m->pipeline,0);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR hardware CT flush failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      } else {
+        router_nat_flush(m->nat,0);
+      }
+    }
     for(uint16_t i=0;i<m->ports->count;i++) {
       const struct router_interface *before=port_interface_at(m->router,m,i);
       const struct router_interface *after=port_interface_at(candidate,m,i);
       if(before && !after) {removed=i;removed_vr=before->vr_id;}
       if(!before && after) {added=i;added_vr=after->vr_id;}
     }
-    if(removed>=0) {
+    if(ok && removed>=0) {
       doca_error_t result=eswitch_pipeline_detach_port(m->pipeline,(uint16_t)removed);
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR router uplink detach failed: %s\n",doca_error_get_descr(result));
         ok=false;
-      }
+      } else removed_detached=true;
     }
     if(ok && added>=0) {
       doca_error_t result=eswitch_pipeline_attach_router_port(
@@ -155,7 +169,7 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR router uplink attach failed: %s\n",doca_error_get_descr(result));
         ok=false;
-      }
+      } else added_attached=true;
     }
     if(ok) {
       doca_error_t result=invalidate_changed_private_rifs(m,candidate);
@@ -178,19 +192,11 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
         snprintf(out,size,"ERR router state path too long\n");ok=false;
       } else ok=router_config_save(path,candidate,out,size);
     }
-    if(ok) {
-      if(previous_nat_policy_count!=candidate->nat_policy_count) {
-        for(size_t i=0;i<m->router->nat_policy_count;i++) {
-          uint16_t vr=m->router->nat_policies[i].vr_id;
-          if(!router_nat_policy_find(candidate,vr)) router_nat_flush(m->nat,vr);
-        }
-      }
-      *m->router=*candidate;
-    }
+    if(ok) *m->router=*candidate;
     else {
       (void)eswitch_manager_hw_routes_sync(m,m->router);
-      if(added>=0) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
-      if(removed>=0) (void)eswitch_pipeline_attach_router_port(
+      if(added_attached) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
+      if(removed_detached) (void)eswitch_pipeline_attach_router_port(
           m->pipeline,(uint16_t)removed,removed_vr);
     }
   }

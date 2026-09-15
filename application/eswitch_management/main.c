@@ -20,6 +20,7 @@
 #include "pipeline/eswitch_pipeline.h"
 #include "pipeline/tx_build.h"
 #include "router/sf_packet_io.h"
+#include "router/router_nat_ct.h"
 
 static volatile sig_atomic_t stop_requested;
 
@@ -85,6 +86,26 @@ static bool parse_hw_route_capacity(uint32_t *capacity) {
   return true;
 }
 
+static bool parse_ct_capacity(uint32_t *capacity) {
+  const char *value = getenv("ESWITCH_HW_CT_CAPACITY");
+  char *end = NULL;
+  unsigned long parsed;
+
+  if (capacity == NULL)
+    return false;
+  if (value == NULL || *value == '\0') {
+    *capacity = ESWITCH_CT_DEFAULT_CAPACITY;
+    return true;
+  }
+  parsed = strtoul(value, &end, 10);
+  if (*value == '-' || end == value || *end != '\0' ||
+      parsed < ESWITCH_CT_MIN_CAPACITY || parsed > ESWITCH_CT_MAX_CAPACITY ||
+      (parsed & (parsed - 1)) != 0)
+    return false;
+  *capacity = (uint32_t)parsed;
+  return true;
+}
+
 static bool parse_u32_env(const char *name, uint32_t default_value,
                           uint32_t maximum, uint32_t *value) {
   const char *text = getenv(name);
@@ -106,6 +127,7 @@ static bool parse_u32_env(const char *name, uint32_t default_value,
 
 static uint32_t actions_mem_size(bool hardware_routing_enabled,
                                  uint32_t route_capacity,
+                                 bool hardware_ct_enabled,
                                  bool uplink_arp_meter_enabled) {
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
   uint32_t rounded = 1;
@@ -127,6 +149,12 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
     required += ESWITCH_MAX_VSWITCHES *
                     DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
                 4096U;
+  /* CT owns its L3/L4 action memory, while the post-CT adjacency pipe uses
+   * the parent switch-port pool for L2 and TTL rewrites. */
+  if (hardware_ct_enabled)
+    required += ESWITCH_MAX_CT_ADJACENCIES *
+                    DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
+                4096U;
   while (rounded < required)
     rounded <<= 1;
   if (hardware_routing_enabled &&
@@ -144,6 +172,7 @@ int main(int argc, char **argv) {
   struct eswitch_manager manager = {0};
   struct sf_packet_io sf_io = {.fd = -1};
   struct control_server control = {.listen_fd = -1, .client_fd = -1};
+  struct router_nat_ct_runtime ct_runtime = {0};
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
   const char *state_path = getenv("ESWITCH_STATE_FILE");
   const char *vf_scope = getenv("ESWITCH_VF_SCOPE");
@@ -152,8 +181,10 @@ int main(int argc, char **argv) {
   doca_error_t ct_capability;
   bool hardware_ct_supported = false;
   bool hardware_routing_enabled = env_enabled("ESWITCH_HW_ROUTING");
+  bool hardware_ct_requested = env_enabled("ESWITCH_HW_CT");
   bool packet_debug = env_enabled("ESWITCH_PACKET_DEBUG");
   uint32_t hardware_route_capacity;
+  uint32_t hardware_ct_capacity;
   uint32_t uplink_arp_pps;
   uint32_t uplink_arp_burst;
   uint32_t flow_actions_mem_size;
@@ -180,6 +211,12 @@ int main(int argc, char **argv) {
             ESWITCH_HW_ROUTE_MIN_CAPACITY, ROUTER_HW_MAX_ROUTES);
     return EXIT_FAILURE;
   }
+  if (!parse_ct_capacity(&hardware_ct_capacity)) {
+    fprintf(stderr, "ESWITCH_HW_CT_CAPACITY must be a power of two "
+                    "between %u and %u\n",
+            ESWITCH_CT_MIN_CAPACITY, ESWITCH_CT_MAX_CAPACITY);
+    return EXIT_FAILURE;
+  }
   if (!parse_u32_env("ESWITCH_UPLINK_ARP_PPS",
                      ESWITCH_UPLINK_ARP_DEFAULT_PPS,
                      ESWITCH_UPLINK_ARP_MAX_PPS, &uplink_arp_pps) ||
@@ -195,6 +232,7 @@ int main(int argc, char **argv) {
   }
   flow_actions_mem_size = actions_mem_size(hardware_routing_enabled,
                                             hardware_route_capacity,
+                                            hardware_ct_requested,
                                             uplink_arp_pps != 0);
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
@@ -243,13 +281,19 @@ int main(int argc, char **argv) {
             doca_error_get_descr(result));
     goto cleanup_io;
   }
+  result = router_nat_ct_init(hardware_ct_requested, hardware_ct_supported,
+                              hardware_ct_capacity, &ct_runtime);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "DOCA Flow CT unavailable (%s); continuing with Arm "
+                    "NAT slow path\n", doca_error_get_descr(result));
+  }
   result = switch_flow_ports_start_with_actions_mem(
       &devices.ethernet_ports, flow_actions_mem_size,
       uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start DOCA Flow ports: %s\n",
             doca_error_get_descr(result));
-    goto cleanup_flow;
+    goto cleanup_ct;
   }
   /* Follow flow_switch_to_wire: obtain switch domain from the actual parent
    * Flow handle, not the process-global NULL lookup. Parent is item 0,
@@ -266,19 +310,30 @@ int main(int argc, char **argv) {
          "actions-mem=%u scope=private-vs-ipv4\n",
          hardware_routing_enabled ? "enabled" : "disabled",
          hardware_route_capacity, flow_actions_mem_size);
+  printf("HARDWARE CT: configured=%s requested-capacity=%u "
+         "initialized=%s protocols=tcp,udp miss=arm\n",
+         hardware_ct_requested ? "enabled" : "disabled",
+         hardware_ct_capacity,
+         ct_runtime.initialized ? "yes" : "no");
   printf("UPLINK ARP CLASSIFIER: configured=%s rate=%u-pps burst=%u "
          "scope=broadcast-arp\n",
          uplink_arp_pps == 0 ? "disabled" : "enabled", uplink_arp_pps,
          uplink_arp_burst);
   result = eswitch_pipeline_create(&runtime, &flow_ports,
                                    hardware_routing_enabled,
-                                   hardware_route_capacity, uplink_arp_pps,
+                                   hardware_route_capacity,
+                                   ct_runtime.initialized,
+                                   hardware_ct_capacity, uplink_arp_pps,
                                    uplink_arp_burst, &pipeline);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to create eSwitch pipeline: %s\n",
             doca_error_get_descr(result));
     goto cleanup_flow_ports;
   }
+  pipeline.hardware_ct_requested = hardware_ct_requested;
+  if (hardware_ct_requested &&
+      (!pipeline.hardware_ct_enabled || !pipeline.hardware_routing_enabled))
+    pipeline.hardware_ct_degraded = true;
   result = sf_packet_io_start(sf_interface, &sf_io);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start Arm SF packet I/O on %s: %s\n",
@@ -345,7 +400,8 @@ cleanup_pipeline:
 cleanup_flow_ports:
   cleanup_error("Failed to stop DOCA Flow ports",
                 switch_flow_ports_stop(&flow_ports), &exit_status);
-cleanup_flow:
+cleanup_ct:
+  router_nat_ct_destroy(&ct_runtime);
   cleanup_error("Failed to destroy DOCA Flow", flow_runtime_destroy(&runtime),
                 &exit_status);
 cleanup_io:

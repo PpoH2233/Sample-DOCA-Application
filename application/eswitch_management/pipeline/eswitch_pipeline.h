@@ -12,6 +12,7 @@
 #include "../../ethernet_switch/flow_ports.h"
 #include "../../ethernet_switch/flow_runtime.h"
 #include "../router/router_hw.h"
+#include "../router/router_nat.h"
 
 struct eswitch_rule {
   struct doca_flow_pipe_entry *entry;
@@ -40,6 +41,23 @@ struct eswitch_flood_group {
 };
 
 #define ESWITCH_MAX_SF_RETURN_CONTEXTS 256U
+#define ESWITCH_MAX_CT_ADJACENCIES 1024U
+
+struct eswitch_ct_adjacency {
+  uint32_t id;
+  uint16_t target_port_id;
+  uint8_t source_mac[6];
+  uint8_t destination_mac[6];
+  struct eswitch_rule rule;
+  bool active;
+};
+
+struct eswitch_ct_session {
+  const struct router_nat_session *software;
+  struct doca_flow_pipe_entry *entry;
+  struct flow_entry_cookie cookie;
+  bool active;
+};
 
 struct eswitch_sf_return_context {
   uint16_t vr_id;
@@ -84,6 +102,10 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *route_control_pipe;
   struct doca_flow_pipe *route_selector_pipe;
   struct doca_flow_pipe *route_lpm_pipe;
+  struct doca_flow_pipe *ct_dispatch_pipe;
+  struct doca_flow_pipe *ct_pipe;
+  struct doca_flow_pipe *ct_egress_pipe;
+  struct eswitch_rule ct_dispatch_rules[3];
   struct eswitch_rule route_fallback_rule;
   struct eswitch_hw_route_entry hw_routes[ROUTER_HW_MAX_ROUTES];
   size_t hw_route_count;
@@ -96,6 +118,16 @@ struct eswitch_pipeline {
   bool hardware_routing_requested;
   bool hardware_routing_enabled;
   bool hardware_routing_degraded;
+  struct eswitch_ct_adjacency ct_adjacencies[ESWITCH_MAX_CT_ADJACENCIES];
+  struct eswitch_ct_session ct_sessions[ROUTER_NAT_MAX_SESSIONS];
+  uint32_t ct_capacity;
+  size_t ct_active;
+  uint64_t ct_promotions;
+  uint64_t ct_failures;
+  uint64_t ct_full;
+  bool hardware_ct_requested;
+  bool hardware_ct_enabled;
+  bool hardware_ct_degraded;
   struct eswitch_rule sf_root_rule;
   uint16_t sf_port_id;
   struct eswitch_sf_return_context
@@ -172,6 +204,8 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      bool hardware_routing_enabled,
                                      uint32_t hardware_route_capacity,
+                                     bool hardware_ct_enabled,
+                                     uint32_t hardware_ct_capacity,
                                      uint32_t uplink_arp_pps,
                                      uint32_t uplink_arp_burst,
                                      struct eswitch_pipeline *pipeline);
@@ -191,6 +225,19 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
     size_t route_count);
 doca_error_t eswitch_pipeline_hw_route_stats(
     const struct eswitch_pipeline *pipeline, uint64_t *lpm_misses);
+
+/* Promote a software TCP/UDP NAT session into the bidirectional CT table.
+ * Both adjacency entries are committed before the CT connection becomes
+ * reachable.  Failure leaves the software slow path authoritative. */
+doca_error_t eswitch_pipeline_ct_promote(
+    struct eswitch_pipeline *pipeline,
+    const struct router_nat_session *session,
+    uint16_t origin_target_port, const uint8_t origin_source_mac[6],
+    const uint8_t origin_destination_mac[6],
+    uint16_t reply_target_port, const uint8_t reply_source_mac[6],
+    const uint8_t reply_destination_mac[6]);
+doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
+                                       uint16_t vr_id);
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index);
 

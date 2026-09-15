@@ -45,6 +45,7 @@ struct router_nat_session {
   uint64_t last_seen_ns;
   uint64_t original_packets;
   uint64_t reply_packets;
+  bool hardware_active;
 };
 
 struct router_nat_stats {
@@ -90,6 +91,10 @@ enum router_nat_result router_nat_inbound(
     const struct router_nat_session **session);
 
 void router_nat_age(struct router_nat_table *table, uint64_t now_ns);
+/* Flush one VR, or every VR when vr_id is zero. Hardware-owned sessions must
+ * first be removed through eswitch_pipeline_ct_flush(). */
 void router_nat_flush(struct router_nat_table *table, uint16_t vr_id);
+void router_nat_session_set_hardware_active(
+    const struct router_nat_session *session, bool active);
 
 #endif /* ESW_ROUTER_NAT_H */

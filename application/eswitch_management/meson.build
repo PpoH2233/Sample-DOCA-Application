@@ -47,6 +47,7 @@ executable(
     'router/router_neighbor.c',
     'router/router_hw.c',
     'router/router_nat.c',
+    'router/router_nat_ct.c',
     'router/router_state.c',
     'router/router_control.c',
     'router/sf_packet_io.c',

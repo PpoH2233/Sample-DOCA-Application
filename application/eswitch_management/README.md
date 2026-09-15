@@ -8,7 +8,8 @@ Router commands persist desired configuration. Addressed private vs-link RIFs
 support gateway ARP, local ICMP and Arm longest-prefix routing between private
 vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
 Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
-hardware CT/NAT is not implemented.
+optional DOCA Flow CT promotion offloads established TCP/UDP NAT sessions.
+ICMP and all CT misses remain on the Arm slow path.
 The default VF scope is now `7-15`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
 /build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported
@@ -38,8 +39,13 @@ separate local router IPs from transit traffic. Valid unfragmented IPv4 with a
 Resolved private adjacencies rewrite source/destination MAC, decrement TTL and
 forward directly through the target egress gate. LPM misses, unresolved
 neighbors, options, fragments, invalid checksums, TTL exceptions, public
-uplinks and every NAT flow continue to the existing Arm slow path. The default
-is `0` until the target BF3 passes the smoke test below.
+uplinks and first packets of NAT flows continue to the Arm slow path. With
+both `ESWITCH_HW_ROUTING=1` and `ESWITCH_HW_CT=1`, a successfully translated
+TCP/UDP first packet installs a bidirectional CT entry. Later packets take
+`LPM miss -> CT` outbound or `uplink -> CT` inbound; a CT hit performs NAT in
+hardware and selects a post-CT L2/TTL adjacency. A miss still reaches Arm.
+ICMP Echo NAT intentionally remains on Arm. The default is off until the
+target BF3 passes the smoke test below.
 Successful per-packet traces are disabled by default; set
 `ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
 Broadcast ARP arriving on a router uplink is rate-limited in DOCA Flow before
@@ -65,7 +71,9 @@ endpoint
    -> root classifier: physical ingress port
       -> write pkt_meta = (vswitch_id << 16) | ingress_port_id
       -> router uplink: broadcast ARP hardware meter -> color gate -> Arm RSS
-         -> non-broadcast traffic -------------------------------> Arm RSS
+         -> IPv4 TCP/UDP -> CT hit -> adjacency -> egress
+                         \-> CT miss -------------> Arm RSS
+         -> other non-broadcast traffic -------------------------> Arm RSS
       -> source guard
          hit  -> destination FDB -> known-unicast egress
          miss -> clone one copy to Arm RSS and continue to destination FDB
@@ -223,6 +231,8 @@ sudo docker run ... \
   --env ESWITCH_VF_SCOPE='10-20' \
   --env ESWITCH_SF_IFACE='enp3s0f0s0' \
   --env ESWITCH_HW_ROUTING='1' \
+  --env ESWITCH_HW_CT='1' \
+  --env ESWITCH_HW_CT_CAPACITY='4096' \
   --env ESWITCH_UPLINK_ARP_PPS='256' \
   --env ESWITCH_UPLINK_ARP_BURST='64' \
   eswitch-management:3.4.0 -l 0 -- 03:00.0
@@ -300,17 +310,25 @@ For a steady inter-VS flow, the egress hardware counter must increase while
 ESWITCH_HW_ROUTING=0 /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
 
 # After stopping the baseline instance, enable the experimental fast path.
-ESWITCH_HW_ROUTING=1 /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
-/build/eswitch-management/eswitchctl status | grep -E 'hw_routing|routed_seen'
+ESWITCH_HW_ROUTING=1 ESWITCH_HW_CT=1 ESWITCH_HW_CT_CAPACITY=4096 \
+  /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
+/build/eswitch-management/eswitchctl status | grep -E 'hw_routing|hw_ct|nat_|routed_seen'
 /build/eswitch-management/eswitchctl tx-debug | grep -E 'egress_port|hw_routing'
 ```
 
 Test gateway ARP/ICMP, bidirectional inter-VS ping and TCP/UDP, then NAT curl
-and NAT ICMP. The first packet may use Arm while ARP resolves; subsequent
-eligible private traffic must use hardware. Change a neighbor MAC, detach and
+and NAT ICMP. For TCP/UDP NAT, `nat_created` and `ct_promotions` must increase,
+`ct_active` must remain non-zero, and `nat_out`/`nat_in` should stop increasing
+for the established flow while traffic continues. The first packet uses Arm;
+subsequent eligible packets use hardware. ICMP NAT counters continue to grow
+because ICMP stays on Arm. Change a neighbor MAC, detach and
 reattach a VF, edit a RIF MAC and remove a route; stale hardware forwarding
 must disappear. Fragments, IPv4 options and TTL 1 must still reach the slow
-path. Do not enable this flag in production until those hardware checks pass.
+path. Router configuration mutations conservatively flush all CT/NAT sessions.
+This initial CT implementation disables hardware aging and counters; entries
+are explicitly removed at configuration change and shutdown, so capacity must
+cover the maximum concurrent TCP/UDP sessions between restarts. Do not enable
+this flag in production until those hardware checks pass.
 
 Inspect startup and health status with:
 

@@ -423,7 +423,7 @@ void router_nat_age(struct router_nat_table *table, uint64_t now_ns) {
   for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
     struct router_nat_session *s = &table->entries[i];
     uint64_t timeout;
-    if (!s->used) continue;
+    if (!s->used || s->hardware_active) continue;
     if (s->protocol == IPPROTO_TCP_VALUE)
       timeout = ROUTER_NAT_TCP_IDLE_NS;
     else if (s->protocol == IPPROTO_UDP_VALUE)
@@ -439,11 +439,22 @@ void router_nat_age(struct router_nat_table *table, uint64_t now_ns) {
 }
 
 void router_nat_flush(struct router_nat_table *table, uint16_t vr_id) {
-  if (!table || !vr_id) return;
+  if (!table) return;
   for (size_t i=0;i<ROUTER_NAT_MAX_SESSIONS;i++) {
-    if(!table->entries[i].used || table->entries[i].vr_id!=vr_id) continue;
+    if(!table->entries[i].used ||
+       (vr_id != 0 && table->entries[i].vr_id!=vr_id) ||
+       table->entries[i].hardware_active) continue;
     index_remove(table, &table->entries[i]);
     table->entries[i]=(struct router_nat_session){0};
     table->count--;
   }
+}
+
+void router_nat_session_set_hardware_active(
+    const struct router_nat_session *session, bool active) {
+  /* Session storage has one dataplane owner.  The public translation API
+   * returns a const view so packet callers cannot mutate tuple keys; this
+   * narrow lifecycle hook is the sole exception. */
+  if (session != NULL)
+    ((struct router_nat_session *)session)->hardware_active = active;
 }
