@@ -827,10 +827,13 @@ static doca_error_t bind_sf_return_context(
       free_context->vswitch_id = vswitch_id;
       free_context->rif_address = rif_address;
       memcpy(free_context->rif_mac, rif_mac, 6);
-      result = add_route_eligible_rule(pipeline, free_context);
+      /* Install the selector first. Its control-pipe miss is the RSS/Arm
+       * fallback, so the RIF remains functional when the optional eligibility
+       * action cannot be allocated. */
+      result = add_route_selector_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
         doca_error_t original_error = result;
-        fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=route-eligible "
+        fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=route-selector "
                         "vs=%u error=%s\n",
                 vswitch_id, doca_error_get_descr(result));
         doca_error_t cleanup = remove_rule(
@@ -841,22 +844,17 @@ static doca_error_t bind_sf_return_context(
                                 "rollback SF return context");
         return cleanup == DOCA_SUCCESS ? original_error : cleanup;
       }
-      result = add_route_selector_rule(pipeline, free_context);
+      result = add_route_eligible_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
-        doca_error_t original_error = result;
-        fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=route-selector "
-                        "vs=%u error=%s\n",
+        /* Hardware routing is optional. Preserve SF return and local-IP
+         * entries, and preserve the selector so its fallback sends this RIF
+         * to RSS. A later route sync retries only the missing eligibility
+         * entry. */
+        pipeline->hw_route_failures++;
+        pipeline->hardware_routing_degraded = true;
+        fprintf(stderr, "HARDWARE ROUTING DEGRADED: stage=route-eligible "
+                        "vs=%u fallback=arm error=%s\n",
                 vswitch_id, doca_error_get_descr(result));
-        doca_error_t cleanup = remove_rule(
-            pipeline, &free_context->route_eligible_rule,
-            "rollback hardware route eligibility");
-        if (cleanup == DOCA_SUCCESS)
-          cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
-                                "rollback local RIF IPv4");
-        if (cleanup == DOCA_SUCCESS)
-          cleanup = remove_rule(pipeline, &free_context->return_rule,
-                                "rollback SF return context");
-        return cleanup == DOCA_SUCCESS ? original_error : cleanup;
       }
     }
   }

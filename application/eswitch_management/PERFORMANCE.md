@@ -50,6 +50,11 @@ a NAT session or neighbor. A private neighbor is promoted only after a required
 gateway ARP reply has successfully entered the SF return path; a failed bind is
 left on the Arm slow path and retried by the next request instead of consuming
 another LPM action first.
+Hardware eligibility is committed after the per-RIF selector. If its HWS
+control entry cannot be allocated, the selector remains installed and its
+fallback sends router traffic to RSS/Arm; SF return, gateway ARP, local ICMP and
+software routing remain available while later synchronization retries the
+eligibility entry.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The
