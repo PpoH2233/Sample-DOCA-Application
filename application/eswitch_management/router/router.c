@@ -112,7 +112,20 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
   if (!strcmp(verb,"create")) { c->op=CREATE; required=ID; }
   else if (!strcmp(verb,"delete")) { c->op=DELETE; required=ID; }
   else if (!strcmp(verb,"show") || !strcmp(verb,"show-interface")) {
+    /* show-interface is a deprecated alias of show. */
     c->op=SHOW; required=ID;
+  } else if (count>2 && !strcmp(verb,"port")) {
+    /* Canonical nested form: vr port attach|detach. */
+    start=3;
+    if (!strcmp(tokens[2],"attach")) { c->op=ATTACH_PORT; required=ID|NAME|PORT; }
+    else if (!strcmp(tokens[2],"detach")) { c->op=DETACH_PORT; required=ID|NAME; }
+    else return error(out,size,"expected port attach|detach");
+  } else if (count>2 && !strcmp(verb,"switch")) {
+    /* Canonical nested form: vr switch attach|detach. */
+    start=3;
+    if (!strcmp(tokens[2],"attach")) { c->op=ATTACH_SWITCH; required=ID|NAME|SWITCH; }
+    else if (!strcmp(tokens[2],"detach")) { c->op=DETACH_SWITCH; required=ID|NAME; }
+    else return error(out,size,"expected switch attach|detach");
   } else if (!strcmp(verb,"port-attach")) {
     c->op=ATTACH_PORT; required=ID|NAME|PORT;
   } else if (!strcmp(verb,"switch-attach")) {
@@ -142,7 +155,9 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
     } else if (!strcmp(tokens[2],"show")) {
       c->op=NAT_SHOW; required=ID;
     } else return error(out,size,"expected nat enable|disable|show");
-  } else return error(out,size,"unsupported vr operation (see router/README.md)");
+  } else return error(out,size,
+    "unsupported vr operation; expected create|delete|show|port|switch|"
+    "interface|ip|route|nat (see router/README.md)");
   allowed=required;
   if ((count-start)%2) return error(out,size,"options require values");
   for (size_t i=start; i<count; i+=2) {

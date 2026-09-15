@@ -21,6 +21,11 @@ available tenant port and cannot be attached to a VS or VR. `eswitchctl` sends
 local control commands over `/run/eswitch-management/control.sock`; it never
 initializes DPDK or DOCA itself.
 
+Commands are resource-first, `<resource> [sub-resource] <action> --options`, for
+example `vs port attach --id 10 --port 1`. The version-1 flat verbs such as
+`vs-create` and `list-port-available` still work but are deprecated;
+[CLI.md](CLI.md) is the command contract and holds the alias table.
+
 At startup every discovered DPDK port is **unassigned**. The root pipe has a
 DROP miss action, so an unassigned VF or uplink cannot exchange traffic through
 this application. A port belongs to at most one virtual switch.
@@ -137,8 +142,8 @@ forwarding state before returning `ERR`.
 The desired topology is stored in
 `/var/lib/eswitch-management/eswitch.conf` by default. Override it with
 `ESWITCH_STATE_FILE=/path/to/eswitch.conf`. On the first successful startup,
-the daemon creates an empty versioned file. Every successful `vs-create`,
-`vs-delete`, `vs-port-attach`, and `vs-port-detach` rewrites it atomically:
+the daemon creates an empty versioned file. Every successful `vs create`,
+`vs delete`, `vs port attach`, and `vs port detach` rewrites it atomically:
 
 ```text
 write eswitch.conf.tmp.<pid>
@@ -271,7 +276,7 @@ Run the CLI already included in the image:
 
 ```bash
 sudo docker exec eswitch-management eswitchctl status
-sudo docker exec eswitch-management eswitchctl list-port-available
+sudo docker exec eswitch-management eswitchctl port show
 ```
 
 The status response includes cumulative SF return diagnostics. A zero
@@ -329,14 +334,14 @@ In another shell:
 
 ```bash
 /tmp/eswitch-management-build/eswitchctl status
-/tmp/eswitch-management-build/eswitchctl list-port-available
-/tmp/eswitch-management-build/eswitchctl vs-create --id 10
-/tmp/eswitch-management-build/eswitchctl vs-port-attach --id 10 --port 1
-/tmp/eswitch-management-build/eswitchctl vs-port-attach --id 10 --port 2
-/tmp/eswitch-management-build/eswitchctl vs-list
-/tmp/eswitch-management-build/eswitchctl show-fdb
-/tmp/eswitch-management-build/eswitchctl vs-port-detach --id 10 --port 2
-/tmp/eswitch-management-build/eswitchctl vs-delete --id 10
+/tmp/eswitch-management-build/eswitchctl port show
+/tmp/eswitch-management-build/eswitchctl vs create --id 10
+/tmp/eswitch-management-build/eswitchctl vs port attach --id 10 --port 1
+/tmp/eswitch-management-build/eswitchctl vs port attach --id 10 --port 2
+/tmp/eswitch-management-build/eswitchctl vs show
+/tmp/eswitch-management-build/eswitchctl fdb show
+/tmp/eswitch-management-build/eswitchctl vs port detach --id 10 --port 2
+/tmp/eswitch-management-build/eswitchctl vs delete --id 10
 ```
 
 Example output:

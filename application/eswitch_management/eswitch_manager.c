@@ -16,6 +16,7 @@
 #include <rte_version.h>
 
 #include "../ethernet_switch/switch_config.h"
+#include "cli/eswitch_cli.h"
 #include "eswitch_state.h"
 #include "router/router_control.h"
 #include "router/router_hw.h"
@@ -1293,60 +1294,6 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   return eswitch_fdb_age(&manager->fdb, now_ns);
 }
 
-static bool parse_u16(const char *text, uint16_t *value) {
-  char *end = NULL;
-  unsigned long parsed;
-
-  if (text == NULL || *text == '\0')
-    return false;
-  errno = 0;
-  parsed = strtoul(text, &end, 0);
-  if (errno != 0 || *end != '\0' || parsed > UINT16_MAX)
-    return false;
-  *value = (uint16_t)parsed;
-  return true;
-}
-
-static bool parse_id_arguments(char **arguments, size_t count,
-                               bool required, uint16_t *id) {
-  if (count == 0) {
-    if (required)
-      return false;
-    *id = 0;
-    return true;
-  }
-  if (count == 1)
-    return parse_u16(arguments[0], id); /* Legacy positional form. */
-  return count == 2 && strcmp(arguments[0], "--id") == 0 &&
-         parse_u16(arguments[1], id);
-}
-
-static bool parse_port_arguments(char **arguments, size_t count,
-                                 uint16_t *id, uint16_t *port_id) {
-  bool found_id = false;
-  bool found_port = false;
-
-  if (count == 2)
-    return parse_u16(arguments[0], id) &&
-           parse_u16(arguments[1], port_id); /* Legacy positional form. */
-  if (count != 4)
-    return false;
-  for (size_t i = 0; i < count; i += 2) {
-    if (strcmp(arguments[i], "--id") == 0 && !found_id) {
-      found_id = parse_u16(arguments[i + 1], id);
-      if (!found_id)
-        return false;
-    } else if (strcmp(arguments[i], "--port") == 0 && !found_port) {
-      found_port = parse_u16(arguments[i + 1], port_id);
-      if (!found_port)
-        return false;
-    } else {
-      return false;
-    }
-  }
-  return found_id && found_port;
-}
-
 static size_t format_status(const struct eswitch_manager *manager,
                             char *response, size_t size) {
   size_t used = 0;
@@ -1591,7 +1538,7 @@ static size_t format_tx_debug(const struct eswitch_manager *manager,
 }
 
 static size_t format_vswitches(const struct eswitch_manager *manager,
-                               char *response, size_t size) {
+                               char *response, size_t size, uint16_t filter) {
   size_t used = append_text(response, size, 0, "OK\n");
   size_t shown = 0;
 
@@ -1599,6 +1546,8 @@ static size_t format_vswitches(const struct eswitch_manager *manager,
     const struct managed_vswitch *vs = &manager->switches[s];
     bool first = true;
     if (!vs->exists)
+      continue;
+    if (filter != 0 && vs->id != filter)
       continue;
     used = append_text(response, size, used, "vs=%u ports=[", vs->id);
     for (uint16_t i = 0; i < manager->ports->count; i++) {
@@ -1648,73 +1597,59 @@ static size_t format_available_ports(const struct eswitch_manager *manager,
 doca_error_t eswitch_manager_command(const char *request, char *response,
                                      size_t response_size, void *context) {
   struct eswitch_manager *manager = context;
-  char command[256];
-  char *save = NULL;
-  char *verb;
-  char *arguments[8];
-  size_t argument_count = 0;
-  uint16_t first;
-  uint16_t second;
+  struct eswitch_cli_command parsed = {0};
   doca_error_t result = DOCA_SUCCESS;
   bool syntax_error = false;
 
   if (request == NULL || response == NULL || response_size == 0 ||
       manager == NULL || !manager->initialized)
     return DOCA_ERROR_INVALID_VALUE;
-  if (strncmp(request, "vr ", 3) == 0 || strncmp(request, "vr\t", 3) == 0)
+  /* The router group owns its own grammar and its own transaction. */
+  if (eswitch_cli_is_router_line(request))
     return router_control_command(manager, request, response, response_size);
-  snprintf(command, sizeof(command), "%s", request);
-  command[strcspn(command, "\r\n")] = '\0';
-  verb = strtok_r(command, " \t", &save);
-  while (argument_count < sizeof(arguments) / sizeof(arguments[0])) {
-    char *argument = strtok_r(NULL, " \t", &save);
-    if (argument == NULL)
-      break;
-    arguments[argument_count++] = argument;
-  }
-  if (strtok_r(NULL, " \t", &save) != NULL)
-    verb = NULL;
-  if (verb == NULL) {
+  /* Raw socket clients reach the same grammar as eswitchctl: canonical
+   * resource-first forms plus the deprecated flat aliases. */
+  if (!eswitch_cli_parse_line(request, &parsed)) {
     result = DOCA_ERROR_INVALID_VALUE;
-  } else if (strcmp(verb, "status") == 0 && argument_count == 0) {
+    syntax_error = true;
+  } else if (parsed.verb == ESWITCH_CLI_STATUS) {
     (void)format_status(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "tx-debug") == 0 && argument_count == 0) {
+  } else if (parsed.verb == ESWITCH_CLI_TX_DEBUG) {
     (void)format_tx_debug(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "vs-list") == 0 && argument_count == 0) {
-    (void)format_vswitches(manager, response, response_size);
-    return DOCA_SUCCESS;
-  } else if (strcmp(verb, "list-port-available") == 0 &&
-             argument_count == 0) {
+  } else if (parsed.verb == ESWITCH_CLI_PORT_SHOW) {
     (void)format_available_ports(manager, response, response_size);
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "show-fdb") == 0 &&
-             parse_id_arguments(arguments, argument_count, false, &first)) {
+  } else if (parsed.verb == ESWITCH_CLI_VS_SHOW) {
+    /* An explicit filter for an absent vSwitch is a lookup miss, not an empty
+     * collection, so API clients can map it to 404. */
+    if (parsed.id != 0 && find_vswitch(manager, parsed.id) == NULL) {
+      result = DOCA_ERROR_NOT_FOUND;
+    } else {
+      (void)format_vswitches(manager, response, response_size, parsed.id);
+      return DOCA_SUCCESS;
+    }
+  } else if (parsed.verb == ESWITCH_CLI_FDB_SHOW) {
     snprintf(response, response_size, "OK\n");
-    eswitch_fdb_format(&manager->fdb, first,
+    eswitch_fdb_format(&manager->fdb, parsed.id,
                        response + strlen(response),
                        response_size - strlen(response));
     return DOCA_SUCCESS;
-  } else if (strcmp(verb, "vs-create") == 0 &&
-             parse_id_arguments(arguments, argument_count, true, &first)) {
-    result = create_vswitch_persisted(manager, first);
-  } else if (strcmp(verb, "vs-delete") == 0 &&
-             parse_id_arguments(arguments, argument_count, true, &first)) {
-    if (manager->router && router_switch_reserved(manager->router, first)) {
+  } else if (parsed.verb == ESWITCH_CLI_VS_CREATE) {
+    result = create_vswitch_persisted(manager, parsed.id);
+  } else if (parsed.verb == ESWITCH_CLI_VS_DELETE) {
+    if (manager->router && router_switch_reserved(manager->router, parsed.id)) {
       snprintf(response, response_size,
-               "ERR vSwitch is attached to a VR; switch-detach first\n");
+               "ERR vSwitch is attached to a VR; detach it first with: "
+               "vr switch detach --id <vr-id> --interface <name>\n");
       return DOCA_ERROR_IN_USE;
     }
-    result = delete_vswitch_persisted(manager, first);
-  } else if (strcmp(verb, "vs-port-attach") == 0 &&
-             parse_port_arguments(arguments, argument_count, &first,
-                                  &second)) {
-    result = attach_port_persisted(manager, first, second);
-  } else if (strcmp(verb, "vs-port-detach") == 0 &&
-             parse_port_arguments(arguments, argument_count, &first,
-                                  &second)) {
-    result = detach_port_persisted(manager, first, second);
+    result = delete_vswitch_persisted(manager, parsed.id);
+  } else if (parsed.verb == ESWITCH_CLI_VS_PORT_ATTACH) {
+    result = attach_port_persisted(manager, parsed.id, parsed.port_id);
+  } else if (parsed.verb == ESWITCH_CLI_VS_PORT_DETACH) {
+    result = detach_port_persisted(manager, parsed.id, parsed.port_id);
   } else {
     result = DOCA_ERROR_INVALID_VALUE;
     syntax_error = true;
@@ -1726,28 +1661,9 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
   }
   snprintf(response, response_size, "ERR code=%d message=%s\n", result,
            doca_error_get_descr(result));
-  if (syntax_error) {
-    size_t used = strlen(response);
-
-    if (verb != NULL && strcmp(verb, "vs-create") == 0)
-      append_text(response, response_size, used,
-                  "Usage: vs-create --id <id>\n");
-    else if (verb != NULL && strcmp(verb, "vs-delete") == 0)
-      append_text(response, response_size, used,
-                  "Usage: vs-delete --id <id>\n");
-    else if (verb != NULL && strcmp(verb, "vs-port-attach") == 0)
-      append_text(response, response_size, used,
-                  "Usage: vs-port-attach --id <id> --port <port-id>\n");
-    else if (verb != NULL && strcmp(verb, "vs-port-detach") == 0)
-      append_text(response, response_size, used,
-                  "Usage: vs-port-detach --id <id> --port <port-id>\n");
-    else if (verb != NULL && strcmp(verb, "show-fdb") == 0)
-      append_text(response, response_size, used,
-                  "Usage: show-fdb [--id <id>]\n");
-    else
-      append_text(response, response_size, used,
-                  "Run: eswitchctl --help\n");
-  }
+  if (syntax_error)
+    append_text(response, response_size, strlen(response), "%s",
+                eswitch_cli_usage_for_line(request));
   return result;
 }
 

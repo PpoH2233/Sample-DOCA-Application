@@ -27,6 +27,48 @@ static void command(const char *request,bool expected) {
 }
 int main(void) {
   router_config_init(&config);
+
+  /* Canonical resource-first grammar. This section is torn down completely so
+   * the legacy-alias section below starts from the same inventory. */
+  command("vr create --id 300",true);
+  command("vr port attach --id 300 --port 7 --name up0",true);
+  command("vr switch attach --id 300 --switch-id 200 --name lan0",true);
+  command("vr interface set --id 300 --interface lan0 --mac 02:aa:bb:cc:dd:ee",true);
+  command("vr ip add --id 300 --interface lan0 --address 10.10.0.1/24",true);
+  command("vr ip add --id 300 --interface up0 --address 203.0.113.2/24",true);
+  command("vr route add --id 300 --prefix 0.0.0.0/0 --via 203.0.113.1 --interface up0",true);
+  command("vr nat enable --id 300 --interface up0 --address interface --port-range 20000-60999",true);
+  command("vr show --id 300",true);
+  assert(strstr(response,"up0") && strstr(response,"lan0") &&
+         strstr(response,"ACTIVE_ARM_NAT") && strstr(response,"ACTIVE_ARM_LPM"));
+  command("vr route show --id 300",true);
+  assert(strstr(response,"connected 10.10.0.0/24") &&
+         strstr(response,"static 0.0.0.0/0"));
+  /* Canonical nested grammar is strict about its options and actions. */
+  command("vr port attach --id 300 --port 8 --interface p9",false);
+  command("vr port detach --id 300 --name up0",false);
+  command("vr port connect --id 300 --port 8 --name p9",false);
+  command("vr switch connect --id 300 --switch-id 201 --name p9",false);
+  command("vr port",false);
+  command("vr switch",false);
+  command("vr port attach --id 300 --port 8",false);
+  command("vr switch attach --id 300 --name p9",false);
+  command("vr port detach --id 300 --interface lan0",false);
+  command("vr switch detach --id 300 --interface up0",false);
+  /* Canonical and legacy aliases address the same objects. */
+  command("vr show-interface --id 300",true);
+  command("vr port-detach --id 300 --interface up0",false);
+  command("vr nat disable --id 300",true);
+  command("vr route del --id 300 --prefix 0.0.0.0/0",true);
+  command("vr ip del --id 300 --interface up0 --address 203.0.113.2/24",true);
+  command("vr port detach --id 300 --interface up0",true);
+  command("vr ip del --id 300 --interface lan0 --address 10.10.0.1/24",true);
+  command("vr switch detach --id 300 --interface lan0",true);
+  command("vr delete --id 300",true);
+  assert(!router_has_vr(&config,300));
+  assert(!router_switch_reserved(&config,200));
+
+  /* Deprecated flat aliases remain fully supported. */
   command("vr create --id 100",true);
   command("vr create --id 100",false);
   command("vr create --id 0",false);
@@ -96,6 +138,48 @@ int main(void) {
   struct router_config before=loaded;
   assert(!router_config_load(path,&loaded,response,sizeof(response)));
   assert(!memcmp(&before,&loaded,sizeof(loaded)));
+  assert(unlink(path)==0);
+
+  /* Newly saved state uses the canonical VR grammar. */
+  assert(router_config_save(path,&config,response,sizeof(response)));
+  file=fopen(path,"r");assert(file);
+  char saved[8192]={0};
+  size_t saved_length=fread(saved,1,sizeof(saved)-1,file);
+  assert(saved_length>0 && feof(file));assert(fclose(file)==0);
+  assert(strstr(saved,"vr port attach --id ") && strstr(saved,"vr switch attach --id "));
+  assert(!strstr(saved,"port-attach") && !strstr(saved,"switch-attach"));
+
+  /* Legacy state written by a version-1 daemon still reloads. */
+  char legacy_path[256];
+  snprintf(legacy_path,sizeof(legacy_path),"%s/router-legacy.conf",dir);
+  file=fopen(legacy_path,"w");assert(file);
+  assert(fputs("router-state 1\nnext 3\n"
+               "vr create --id 400\n"
+               "identity 1 0 0 11\n"
+               "vr port-attach --id 400 --name up0 --port 0\n"
+               "vr interface set --id 400 --interface up0 --mac 02:00:01:90:00:01\n"
+               "vr ip add --id 400 --interface up0 --address 203.0.113.9/24\n"
+               "identity 2 0 0 0\n"
+               "vr switch-attach --id 400 --name lan0 --switch-id 200\n"
+               "vr interface set --id 400 --interface lan0 --mac 02:00:01:90:00:02\n",
+               file)>=0);
+  assert(fclose(file)==0);
+  struct router_config legacy;router_config_init(&legacy);
+  assert(router_config_load(legacy_path,&legacy,response,sizeof(response)));
+  assert(legacy.vr_count==1 && legacy.interface_count==2);
+  assert(legacy.next_interface_id==3);
+  assert(legacy.interfaces[0].attachment==ROUTER_PORT &&
+         legacy.interfaces[0].port.vf==11 &&
+         !strcmp(legacy.interfaces[0].name,"up0"));
+  assert(legacy.interfaces[1].attachment==ROUTER_VSWITCH &&
+         legacy.interfaces[1].vswitch_id==200 &&
+         !strcmp(legacy.interfaces[1].name,"lan0"));
+  /* Legacy state is re-saved in canonical form without changing the model. */
+  assert(router_config_save(legacy_path,&legacy,response,sizeof(response)));
+  struct router_config rewritten;router_config_init(&rewritten);
+  assert(router_config_load(legacy_path,&rewritten,response,sizeof(response)));
+  assert(!memcmp(&rewritten,&legacy,sizeof(legacy)));
+  assert(unlink(legacy_path)==0);
   assert(unlink(path)==0);assert(rmdir(dir)==0);
 
   command("vr nat disable --id 100",true);

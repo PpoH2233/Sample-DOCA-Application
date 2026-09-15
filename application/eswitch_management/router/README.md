@@ -103,14 +103,14 @@ creates VS 100 for VM-A and VS 200 for VM-B, then attaches both networks to VR
 static route command is needed.
 
 ```sh
-eswitchctl vs-create --id 100
-eswitchctl vs-port-attach --id 100 --port <VM-A-VF-DPDK-port>
-eswitchctl vs-create --id 200
-eswitchctl vs-port-attach --id 200 --port <VM-B-VF-DPDK-port>
+eswitchctl vs create --id 100
+eswitchctl vs port attach --id 100 --port <VM-A-VF-DPDK-port>
+eswitchctl vs create --id 200
+eswitchctl vs port attach --id 200 --port <VM-B-VF-DPDK-port>
 
 eswitchctl vr create --id 101
-eswitchctl vr switch-attach --id 101 --switch-id 100 --name lan-a
-eswitchctl vr switch-attach --id 101 --switch-id 200 --name lan-b
+eswitchctl vr switch attach --id 101 --switch-id 100 --name lan-a
+eswitchctl vr switch attach --id 101 --switch-id 200 --name lan-b
 eswitchctl vr interface set --id 101 --interface lan-a --mac 02:00:00:65:00:01
 eswitchctl vr interface set --id 101 --interface lan-b --mac 02:00:00:65:00:02
 eswitchctl vr ip add --id 101 --interface lan-a --address 192.168.10.1/24
@@ -132,6 +132,7 @@ to a different VR.
 ```text
 eswitch_management/
   main.c / eswitch_manager.c   runtime, command dispatch, persistence coordination
+  cli/                        shared resource-first grammar for eswitchctl and daemon
   control/                    existing Unix socket transport
   l2/                         vSwitch membership and MAC learning/FDB
   pipeline/                   shared DOCA root, L2 pipes, RSS, flooding and gates
@@ -148,26 +149,31 @@ eswitch_management/
 
 ## Commands implemented
 
-Use actual DPDK IDs from `list-port-available`; VF 11 is **not necessarily** DPDK
+Commands are resource-first: `vr <resource> <action> --options`. The version-1
+hyphenated verbs `vr port-attach`, `vr switch-attach`, `vr port-detach`,
+`vr switch-detach` and `vr show-interface` still work but are deprecated; see
+[../CLI.md](../CLI.md) for the alias table and the full command contract.
+
+Use actual DPDK IDs from `port show`; VF 11 is **not necessarily** DPDK
 port 11. Choose a public port whose inventory says VF 11–15. Parent is rejected
 as a VR uplink because this topology requires a host VF.
 
 ```sh
 eswitchctl vr create --id 100
-eswitchctl vr port-attach --id 100 --port <actual-public-dpdk-id> --name p1
-eswitchctl vr switch-attach --id 100 --switch-id 200 --name p2
+eswitchctl vr port attach --id 100 --port <actual-public-dpdk-id> --name p1
+eswitchctl vr switch attach --id 100 --switch-id 200 --name p2
 eswitchctl vr interface set --id 100 --interface p1 --mac <public-vf-mac>
 eswitchctl vr ip add --id 100 --interface p2 --address 192.168.0.1/24
 eswitchctl vr ip add --id 100 --interface p1 --address 200.20.0.4/16
 eswitchctl vr route add --id 100 --prefix 0.0.0.0/0 --via 200.20.0.1 --interface p1
-eswitchctl vr show-interface --id 100
+eswitchctl vr show --id 100
 eswitchctl vr route show --id 100
 
 eswitchctl vr route del --id 100 --prefix 0.0.0.0/0
 eswitchctl vr ip del --id 100 --interface p1 --address 200.20.0.4/16
-eswitchctl vr port-detach --id 100 --interface p1
+eswitchctl vr port detach --id 100 --interface p1
 eswitchctl vr ip del --id 100 --interface p2 --address 192.168.0.1/24
-eswitchctl vr switch-detach --id 100 --interface p2
+eswitchctl vr switch detach --id 100 --interface p2
 eswitchctl vr delete --id 100
 ```
 
@@ -289,7 +295,16 @@ clang -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   router/router_test.c router/router.c router/router_state.c \
   -o /tmp/eswitch-router-test
 /tmp/eswitch-router-test
+
+clang -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  cli/eswitch_cli_test.c cli/eswitch_cli.c -o /tmp/eswitch-cli-test
+/tmp/eswitch-cli-test
 ```
+
+`router_test.c` covers the canonical grammar, the deprecated aliases, invalid
+grammar, and that saved state uses canonical syntax while legacy state still
+loads. `cli/eswitch_cli_test.c` covers the L2 grammar shared by `eswitchctl`
+and the daemon's raw-socket path.
 
 In the DOCA 3.4 environment (user-run):
 

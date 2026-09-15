@@ -303,7 +303,8 @@ int main(int argc, char **argv) {
   }
 
   printf("eSwitch Management ready: socket=%s\n", socket_path);
-  printf("All ports are unassigned and DROP until vs-port-attach.\n");
+  printf("All ports are unassigned and DROP until: "
+         "eswitchctl vs port attach --id <id> --port <port>\n");
   while (!stop_requested) {
     bool command_work = false;
     bool packet_work = false;

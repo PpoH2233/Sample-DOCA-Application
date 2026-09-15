@@ -33,6 +33,7 @@ executable(
   'eswitch-management',
   [
     'main.c',
+    'cli/eswitch_cli.c',
     'control/control_server.c',
     'eswitch_manager.c',
     'eswitch_state.c',
@@ -65,10 +66,19 @@ executable(
 
 executable(
   'eswitchctl',
-  ['eswitchctl.c', 'router/router.c'],
+  ['eswitchctl.c', 'cli/eswitch_cli.c', 'router/router.c'],
   include_directories: include_dirs,
   install: true,
 )
+
+cli_test = executable(
+  'eswitch-cli-test',
+  ['cli/eswitch_cli_test.c', 'cli/eswitch_cli.c'],
+  include_directories: include_dirs,
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-cli', cli_test)
 
 state_test = executable(
   'eswitch-state-test',

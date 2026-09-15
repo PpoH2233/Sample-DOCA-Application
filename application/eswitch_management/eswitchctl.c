@@ -8,111 +8,19 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "cli/eswitch_cli.h"
 #include "eswitch_config.h"
 #include "router/router.h"
 
 static void print_help(FILE *output, const char *program) {
-  fprintf(output,
-          "Usage: %s <command> [arguments]\n\n"
-          "Commands:\n"
-          "  status                              Show daemon status\n"
-          "  vs-create --id <id>                 Create a virtual switch\n"
-          "  vs-delete --id <id>                 Delete a virtual switch\n"
-          "  vs-port-attach --id <id> --port <p> Attach an available port\n"
-          "  vs-port-detach --id <id> --port <p> Detach a member port\n"
-          "  vs-list                             List virtual switches\n"
-          "  tx-debug                            Show SF return/TX diagnostics\n"
-          "  show-fdb [--id <id>]                Show all or one FDB\n"
-          "  list-port-available                 List unassigned DPDK ports\n"
-          "  vr create|delete|show --id <id>     Manage logical routers\n"
-          "  vr show-interface --id <id>        Show named RIFs and readiness\n"
-          "  vr port-attach --id <id> --port <p> --name <name>\n"
-          "  vr switch-attach --id <id> --switch-id <vs> --name <name>\n"
-          "  vr port-detach|switch-detach --id <id> --interface <name>\n"
-          "  vr ip add|del --id <id> --interface <name> --address <ip/prefix>\n"
-          "  vr interface set --id <id> --interface <name> --mac <mac>\n"
-          "  vr route add --id <id> --prefix <cidr> --via <ip> --interface <name>\n"
-          "  vr route del --id <id> --prefix <cidr>\n"
-          "  vr route show --id <id>\n"
-          "  vr nat enable --id <id> --interface <name> --address <interface|ip>\n"
-          "      --port-range <first-last>       TCP/UDP ports and ICMP Echo IDs\n"
-          "  vr nat disable|show --id <id>       Manage/show the NAT policy\n"
-          "  Private VS gateway ARP, ICMP echo and Arm LPM routing are active.\n"
-          "  Arm TCP/UDP/ICMP Echo NAT and uplink ARP are active; hardware CT is pending.\n"
-          "  --help, -h                          Show this help\n\n"
-          "Control socket: %s\n"
-          "Override with: ESWITCH_CONTROL_SOCKET=/path/to/socket\n",
-          program, ESWITCH_SOCKET_PATH);
-}
-
-static bool parse_u16_value(const char *text) {
-  char *end = NULL;
-  unsigned long value;
-
-  if (text == NULL || *text == '\0')
-    return false;
-  errno = 0;
-  value = strtoul(text, &end, 0);
-  return errno == 0 && *end == '\0' && value <= UINT16_MAX;
-}
-
-static bool valid_id_arguments(int count, char **arguments, bool optional) {
-  if (count == 0)
-    return optional;
-  if (count == 1)
-    return parse_u16_value(arguments[0]);
-  return count == 2 && strcmp(arguments[0], "--id") == 0 &&
-         parse_u16_value(arguments[1]);
-}
-
-static bool valid_port_arguments(int count, char **arguments) {
-  bool found_vswitch = false;
-  bool found_port = false;
-
-  if (count == 2)
-    return parse_u16_value(arguments[0]) && parse_u16_value(arguments[1]);
-  if (count != 4)
-    return false;
-  for (int i = 0; i < count; i += 2) {
-    if (strcmp(arguments[i], "--id") == 0 && !found_vswitch) {
-      found_vswitch = parse_u16_value(arguments[i + 1]);
-      if (!found_vswitch)
-        return false;
-    } else if (strcmp(arguments[i], "--port") == 0 && !found_port) {
-      found_port = parse_u16_value(arguments[i + 1]);
-      if (!found_port)
-        return false;
-    } else {
-      return false;
-    }
-  }
-  return found_vswitch && found_port;
-}
-
-static bool valid_command_line(int argc, char **argv) {
-  const char *command = argv[1];
-  int argument_count = argc - 2;
-  char **arguments = &argv[2];
-
-  if (strcmp(command, "status") == 0 || strcmp(command, "tx-debug") == 0 ||
-      strcmp(command, "vs-list") == 0 ||
-      strcmp(command, "list-port-available") == 0)
-    return argument_count == 0;
-  if (strcmp(command, "vs-create") == 0 ||
-      strcmp(command, "vs-delete") == 0)
-    return valid_id_arguments(argument_count, arguments, false);
-  if (strcmp(command, "vs-port-attach") == 0 ||
-      strcmp(command, "vs-port-detach") == 0)
-    return valid_port_arguments(argument_count, arguments);
-  if (strcmp(command, "show-fdb") == 0)
-    return valid_id_arguments(argument_count, arguments, true);
-  return false;
+  eswitch_cli_help(output, program, ESWITCH_SOCKET_PATH);
 }
 
 int main(int argc, char **argv) {
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
   struct sockaddr_un address = {0};
-  char request[256] = {0};
+  struct eswitch_cli_command parsed = {0};
+  char request[512] = {0};
   char response[16384];
   size_t used = 0;
   size_t sent_total = 0;
@@ -129,8 +37,13 @@ int main(int argc, char **argv) {
     print_help(stdout, argv[0]);
     return EXIT_SUCCESS;
   }
-  if (strcmp(argv[1], "vr") != 0 && !valid_command_line(argc, argv)) {
-    fprintf(stderr, "Invalid command or arguments.\n\n");
+  /* Grammar is validated locally so a stopped daemon still reports misuse.
+   * The `vr` group is validated by the router parser below. */
+  if (!eswitch_cli_parse((size_t)(argc - 1), (const char *const *)&argv[1],
+                         &parsed)) {
+    fprintf(stderr, "Invalid command or arguments.\n%s\n",
+            eswitch_cli_usage_for_tokens((size_t)(argc - 1),
+                                         (const char *const *)&argv[1]));
     print_help(stderr, argv[0]);
     return EXIT_FAILURE;
   }
@@ -153,7 +66,7 @@ int main(int argc, char **argv) {
   request[used++] = '\n';
   request[used] = '\0';
 
-  if (strcmp(argv[1], "vr") == 0) {
+  if (parsed.verb == ESWITCH_CLI_ROUTER) {
     char error[256];
     if (!router_command_valid(request, error, sizeof(error))) {
       fprintf(stderr, "%s", error);
