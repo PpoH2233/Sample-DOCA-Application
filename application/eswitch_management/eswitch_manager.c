@@ -512,8 +512,9 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
       manager, vs, ingress, response + 6, &context_tag);
   if (arm_result != DOCA_SUCCESS) {
     manager->arp_target_drops++; manager->arp_tx_drops++;
-    if (debug) printf("SF RETURN BIND FAILED: port=%u error=%s\n",
-                      ingress, doca_error_get_descr(arm_result));
+    fprintf(stderr,
+            "ARP SF RETURN BIND FAILED: vs=%u port=%u error=%s\n",
+            vs, ingress, doca_error_get_descr(arm_result));
     return;
   }
   if (debug) {
@@ -541,8 +542,8 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
   } else {
     manager->arp_tx_drops++;
     manager->arp_sf_send_drops++;
-    if (debug) printf("ARP TX DROP: stage=sf-send iface=%s\n",
-                      manager->sf_io->interface_name);
+    fprintf(stderr, "ARP TX DROP: stage=sf-send vs=%u port=%u iface=%s\n",
+            vs, ingress, manager->sf_io->interface_name);
   }
 }
 
@@ -1161,23 +1162,31 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
    * entry being visible before transmission. */
   if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
     uint8_t arp_scratch[42];
+    bool neighbor_changed = false;
     const uint8_t *arp = rte_pktmbuf_read(packet, 0, sizeof(arp_scratch),
                                           arp_scratch);
-    if (arp != NULL && router_neighbor_learn_arp(
-                           &manager->neighbors, manager->router,
-                           domain_id, port_id, arp, sizeof(arp_scratch),
-                           now_ns)) {
-      if (manager->packet_debug)
-        printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
+    if (arp != NULL)
+      neighbor_changed = router_neighbor_learn_arp(
+          &manager->neighbors, manager->router, domain_id, port_id, arp,
+          sizeof(arp_scratch), now_ns);
+    if (neighbor_changed && manager->packet_debug) {
+      printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
              "%02x:%02x:%02x:%02x:%02x:%02x\n",
-             domain_id, port_id, arp[28], arp[29], arp[30], arp[31],
-             arp[22], arp[23], arp[24], arp[25], arp[26], arp[27]);
+             domain_id, port_id, arp[28], arp[29], arp[30], arp[31], arp[22],
+             arp[23], arp[24], arp[25], arp[26], arp[27]);
+    }
+
+    /* Neighbor resolution is the dependency of all later IPv4 traffic. Bind
+     * the SF return context and enqueue the gateway ARP reply before spending
+     * hardware resources or time on an optional LPM promotion. The neighbor
+     * is already present in the Arm table, so the sync below still sees it. */
+    reply_gateway_arp(manager, packet, domain_id, port_id, now_ns);
+    if (neighbor_changed) {
       result = eswitch_manager_hw_routes_sync(manager, manager->router);
       if (result != DOCA_SUCCESS)
         fprintf(stderr, "Hardware route sync after private ARP failed: %s\n",
                 doca_error_get_descr(result));
     }
-    reply_gateway_arp(manager, packet, domain_id, port_id, now_ns);
   } else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
     route_ipv4_packet(manager, packet, domain_id, port_id, now_ns);
   }
