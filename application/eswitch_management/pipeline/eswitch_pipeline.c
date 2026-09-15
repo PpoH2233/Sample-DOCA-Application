@@ -755,7 +755,7 @@ doca_error_t eswitch_pipeline_uplink_arp_drop_query(
   result = doca_flow_resource_query_pipe_miss(
       pipeline->uplink_arp_color_pipe, &query);
   if (result == DOCA_SUCCESS)
-    *packets = query.total_pkts;
+    *packets = query.counter.total_pkts;
   return result;
 }
 
@@ -1377,9 +1377,10 @@ static doca_error_t attach_uplink_arp_meter(
   memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
-  monitor.limit_type = DOCA_FLOW_METER_LIMIT_TYPE_PACKETS;
-  monitor.cir = pipeline->uplink_arp_pps;
-  monitor.cbs = pipeline->uplink_arp_burst;
+  monitor.non_shared_meter.limit_type =
+      DOCA_FLOW_METER_LIMIT_TYPE_PACKETS;
+  monitor.non_shared_meter.cir = pipeline->uplink_arp_pps;
+  monitor.non_shared_meter.cbs = pipeline->uplink_arp_burst;
   flow_entry_cookie_prepare(&meter->cookie, "meter uplink broadcast ARP",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
