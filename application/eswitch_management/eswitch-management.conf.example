@@ -8,18 +8,24 @@ DEVICE_PCI="03:00.0"
 # StateDirectory=eswitch-management before starting the daemon.
 ESWITCH_STATE_FILE="/var/lib/eswitch-management/eswitch.conf"
 
-# VF indexes, not DPDK port IDs. Limit this integration test to VF 7-15.
-ESWITCH_VF_SCOPE="7-15"
+# VF indexes, not DPDK port IDs. The production image manages VF0 through
+# VF10; the parent PF and one Arm system-SF are added independently.
+ESWITCH_VF_SCOPE="0-10"
 
-# Opt-in private-to-private IPv4 hardware LPM. Keep disabled until the BF3
-# smoke test confirms pipe creation, counters, TTL and exception fallback.
-ESWITCH_HW_ROUTING="0"
+# Private-to-private IPv4 DOCA Flow LPM fast path. Unsupported traffic and
+# resource-admission failures remain on the Arm slow path.
+ESWITCH_HW_ROUTING="1"
 
 # Maximum private hardware routes requested from the HWS LPM table. It must be
 # a power of two from 64 through 1024. The application reserves matching
 # actions memory before starting Flow ports and may admit a smaller table if
 # the device cannot allocate the requested LPM size.
-ESWITCH_HW_ROUTE_CAPACITY="1024"
+ESWITCH_HW_ROUTE_CAPACITY="256"
+
+# Promote established TCP/UDP NAT sessions to DOCA Flow CT. First packets,
+# misses, ICMP and unsupported flows continue through the Arm slow path.
+ESWITCH_HW_CT="1"
+ESWITCH_HW_CT_CAPACITY="4096"
 
 # Rate-limit broadcast ARP from router uplinks in DOCA Flow before RSS/Arm.
 # Unicast ARP replies and non-broadcast traffic bypass this meter. Set PPS to

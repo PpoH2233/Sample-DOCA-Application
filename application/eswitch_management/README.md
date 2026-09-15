@@ -1,7 +1,7 @@
 # eSwitch Management
 
 Router integration is in progress: [router/README.md](router/README.md) records
-implemented control commands, readiness, SDK prerequisites, and the VF 11–15
+implemented control commands, readiness, SDK prerequisites, and the VF0–VF10
 test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
 `pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
 Router commands persist desired configuration. Addressed private vs-link RIFs
@@ -10,9 +10,9 @@ vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
 Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
 optional DOCA Flow CT promotion offloads established TCP/UDP NAT sessions.
 ICMP and all CT misses remain on the Arm slow path.
-The default VF scope is now `7-15`; explicit settings override that default.
+The default VF scope is `0-10`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
-/build/eswitch-management -Dvf_scope=7-15` and rebuild. An exported
+/build/eswitch-management -Dvf_scope=0-10` and rebuild. An exported
 `ESWITCH_VF_SCOPE` still overrides the compiled default.
 
 `eswitch-management` is the single owner of the BlueField eSwitch, DOCA Flow
@@ -214,7 +214,6 @@ directories:
 ```bash
 cd /mnt/doca-dev/Sample-DOCA-Application
 sudo docker build \
-  --build-arg VF_SCOPE='0-6,10-20' \
   -f application/eswitch_management/Dockerfile \
   -t eswitch-management:3.4.0 .
 ```
@@ -224,17 +223,12 @@ sudo docker build \
 `4`, or comma-separated indexes/ranges such as `0-6,10-20`. The parent DPDK
 port and exactly one Arm system SF representor are always probed. Startup fails
 closed when no SF or more than one SF is discovered. The image stores this as
-its default scope; a deployment may override it without rebuilding:
+its default scope (`0-10`); a deployment may override it without rebuilding.
+The image also enables DOCA Flow hardware LPM and CT by default, with Arm as
+the fail-open slow path when a capability or hardware resource is unavailable:
 
 ```bash
 sudo docker run ... \
-  --env ESWITCH_VF_SCOPE='10-20' \
-  --env ESWITCH_SF_IFACE='enp3s0f0s0' \
-  --env ESWITCH_HW_ROUTING='1' \
-  --env ESWITCH_HW_CT='1' \
-  --env ESWITCH_HW_CT_CAPACITY='4096' \
-  --env ESWITCH_UPLINK_ARP_PPS='256' \
-  --env ESWITCH_UPLINK_ARP_BURST='64' \
   eswitch-management:3.4.0 -l 0 -- 03:00.0
 ```
 
@@ -246,7 +240,10 @@ The base images can be changed without editing the Dockerfile:
 
 ```bash
 sudo docker build \
-  --build-arg VF_SCOPE='0-6,10-20'
+  --build-arg DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0 \
+  --build-arg DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0 \
+  --build-arg DOCA_PKG_VERSION=3.4.0112 \
+  --build-arg VF_SCOPE='0-10' \
   -f application/eswitch_management/Dockerfile \
   -t eswitch-management:3.4.0 .
 ```

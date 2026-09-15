@@ -286,7 +286,7 @@ generation, and durable config/hardware rollback. The daemon probes
 keeps `hw_ct_state=NOT_INITIALIZED` until the CT lifecycle and both directions
 can be installed atomically.
 
-## Verification and VF 11–15 build handoff
+## Verification and VF0–VF10 build handoff
 
 Portable model tests run without DOCA. Example from this directory's parent:
 
@@ -309,15 +309,15 @@ spellings. `cli/eswitch_cli_test.c` covers the L2 grammar shared by
 In the DOCA 3.4 environment (user-run):
 
 ```sh
-meson setup /tmp/eswitch-management-build application/eswitch_management -Dvf_scope=7-15
+meson setup /tmp/eswitch-management-build application/eswitch_management -Dvf_scope=0-10
 meson compile -C /tmp/eswitch-management-build
 meson test -C /tmp/eswitch-management-build --print-errorlogs
 ```
 
 The Meson command above runs from `Sample-DOCA-Application`. For container
-builds, use that directory as context and `--build-arg VF_SCOPE=7-15`.
-For runtime set `ESWITCH_VF_SCOPE=7-15` explicitly. Existing build trees retain
+builds, use that directory as context and `--build-arg VF_SCOPE=0-10`.
+For runtime set `ESWITCH_VF_SCOPE=0-10` explicitly. Existing build trees retain
 their old option: reconfigure before testing. Check inventory identifies only
-VF indexes 11–15 plus the parent needed by the shared manager. Never infer VF
+VF indexes 0–10 plus the parent and one system-SF needed by the shared manager. Never infer VF
 index from a DPDK port ID. Use a separate test state/socket path so unrelated
 saved memberships are not replayed. No hardware test was run by this change.
