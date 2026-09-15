@@ -90,12 +90,17 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
   uint32_t rounded = 1;
 
-  /* The private LPM shares the port action pool with the existing L2, SF
-   * return and router-selector pipes. Its reservation is additive; taking
-   * max(base, LPM) leaves no room once those earlier pipes are created. */
-  if (hardware_routing_enabled)
-    required += route_capacity * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
-                1024U;
+  /* The private LPM and dynamic SF return contexts share the parent port's
+   * action pool. Each context can require a return rewrite and an eligibility
+   * metadata write, so reserving only for LPM entries lets the LPM pipe start
+   * successfully but makes the first gateway ARP bind fail with NO_MEMORY. */
+  if (hardware_routing_enabled) {
+    uint32_t action_entries = route_capacity +
+        ESWITCH_MAX_SF_RETURN_CONTEXTS *
+            ESWITCH_SF_ACTION_ENTRIES_PER_CONTEXT;
+    required += action_entries * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
+                4096U;
+  }
   while (rounded < required)
     rounded <<= 1;
   if (hardware_routing_enabled &&

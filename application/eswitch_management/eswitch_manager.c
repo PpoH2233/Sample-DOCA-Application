@@ -462,9 +462,9 @@ doca_error_t eswitch_manager_hw_routes_sync(
   return result;
 }
 
-static void reply_gateway_arp(struct eswitch_manager *manager,
-                              struct rte_mbuf *request, uint16_t vs,
-                              uint16_t ingress, uint64_t now_ns) {
+static doca_error_t reply_gateway_arp(struct eswitch_manager *manager,
+                                      struct rte_mbuf *request, uint16_t vs,
+                                      uint16_t ingress, uint64_t now_ns) {
   uint8_t scratch[42], response[60];
   uint16_t context_tag = 0;
   bool debug = manager->packet_debug &&
@@ -483,7 +483,7 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
       printf("ARP TX SKIP: vs=%u port=%u reason=%s rx_len=%u\n", vs, ingress,
              bytes ? "not-local-gateway-request-or-invalid-arp" : "truncated-frame",
              rte_pktmbuf_pkt_len(request));
-    return;
+    return DOCA_ERROR_NOT_FOUND;
   }
   manager->arp_built++;
   int index = find_port_index(manager, ingress);
@@ -496,7 +496,7 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     if (debug)
       printf("ARP TX DROP: stage=target-validation vs=%u port=%u index=%d\n",
              vs, ingress, index);
-    return;
+    return DOCA_ERROR_INVALID_VALUE;
   }
   if (now_ns - manager->arp_window_ns >= 1000000000ULL) {
     manager->arp_window_ns = now_ns;
@@ -505,7 +505,7 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
   if (manager->arp_window_replies >= 100) {
     manager->arp_rate_drops++;
     if (debug) printf("ARP TX DROP: stage=rate-limit limit=100/s\n");
-    return;
+    return DOCA_ERROR_IN_USE;
   }
   manager->arp_window_replies++;
   doca_error_t arm_result = bind_sf_directed_context(
@@ -515,7 +515,7 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     fprintf(stderr,
             "ARP SF RETURN BIND FAILED: vs=%u port=%u error=%s\n",
             vs, ingress, doca_error_get_descr(arm_result));
-    return;
+    return arm_result;
   }
   if (debug) {
     const struct ethernet_port *target = manager->ports->items[index].ethernet;
@@ -539,11 +539,13 @@ static void reply_gateway_arp(struct eswitch_manager *manager,
     manager->arp_replies++;
     if (debug) printf("ARP SF TX SENT: vs=%u port=%u gateway=%u.%u.%u.%u\n", vs, ingress,
            response[28], response[29], response[30], response[31]);
+    return DOCA_SUCCESS;
   } else {
     manager->arp_tx_drops++;
     manager->arp_sf_send_drops++;
     fprintf(stderr, "ARP TX DROP: stage=sf-send vs=%u port=%u iface=%s\n",
             vs, ingress, manager->sf_io->interface_name);
+    return DOCA_ERROR_DRIVER;
   }
 }
 
@@ -1163,6 +1165,7 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
   if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
     uint8_t arp_scratch[42];
     bool neighbor_changed = false;
+    doca_error_t arp_reply_result;
     const uint8_t *arp = rte_pktmbuf_read(packet, 0, sizeof(arp_scratch),
                                           arp_scratch);
     if (arp != NULL)
@@ -1180,12 +1183,22 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
      * the SF return context and enqueue the gateway ARP reply before spending
      * hardware resources or time on an optional LPM promotion. The neighbor
      * is already present in the Arm table, so the sync below still sees it. */
-    reply_gateway_arp(manager, packet, domain_id, port_id, now_ns);
-    if (neighbor_changed) {
+    arp_reply_result = reply_gateway_arp(manager, packet, domain_id, port_id,
+                                         now_ns);
+    /* A successful gateway reply also retries a promotion deferred by an
+     * earlier resource failure, even when the neighbor tuple is unchanged. */
+    if ((neighbor_changed || arp_reply_result == DOCA_SUCCESS) &&
+        (arp_reply_result == DOCA_SUCCESS ||
+         arp_reply_result == DOCA_ERROR_NOT_FOUND)) {
       result = eswitch_manager_hw_routes_sync(manager, manager->router);
       if (result != DOCA_SUCCESS)
         fprintf(stderr, "Hardware route sync after private ARP failed: %s\n",
                 doca_error_get_descr(result));
+    } else if (neighbor_changed) {
+      fprintf(stderr,
+              "Hardware route promotion deferred: vs=%u port=%u "
+              "arp-return-error=%s\n",
+              domain_id, port_id, doca_error_get_descr(arp_reply_result));
     }
   } else if (header->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
     route_ipv4_packet(manager, packet, domain_id, port_id, now_ns);

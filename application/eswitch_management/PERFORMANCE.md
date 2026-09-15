@@ -42,9 +42,14 @@ cannot be admitted, so this optional optimization no longer prevents startup.
 The VR exact-match dimension uses `meta.u32[1]`, the metadata field supported
 for combined EM+LPM matching by BF3/DOCA Flow; `pkt_meta` remains dedicated to
 the existing vSwitch and ingress-port identity.
-Hardware-routing mode reserves at least 256 KiB of per-port actions memory so
-LPM templates do not starve dynamic SF-return, egress and eligibility entries
-that are created after traffic resolves a NAT session or neighbor.
+Hardware-routing mode reserves at least 512 KiB of per-port actions memory.
+The budget includes both the requested LPM capacity and two action-bearing
+entries per possible SF-return context, so LPM templates do not starve the
+dynamic return rewrite and eligibility entries created after traffic resolves
+a NAT session or neighbor. A private neighbor is promoted only after a required
+gateway ARP reply has successfully entered the SF return path; a failed bind is
+left on the Arm slow path and retried by the next request instead of consuming
+another LPM action first.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The

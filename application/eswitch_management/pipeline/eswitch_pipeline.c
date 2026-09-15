@@ -810,6 +810,11 @@ static doca_error_t bind_sf_return_context(
       result = process_rules(pipeline, &free_context->local_ip_rule, 1);
     if (result != DOCA_SUCCESS) {
       doca_error_t original_error = result;
+      fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=local-ip vs=%u "
+                      "mode=%s target=%u error=%s\n",
+              vswitch_id, directed ? "directed" : "flood",
+              directed ? target_port_id : UINT16_MAX,
+              doca_error_get_descr(result));
       doca_error_t cleanup = remove_rule(pipeline, &free_context->local_ip_rule,
                                          "rollback local RIF IPv4");
       if (cleanup == DOCA_SUCCESS)
@@ -825,6 +830,9 @@ static doca_error_t bind_sf_return_context(
       result = add_route_eligible_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
         doca_error_t original_error = result;
+        fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=route-eligible "
+                        "vs=%u error=%s\n",
+                vswitch_id, doca_error_get_descr(result));
         doca_error_t cleanup = remove_rule(
             pipeline, &free_context->local_ip_rule,
             "rollback local RIF IPv4");
@@ -836,6 +844,9 @@ static doca_error_t bind_sf_return_context(
       result = add_route_selector_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
         doca_error_t original_error = result;
+        fprintf(stderr, "SF RETURN RESOURCE ERROR: stage=route-selector "
+                        "vs=%u error=%s\n",
+                vswitch_id, doca_error_get_descr(result));
         doca_error_t cleanup = remove_rule(
             pipeline, &free_context->route_eligible_rule,
             "rollback hardware route eligibility");
