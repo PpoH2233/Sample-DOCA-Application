@@ -59,6 +59,7 @@ static bool learn_on_interface(struct router_neighbor_table *table,
                                const uint8_t *frame, size_t length,
                                uint64_t now_ns) {
   struct router_neighbor *neighbor;
+  bool changed;
   uint32_t sender_ip;
   uint32_t mask;
   uint8_t nonzero = 0;
@@ -86,11 +87,18 @@ static bool learn_on_interface(struct router_neighbor_table *table,
                                sender_ip);
   if (neighbor == NULL)
     return false;
+  changed = !neighbor->resolved || neighbor->port_id != ingress_port_id ||
+            memcmp(neighbor->mac, frame + 22, 6) != 0;
   neighbor->resolved = true;
   neighbor->port_id = ingress_port_id;
   memcpy(neighbor->mac, frame + 22, 6);
-  neighbor->last_seen_ns = now_ns;
-  return true;
+  /* A broadcast-heavy segment can repeat the same gateway ARP thousands of
+   * times per second. Refresh reachability at bounded frequency instead of
+   * dirtying the neighbor cache line for every duplicate. */
+  if (changed || neighbor->last_seen_ns == 0 ||
+      now_ns - neighbor->last_seen_ns >= ROUTER_NEIGHBOR_REFRESH_NS)
+    neighbor->last_seen_ns = now_ns;
+  return changed;
 }
 
 bool router_neighbor_learn_arp(struct router_neighbor_table *table,

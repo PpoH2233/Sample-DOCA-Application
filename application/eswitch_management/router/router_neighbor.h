@@ -10,6 +10,7 @@
 #define ROUTER_MAX_NEIGHBORS 512U
 #define ROUTER_NEIGHBOR_REACHABLE_NS UINT64_C(300000000000)
 #define ROUTER_NEIGHBOR_PROBE_NS UINT64_C(1000000000)
+#define ROUTER_NEIGHBOR_REFRESH_NS UINT64_C(1000000000)
 
 struct router_neighbor {
   bool used;
@@ -28,7 +29,9 @@ struct router_neighbor_table {
   size_t count;
 };
 
-/* Learn an on-link sender from a validated Ethernet/IPv4 ARP packet. */
+/* Learn an on-link sender from a validated Ethernet/IPv4 ARP packet. Refresh
+ * last_seen for an unchanged adjacency, but return true only when the
+ * IP/MAC/port mapping is new or materially changed. */
 bool router_neighbor_learn_arp(struct router_neighbor_table *table,
                                const struct router_config *config,
                                uint16_t ingress_vswitch_id,

@@ -55,6 +55,12 @@ control entry cannot be allocated, the selector remains installed and its
 fallback sends router traffic to RSS/Arm; SF return, gateway ARP, local ICMP and
 software routing remain available while later synchronization retries the
 eligibility entry.
+Repeated ARP frames that only refresh an unchanged IP/MAC/port adjacency do
+not trigger hardware reconciliation. After a genuine HWS programming failure,
+active-config retries use exponential backoff from one to sixty seconds;
+candidate configuration validation remains immediate. This prevents a noisy
+uplink broadcast domain from turning one resource shortage into a control-plane
+retry and logging storm.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The

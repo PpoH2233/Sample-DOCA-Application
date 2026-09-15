@@ -434,16 +434,25 @@ doca_error_t eswitch_manager_hw_routes_sync(
   struct router_hw_route *routes;
   size_t route_count;
   doca_error_t result;
+  uint64_t now_ns;
 
   if (manager == NULL || config == NULL || manager->pipeline == NULL)
     return DOCA_ERROR_INVALID_VALUE;
   if (!manager->pipeline->hardware_routing_enabled)
     return DOCA_SUCCESS;
+  now_ns = monotonic_ns();
+  /* Runtime packet/maintenance syncs use the active config and may be
+   * throttled after an HWS resource failure. Candidate configurations from
+   * the control plane still bypass this gate and validate immediately. */
+  if (config == manager->router &&
+      manager->pipeline->hardware_routing_degraded &&
+      now_ns != 0 && now_ns < manager->next_hw_route_retry_ns)
+    return DOCA_SUCCESS;
   routes = calloc(manager->pipeline->hw_route_capacity, sizeof(*routes));
   if (routes == NULL)
     return DOCA_ERROR_NO_MEMORY;
-  route_count = router_hw_routes_build(config, &manager->neighbors,
-                                       monotonic_ns(), routes,
+  route_count = router_hw_routes_build(config, &manager->neighbors, now_ns,
+                                       routes,
                                        manager->pipeline->hw_route_capacity);
   /* A neighbor is useful only while its VF remains owned by the expected VS.
    * This closes the stale-adjacency window across port moves. */
@@ -459,6 +468,19 @@ doca_error_t eswitch_manager_hw_routes_sync(
   result = eswitch_pipeline_hw_routes_sync(manager->pipeline, routes,
                                             route_count);
   free(routes);
+  if (result == DOCA_SUCCESS) {
+    manager->next_hw_route_retry_ns = 0;
+    manager->hw_route_retry_backoff_ns = 0;
+  } else if (config == manager->router && now_ns != 0) {
+    if (manager->hw_route_retry_backoff_ns == 0)
+      manager->hw_route_retry_backoff_ns = ESWITCH_HW_RETRY_INITIAL_NS;
+    else if (manager->hw_route_retry_backoff_ns < ESWITCH_HW_RETRY_MAX_NS / 2)
+      manager->hw_route_retry_backoff_ns *= 2;
+    else
+      manager->hw_route_retry_backoff_ns = ESWITCH_HW_RETRY_MAX_NS;
+    manager->next_hw_route_retry_ns = now_ns +
+                                      manager->hw_route_retry_backoff_ns;
+  }
   return result;
 }
 
@@ -1333,9 +1355,13 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
   uint64_t hw_lpm_misses = 0;
+  uint64_t now_ns = monotonic_ns();
+  uint64_t hw_retry_in_ms = manager->next_hw_route_retry_ns > now_ns
+      ? (manager->next_hw_route_retry_ns - now_ns) / UINT64_C(1000000)
+      : 0;
   doca_error_t sf_counter_result;
   doca_error_t hw_counter_result;
-  uint64_t uptime = (monotonic_ns() - manager->started_ns) / 1000000000ULL;
+  uint64_t uptime = (now_ns - manager->started_ns) / 1000000000ULL;
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
     switch_count += manager->switches[i].exists ? 1U : 0U;
@@ -1407,6 +1433,10 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline->hw_route_failures, hw_lpm_misses,
       !manager->pipeline->hardware_routing_enabled ? "off" :
           (hw_counter_result == DOCA_SUCCESS ? "ready" : "error"));
+  used = append_text(response, size, used,
+      "hw_retry_backoff_ms=%" PRIu64 " hw_retry_in_ms=%" PRIu64 "\n",
+      manager->hw_route_retry_backoff_ns / UINT64_C(1000000),
+      hw_retry_in_ms);
   used = append_text(response, size, used,
       "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
       "hw_ct_state=NOT_INITIALIZED\n",

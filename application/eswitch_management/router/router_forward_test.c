@@ -115,6 +115,11 @@ int main(void) {
   const struct router_neighbor *neighbor=router_neighbor_lookup(
       &neighbors,101,2,0xc0a80132,UINT64_C(3000000000));
   assert(neighbor && neighbor->port_id==7 && !memcmp(neighbor->mac,vm_b,6));
+  assert(!router_neighbor_learn_arp(&neighbors,&config,200,7,arp,42,
+                                    UINT64_C(4000000000)));
+  neighbor=router_neighbor_lookup(&neighbors,101,2,0xc0a80132,
+                                  UINT64_C(303000000000));
+  assert(neighbor && neighbor->port_id==7 && !memcmp(neighbor->mac,vm_b,6));
   assert(router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,
                                       UINT64_C(3000000000)));
   assert(!router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,
@@ -129,6 +134,8 @@ int main(void) {
     ip(arp+38,config.interfaces[2].address);
     assert(router_neighbor_learn_arp_interface(
         &neighbors,&config,3,9,arp,42,UINT64_C(5000000000)));
+    assert(!router_neighbor_learn_arp_interface(
+        &neighbors,&config,3,9,arp,42,UINT64_C(6000000000)));
     neighbor=router_neighbor_lookup(&neighbors,101,3,0xc8140001,
                                     UINT64_C(6000000000));
     assert(neighbor && neighbor->port_id==9 &&
