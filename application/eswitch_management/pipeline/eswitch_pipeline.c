@@ -631,6 +631,14 @@ static doca_error_t create_ingress_classifier(
                                       sizeof(*pipeline->classifier_rules));
   if (pipeline->classifier_rules == NULL)
     return DOCA_ERROR_NO_MEMORY;
+  pipeline->uplink_arp_meter_rules = calloc(
+      pipeline->ports->count, sizeof(*pipeline->uplink_arp_meter_rules));
+  if (pipeline->uplink_arp_meter_rules == NULL)
+    return DOCA_ERROR_NO_MEMORY;
+  pipeline->uplink_catchall_rules = calloc(
+      pipeline->ports->count, sizeof(*pipeline->uplink_catchall_rules));
+  if (pipeline->uplink_catchall_rules == NULL)
+    return DOCA_ERROR_NO_MEMORY;
   pipeline->egress_gates = calloc(pipeline->ports->count,
                                   sizeof(*pipeline->egress_gates));
   if (pipeline->egress_gates == NULL)
@@ -663,6 +671,92 @@ static doca_error_t create_ingress_classifier(
   }
   return pipeline->sf_root_rule.entry == NULL ? DOCA_ERROR_NOT_FOUND
                                                : DOCA_SUCCESS;
+}
+
+/* DOCA Flow 3.4 exposes Ethernet and meter-color fields but not ARP opcode or
+ * target protocol address. Preserve every unicast ARP reply and rate-limit
+ * only broadcast ARP before it reaches the Arm slow path. The software ARP
+ * parser remains the exact TPA/opcode authority for the admitted packets. */
+static doca_error_t create_uplink_arp_classifier(
+    struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_fwd rss = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->rss_pipe};
+  struct doca_flow_fwd drop = {.type = DOCA_FLOW_FWD_DROP};
+  const enum doca_flow_meter_color colors[2] = {
+      DOCA_FLOW_METER_COLOR_GREEN, DOCA_FLOW_METER_COLOR_YELLOW};
+  doca_error_t result;
+
+  match.parser_meta.meter_color =
+      (enum doca_flow_meter_color)UINT32_MAX;
+  mask.parser_meta.meter_color =
+      (enum doca_flow_meter_color)UINT32_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_UPLINK_ARP_COLOR",
+                             DOCA_FLOW_PIPE_BASIC, false, 2);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &rss, &drop,
+                                   &pipeline->uplink_arp_color_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  for (uint32_t i = 0; i < 2; i++) {
+    struct eswitch_rule *rule = &pipeline->uplink_arp_color_rules[i];
+
+    memset(&match, 0, sizeof(match));
+    match.parser_meta.meter_color = colors[i];
+    flow_entry_cookie_prepare(&rule->cookie,
+                              i == 0 ? "uplink ARP meter green"
+                                     : "uplink ARP meter yellow",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_basic_add_entry(
+        pipeline->runtime->queue_id, pipeline->uplink_arp_color_pipe,
+        &match, 0, NULL, NULL, NULL, batch_flags(i, 2),
+        &rule->cookie, &rule->entry);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  result = process_rules(pipeline, pipeline->uplink_arp_color_rules, 2);
+  if (result != DOCA_SUCCESS)
+    return result;
+
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_UPLINK_DISPATCH",
+                             DOCA_FLOW_PIPE_CONTROL, false,
+                             pipeline->ports->count * 2U);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL,
+                                   &pipeline->uplink_dispatch_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
+}
+
+doca_error_t eswitch_pipeline_uplink_arp_drop_query(
+    const struct eswitch_pipeline *pipeline, uint64_t *packets) {
+  struct doca_flow_resource_query query = {0};
+  doca_error_t result;
+
+  if (pipeline == NULL || packets == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (!pipeline->uplink_arp_filter_enabled ||
+      pipeline->uplink_arp_color_pipe == NULL)
+    return DOCA_ERROR_NOT_FOUND;
+  result = doca_flow_resource_query_pipe_miss(
+      pipeline->uplink_arp_color_pipe, &query);
+  if (result == DOCA_SUCCESS)
+    *packets = query.total_pkts;
+  return result;
 }
 
 /* Packets created by Arm enter through the actual SF MAC with an internal VLAN
@@ -1070,6 +1164,8 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      bool hardware_routing_enabled,
                                      uint32_t hardware_route_capacity,
+                                     uint32_t uplink_arp_pps,
+                                     uint32_t uplink_arp_burst,
                                      struct eswitch_pipeline *pipeline) {
   doca_error_t result;
 
@@ -1088,6 +1184,9 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   pipeline->hardware_routing_enabled = hardware_routing_enabled;
   pipeline->hw_route_requested_capacity = hardware_route_capacity;
   pipeline->hw_route_capacity = hardware_route_capacity;
+  pipeline->uplink_arp_pps = uplink_arp_pps;
+  pipeline->uplink_arp_burst = uplink_arp_burst;
+  pipeline->uplink_arp_filter_requested = uplink_arp_pps != 0;
 
 #define CREATE_STAGE(label, call)                                             \
   do {                                                                        \
@@ -1138,6 +1237,26 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
+  if (pipeline->uplink_arp_filter_requested) {
+    printf("Creating eSwitch stage: uplink ARP classifier\n");
+    result = create_uplink_arp_classifier(pipeline);
+    if (result == DOCA_SUCCESS) {
+      pipeline->uplink_arp_filter_enabled = true;
+    } else {
+      fprintf(stderr, "Uplink ARP classifier unavailable (%s); continuing "
+                      "with exact Arm ARP filtering\n",
+              doca_error_get_descr(result));
+      if (pipeline->uplink_dispatch_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->uplink_dispatch_pipe);
+      if (pipeline->uplink_arp_color_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->uplink_arp_color_pipe);
+      pipeline->uplink_dispatch_pipe = NULL;
+      pipeline->uplink_arp_color_pipe = NULL;
+      memset(pipeline->uplink_arp_color_rules, 0,
+             sizeof(pipeline->uplink_arp_color_rules));
+      pipeline->uplink_arp_filter_degraded = true;
+    }
+  }
   CREATE_STAGE("ingress classifier", create_ingress_classifier(pipeline));
 #undef CREATE_STAGE
 
@@ -1153,6 +1272,10 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     return;
   if (pipeline->ingress_classifier_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ingress_classifier_pipe);
+  if (pipeline->uplink_dispatch_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->uplink_dispatch_pipe);
+  if (pipeline->uplink_arp_color_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->uplink_arp_color_pipe);
   if (pipeline->sf_return_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->sf_return_pipe);
   if (pipeline->arp_dispatch_pipe != NULL)
@@ -1184,6 +1307,8 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     }
   }
   free(pipeline->classifier_rules);
+  free(pipeline->uplink_arp_meter_rules);
+  free(pipeline->uplink_catchall_rules);
   free(pipeline->egress_gates);
   *pipeline = (struct eswitch_pipeline){0};
 }
@@ -1230,6 +1355,82 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
   return DOCA_SUCCESS;
 }
 
+static doca_error_t attach_uplink_arp_meter(
+    struct eswitch_pipeline *pipeline, uint16_t port_index,
+    uint32_t metadata) {
+  struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_monitor monitor = {0};
+  struct doca_flow_fwd meter_fwd = {
+      .type = DOCA_FLOW_FWD_PIPE,
+      .next_pipe = pipeline->uplink_arp_color_pipe};
+  struct doca_flow_fwd rss_fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                                  .next_pipe = pipeline->rss_pipe};
+  struct eswitch_rule *meter = &pipeline->uplink_arp_meter_rules[port_index];
+  struct eswitch_rule *catchall = &pipeline->uplink_catchall_rules[port_index];
+  doca_error_t result;
+
+  match.meta.pkt_meta = DOCA_HTOBE32(metadata);
+  mask.meta.pkt_meta = UINT32_MAX;
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_ARP);
+  mask.outer.eth.type = UINT16_MAX;
+  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
+  monitor.limit_type = DOCA_FLOW_METER_LIMIT_TYPE_PACKETS;
+  monitor.cir = pipeline->uplink_arp_pps;
+  monitor.cbs = pipeline->uplink_arp_burst;
+  flow_entry_cookie_prepare(&meter->cookie, "meter uplink broadcast ARP",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->uplink_dispatch_pipe,
+      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 0, &meter_fwd,
+      &meter->cookie, &meter->entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = process_rules(pipeline, meter, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = remove_rule(pipeline, meter,
+                                       "rollback failed uplink ARP meter");
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
+
+  memset(&match, 0, sizeof(match));
+  memset(&mask, 0, sizeof(mask));
+  match.meta.pkt_meta = DOCA_HTOBE32(metadata);
+  mask.meta.pkt_meta = UINT32_MAX;
+  flow_entry_cookie_prepare(&catchall->cookie, "uplink non-noise catch-all",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->uplink_dispatch_pipe,
+      &match, &mask, NULL, NULL, NULL, NULL, NULL, 7, &rss_fwd,
+      &catchall->cookie, &catchall->entry);
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, catchall, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t cleanup = remove_rule(pipeline, catchall,
+                                       "rollback uplink catch-all");
+    if (cleanup == DOCA_SUCCESS)
+      cleanup = remove_rule(pipeline, meter,
+                            "rollback uplink ARP meter");
+    return cleanup == DOCA_SUCCESS ? result : cleanup;
+  }
+  return DOCA_SUCCESS;
+}
+
+static doca_error_t detach_uplink_arp_meter(
+    struct eswitch_pipeline *pipeline, uint16_t port_index) {
+  doca_error_t result;
+
+  result = remove_rule(pipeline, &pipeline->uplink_catchall_rules[port_index],
+                       "detach uplink catch-all");
+  if (result != DOCA_SUCCESS)
+    return result;
+  return remove_rule(pipeline, &pipeline->uplink_arp_meter_rules[port_index],
+                     "detach uplink ARP meter");
+}
+
 doca_error_t eswitch_pipeline_attach_router_port(
     struct eswitch_pipeline *pipeline, uint16_t port_index, uint16_t vr_id) {
   struct doca_flow_match match = {0};
@@ -1237,6 +1438,7 @@ doca_error_t eswitch_pipeline_attach_router_port(
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
   struct eswitch_rule *rule;
   uint16_t port_id;
+  bool metered = false;
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created ||
@@ -1251,23 +1453,42 @@ doca_error_t eswitch_pipeline_attach_router_port(
   port_id = pipeline->ports->items[port_index].ethernet->port_id;
   match.parser_meta.port_id = port_id;
   actions.meta.pkt_meta = DOCA_HTOBE32(eswitch_metadata_encode(vr_id, port_id));
-  fwd.next_pipe = pipeline->rss_pipe;
+  if (pipeline->uplink_arp_filter_enabled) {
+    result = attach_uplink_arp_meter(
+        pipeline, port_index, eswitch_metadata_encode(vr_id, port_id));
+    if (result == DOCA_SUCCESS) {
+      metered = true;
+    } else {
+      pipeline->uplink_arp_filter_degraded = true;
+      fprintf(stderr, "UPLINK ARP CLASSIFIER DEGRADED: vr=%u port=%u "
+                      "fallback=arm error=%s\n",
+              vr_id, port_id, doca_error_get_descr(result));
+    }
+  }
+  fwd.next_pipe = metered ? pipeline->uplink_dispatch_pipe
+                          : pipeline->rss_pipe;
   flow_entry_cookie_prepare(&rule->cookie, "attach router uplink",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_basic_add_entry(
       pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe, &match,
       0, &actions, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, &rule->cookie,
       &rule->entry);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    if (metered)
+      (void)detach_uplink_arp_meter(pipeline, port_index);
     return result;
+  }
   result = process_rules(pipeline, rule, 1);
   if (result != DOCA_SUCCESS) {
     doca_error_t original_error = result;
     doca_error_t cleanup = remove_rule(pipeline, rule,
                                        "rollback router uplink attach");
+    if (cleanup == DOCA_SUCCESS && metered)
+      cleanup = detach_uplink_arp_meter(pipeline, port_index);
     return cleanup == DOCA_SUCCESS ? original_error : cleanup;
   }
-  printf("ROUTER UPLINK ATTACH: vr=%u port=%u path=RSS\n", vr_id, port_id);
+  printf("ROUTER UPLINK ATTACH: vr=%u port=%u path=%s\n", vr_id, port_id,
+         metered ? "ARP-METER->RSS" : "RSS");
   return DOCA_SUCCESS;
 }
 
@@ -1276,8 +1497,14 @@ doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
   if (pipeline == NULL || !pipeline->created ||
       port_index >= pipeline->ports->count)
     return DOCA_ERROR_INVALID_VALUE;
-  return remove_rule(pipeline, &pipeline->classifier_rules[port_index],
-                     "detach ingress port");
+  {
+    doca_error_t result = remove_rule(
+        pipeline, &pipeline->classifier_rules[port_index],
+        "detach ingress port");
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  return detach_uplink_arp_meter(pipeline, port_index);
 }
 
 static bool hw_route_same_key(const struct router_hw_route *left,

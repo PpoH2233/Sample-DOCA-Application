@@ -21,6 +21,12 @@ ESWITCH_HW_ROUTING="0"
 # the device cannot allocate the requested LPM size.
 ESWITCH_HW_ROUTE_CAPACITY="1024"
 
+# Rate-limit broadcast ARP from router uplinks in DOCA Flow before RSS/Arm.
+# Unicast ARP replies and non-broadcast traffic bypass this meter. Set PPS to
+# 0 to disable the classifier and use exact Arm filtering only.
+ESWITCH_UPLINK_ARP_PPS="256"
+ESWITCH_UPLINK_ARP_BURST="64"
+
 # Successful slow-path packet traces are expensive at scale. Errors and
 # counters remain active when this is disabled.
 ESWITCH_PACKET_DEBUG="0"

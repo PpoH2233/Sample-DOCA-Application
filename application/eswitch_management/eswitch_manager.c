@@ -1283,8 +1283,12 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   {
     doca_error_t result = eswitch_manager_hw_routes_sync(manager,
                                                           manager->router);
-    if (result != DOCA_SUCCESS)
-      return result;
+    /* Hardware route promotion is optional and already has exponential
+     * backoff. Never let its resource pressure suppress FDB aging or make the
+     * main loop mislabel the failure as FDB maintenance. */
+    if (result != DOCA_SUCCESS && manager->packet_debug)
+      fprintf(stderr, "Optional hardware route maintenance deferred: %s\n",
+              doca_error_get_descr(result));
   }
   return eswitch_fdb_age(&manager->fdb, now_ns);
 }
@@ -1355,12 +1359,14 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
   uint64_t hw_lpm_misses = 0;
+  uint64_t uplink_arp_hw_drops = 0;
   uint64_t now_ns = monotonic_ns();
   uint64_t hw_retry_in_ms = manager->next_hw_route_retry_ns > now_ns
       ? (manager->next_hw_route_retry_ns - now_ns) / UINT64_C(1000000)
       : 0;
   doca_error_t sf_counter_result;
   doca_error_t hw_counter_result;
+  doca_error_t uplink_arp_counter_result;
   uint64_t uptime = (now_ns - manager->started_ns) / 1000000000ULL;
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
@@ -1385,6 +1391,8 @@ static size_t format_status(const struct eswitch_manager *manager,
       &local_ip_hits);
   hw_counter_result = eswitch_pipeline_hw_route_stats(manager->pipeline,
                                                        &hw_lpm_misses);
+  uplink_arp_counter_result = eswitch_pipeline_uplink_arp_drop_query(
+      manager->pipeline, &uplink_arp_hw_drops);
   used = append_text(response, size, used, "OK\n");
   used = append_text(response, size, used,
                      "service=eSwitch Management state=running uptime=%" PRIu64
@@ -1437,6 +1445,18 @@ static size_t format_status(const struct eswitch_manager *manager,
       "hw_retry_backoff_ms=%" PRIu64 " hw_retry_in_ms=%" PRIu64 "\n",
       manager->hw_route_retry_backoff_ns / UINT64_C(1000000),
       hw_retry_in_ms);
+  used = append_text(response, size, used,
+      "uplink_arp_classifier=%s scope=broadcast-arp rate_pps=%u burst=%u "
+      "hw_drops=%" PRIu64 " counter_state=%s exact_target_validation=arm\n",
+      !manager->pipeline->uplink_arp_filter_requested ? "off" :
+          (manager->pipeline->uplink_arp_filter_enabled &&
+                   !manager->pipeline->uplink_arp_filter_degraded
+               ? "ready"
+               : "fallback-arm"),
+      manager->pipeline->uplink_arp_pps,
+      manager->pipeline->uplink_arp_burst, uplink_arp_hw_drops,
+      !manager->pipeline->uplink_arp_filter_enabled ? "off" :
+          (uplink_arp_counter_result == DOCA_SUCCESS ? "ready" : "error"));
   used = append_text(response, size, used,
       "nat_dataplane=ARM_NAPT_TCP_UDP_ICMP_ECHO hw_ct_capability=%s "
       "hw_ct_state=NOT_INITIALIZED\n",

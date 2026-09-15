@@ -26,6 +26,7 @@ doca_error_t switch_flow_ports_start(struct ethernet_ports *ethernet_ports,
                                      struct switch_flow_ports *ports);
 doca_error_t switch_flow_ports_start_with_actions_mem(
     struct ethernet_ports *ethernet_ports, uint32_t actions_mem_size,
+    uint32_t meter_count,
     struct switch_flow_ports *ports);
 
 /* Flush and stop endpoint ports in reverse order, proxy/parent last. */

@@ -75,6 +75,9 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *source_guard_pipe;
   struct doca_flow_pipe *arp_dispatch_pipe;
   struct eswitch_rule arp_dispatch_rule;
+  struct doca_flow_pipe *uplink_arp_color_pipe;
+  struct doca_flow_pipe *uplink_dispatch_pipe;
+  struct eswitch_rule uplink_arp_color_rules[2];
   struct doca_flow_pipe *ingress_classifier_pipe;
   struct doca_flow_pipe *sf_return_pipe;
   struct doca_flow_pipe *local_ip_pipe;
@@ -102,7 +105,14 @@ struct eswitch_pipeline {
   struct eswitch_rule learning_clone_rules[2];
   struct eswitch_rule learning_dispatch_rule;
   struct eswitch_rule *classifier_rules; /* indexed like ports->items */
+  struct eswitch_rule *uplink_arp_meter_rules; /* indexed like ports->items */
+  struct eswitch_rule *uplink_catchall_rules; /* indexed like ports->items */
   struct eswitch_egress_gate *egress_gates; /* indexed like ports->items */
+  uint32_t uplink_arp_pps;
+  uint32_t uplink_arp_burst;
+  bool uplink_arp_filter_requested;
+  bool uplink_arp_filter_enabled;
+  bool uplink_arp_filter_degraded;
   bool created;
 };
 
@@ -152,6 +162,8 @@ doca_error_t eswitch_pipeline_sf_context_query(
 /* Return-path diagnostics. Counters are cumulative hardware values. */
 doca_error_t eswitch_pipeline_destination_miss_query(
     const struct eswitch_pipeline *pipeline, uint64_t *packets);
+doca_error_t eswitch_pipeline_uplink_arp_drop_query(
+    const struct eswitch_pipeline *pipeline, uint64_t *packets);
 doca_error_t eswitch_pipeline_egress_query(
     const struct eswitch_pipeline *pipeline, uint16_t port_id,
     uint64_t *forward_packets, uint64_t *split_horizon_drops);
@@ -160,6 +172,8 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
                                      struct switch_flow_ports *ports,
                                      bool hardware_routing_enabled,
                                      uint32_t hardware_route_capacity,
+                                     uint32_t uplink_arp_pps,
+                                     uint32_t uplink_arp_burst,
                                      struct eswitch_pipeline *pipeline);
 void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline);
 

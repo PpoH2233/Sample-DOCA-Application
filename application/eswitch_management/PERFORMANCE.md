@@ -61,6 +61,29 @@ active-config retries use exponential backoff from one to sixty seconds;
 candidate configuration validation remains immediate. This prevents a noisy
 uplink broadcast domain from turning one resource shortage into a control-plane
 retry and logging storm.
+Optional hardware-route reconciliation no longer aborts FDB aging or appears
+as an `FDB maintenance` error. FDB maintenance reports only its own result;
+route promotion keeps its independent backoff and degraded-state counters.
+
+## Implemented: uplink broadcast-ARP hardware meter
+
+Router-uplink root entries now enter a DOCA Flow control stage. Broadcast ARP
+is handled by a non-shared packet-rate meter and a meter-color gate: green and
+yellow packets continue to RSS, while red packets are dropped in hardware.
+The default is 256 packets/s with a burst of 64 and is configurable through
+`ESWITCH_UPLINK_ARP_PPS` and `ESWITCH_UPLINK_ARP_BURST`; rate `0` disables it.
+All non-broadcast traffic, including unicast ARP replies required for neighbor
+resolution, bypasses the meter.
+
+DOCA Flow 3.4 has no ARP opcode or target-protocol-address member in
+`doca_flow_header_format`. Therefore this stage cannot safely express an exact
+`ARP TPA == uplink RIF address` rule. A bounded number of broadcast frames is
+still sent to Arm, where the existing parser performs the exact check. This is
+a deliberate hybrid classifier, not a claim that TPA matching is offloaded.
+Pipe or entry resource failure fails open to direct RSS and is visible as
+`uplink_arp_classifier=fallback-arm`, preserving routing/NAT availability.
+The color-pipe miss counter is exported as `hw_drops`; it counts red packets
+dropped by this classifier and provides a direct hardware verification point.
 
 Local router IPs, TTL <= 1, options, fragments, invalid IPv4/checksum state,
 LPM misses, unresolved neighbors, public port-links and NAT stay on Arm. The

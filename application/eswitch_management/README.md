@@ -37,6 +37,17 @@ uplinks and every NAT flow continue to the existing Arm slow path. The default
 is `0` until the target BF3 passes the smoke test below.
 Successful per-packet traces are disabled by default; set
 `ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
+Broadcast ARP arriving on a router uplink is rate-limited in DOCA Flow before
+RSS with `ESWITCH_UPLINK_ARP_PPS` (default 256 packets/s) and
+`ESWITCH_UPLINK_ARP_BURST` (default 64 packets). Set the rate to `0` to disable
+the hardware classifier. DOCA Flow 3.4 does not expose ARP TPA/opcode as match
+fields, so the hardware meter deliberately preserves a bounded broadcast
+sample and the Arm parser remains responsible for exact target/opcode checks.
+Unicast ARP replies, IPv4 and other uplink traffic bypass the meter. If the
+meter cannot be admitted, the uplink fails open to the existing Arm path and
+status reports `uplink_arp_classifier=fallback-arm`. A ready classifier also
+reports `hw_drops` from the color-pipe miss counter; this value must increase
+when the offered broadcast-ARP rate exceeds the configured meter.
 `ESWITCH_HW_ROUTE_CAPACITY` selects a power-of-two capacity from 64 to 1024
 (default 1024). The requested capacity is included when actions memory is
 reserved before Flow ports start, in addition to the existing L2/SF action
@@ -48,6 +59,8 @@ available on the Arm dataplane with `hw_state=fallback-arm`.
 endpoint
    -> root classifier: physical ingress port
       -> write pkt_meta = (vswitch_id << 16) | ingress_port_id
+      -> router uplink: broadcast ARP hardware meter -> color gate -> Arm RSS
+         -> non-broadcast traffic -------------------------------> Arm RSS
       -> source guard
          hit  -> destination FDB -> known-unicast egress
          miss -> clone one copy to Arm RSS and continue to destination FDB
@@ -205,6 +218,8 @@ sudo docker run ... \
   --env ESWITCH_VF_SCOPE='10-20' \
   --env ESWITCH_SF_IFACE='enp3s0f0s0' \
   --env ESWITCH_HW_ROUTING='1' \
+  --env ESWITCH_UPLINK_ARP_PPS='256' \
+  --env ESWITCH_UPLINK_ARP_BURST='64' \
   eswitch-management:3.4.0 -l 0 -- 03:00.0
 ```
 

@@ -85,8 +85,28 @@ static bool parse_hw_route_capacity(uint32_t *capacity) {
   return true;
 }
 
+static bool parse_u32_env(const char *name, uint32_t default_value,
+                          uint32_t maximum, uint32_t *value) {
+  const char *text = getenv(name);
+  char *end = NULL;
+  unsigned long parsed;
+
+  if (value == NULL)
+    return false;
+  if (text == NULL || *text == '\0') {
+    *value = default_value;
+    return true;
+  }
+  parsed = strtoul(text, &end, 10);
+  if (*text == '-' || end == text || *end != '\0' || parsed > maximum)
+    return false;
+  *value = (uint32_t)parsed;
+  return true;
+}
+
 static uint32_t actions_mem_size(bool hardware_routing_enabled,
-                                 uint32_t route_capacity) {
+                                 uint32_t route_capacity,
+                                 bool uplink_arp_meter_enabled) {
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
   uint32_t rounded = 1;
 
@@ -101,6 +121,12 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
     required += action_entries * DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
                 4096U;
   }
+  /* Meter actions and their color dispatch entries share the switch-port
+   * action pool even when private LPM promotion is disabled. */
+  if (uplink_arp_meter_enabled)
+    required += ESWITCH_MAX_VSWITCHES *
+                    DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
+                4096U;
   while (rounded < required)
     rounded <<= 1;
   if (hardware_routing_enabled &&
@@ -128,6 +154,8 @@ int main(int argc, char **argv) {
   bool hardware_routing_enabled = env_enabled("ESWITCH_HW_ROUTING");
   bool packet_debug = env_enabled("ESWITCH_PACKET_DEBUG");
   uint32_t hardware_route_capacity;
+  uint32_t uplink_arp_pps;
+  uint32_t uplink_arp_burst;
   uint32_t flow_actions_mem_size;
   int separator;
   int exit_status = EXIT_FAILURE;
@@ -152,8 +180,22 @@ int main(int argc, char **argv) {
             ESWITCH_HW_ROUTE_MIN_CAPACITY, ROUTER_HW_MAX_ROUTES);
     return EXIT_FAILURE;
   }
+  if (!parse_u32_env("ESWITCH_UPLINK_ARP_PPS",
+                     ESWITCH_UPLINK_ARP_DEFAULT_PPS,
+                     ESWITCH_UPLINK_ARP_MAX_PPS, &uplink_arp_pps) ||
+      !parse_u32_env("ESWITCH_UPLINK_ARP_BURST",
+                     ESWITCH_UPLINK_ARP_DEFAULT_BURST,
+                     ESWITCH_UPLINK_ARP_MAX_PPS, &uplink_arp_burst) ||
+      (uplink_arp_pps != 0 && uplink_arp_burst == 0)) {
+    fprintf(stderr, "ESWITCH_UPLINK_ARP_PPS and "
+                    "ESWITCH_UPLINK_ARP_BURST must be 0..%u; burst must "
+                    "be non-zero when rate limiting is enabled\n",
+            ESWITCH_UPLINK_ARP_MAX_PPS);
+    return EXIT_FAILURE;
+  }
   flow_actions_mem_size = actions_mem_size(hardware_routing_enabled,
-                                            hardware_route_capacity);
+                                            hardware_route_capacity,
+                                            uplink_arp_pps != 0);
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -202,7 +244,8 @@ int main(int argc, char **argv) {
     goto cleanup_io;
   }
   result = switch_flow_ports_start_with_actions_mem(
-      &devices.ethernet_ports, flow_actions_mem_size, &flow_ports);
+      &devices.ethernet_ports, flow_actions_mem_size,
+      uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start DOCA Flow ports: %s\n",
             doca_error_get_descr(result));
@@ -223,9 +266,14 @@ int main(int argc, char **argv) {
          "actions-mem=%u scope=private-vs-ipv4\n",
          hardware_routing_enabled ? "enabled" : "disabled",
          hardware_route_capacity, flow_actions_mem_size);
+  printf("UPLINK ARP CLASSIFIER: configured=%s rate=%u-pps burst=%u "
+         "scope=broadcast-arp\n",
+         uplink_arp_pps == 0 ? "disabled" : "enabled", uplink_arp_pps,
+         uplink_arp_burst);
   result = eswitch_pipeline_create(&runtime, &flow_ports,
                                    hardware_routing_enabled,
-                                   hardware_route_capacity, &pipeline);
+                                   hardware_route_capacity, uplink_arp_pps,
+                                   uplink_arp_burst, &pipeline);
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to create eSwitch pipeline: %s\n",
             doca_error_get_descr(result));
