@@ -8,6 +8,7 @@
 #define ROUTER_MAX_VRS 64
 #define ROUTER_MAX_INTERFACES 256
 #define ROUTER_MAX_ROUTES 512
+#define ROUTER_MAX_LINKS 128
 #define ROUTER_MAX_NAT_POLICIES ROUTER_MAX_VRS
 #define ROUTER_NAME_SIZE 32
 #define ROUTER_COMMAND_SIZE 512
@@ -15,12 +16,13 @@
 /* Desired configuration is independent of SDK handles and runtime port IDs.
  * No pointer into a candidate configuration may be retained by a backend. */
 struct router_port_identity { uint32_t host, pf, vf; };
-enum router_attachment { ROUTER_VSWITCH, ROUTER_PORT };
+enum router_attachment { ROUTER_VSWITCH, ROUTER_PORT, ROUTER_LINK };
 struct router_interface {
   uint16_t vr_id, interface_id;
   char name[ROUTER_NAME_SIZE];
   enum router_attachment attachment;
   uint16_t vswitch_id;
+  uint16_t link_id;
   struct router_port_identity port;
   uint8_t mac[6];
   bool has_address;
@@ -39,7 +41,8 @@ struct router_nat_policy {
 };
 struct router_config {
   uint16_t vr_ids[ROUTER_MAX_VRS];
-  size_t vr_count, interface_count, route_count, nat_policy_count;
+  uint16_t link_ids[ROUTER_MAX_LINKS];
+  size_t vr_count, link_count, interface_count, route_count, nat_policy_count;
   uint32_t next_interface_id;
   struct router_interface interfaces[ROUTER_MAX_INTERFACES];
   struct router_route routes[ROUTER_MAX_ROUTES];
@@ -58,6 +61,10 @@ bool router_port_reserved(const struct router_config *,
                           const struct router_port_identity *);
 bool router_switch_reserved(const struct router_config *, uint16_t);
 bool router_has_vr(const struct router_config *, uint16_t);
+bool router_has_link(const struct router_config *, uint16_t);
+/* Return the other endpoint of a two-ended logical router link. */
+const struct router_interface *router_link_peer(const struct router_config *,
+                                                uint16_t interface_id);
 const struct router_nat_policy *router_nat_policy_find(
     const struct router_config *, uint16_t vr_id);
 uint32_t router_nat_policy_address(const struct router_config *,

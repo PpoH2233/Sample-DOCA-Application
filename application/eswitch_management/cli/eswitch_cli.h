@@ -33,7 +33,7 @@ enum eswitch_cli_verb {
   ESWITCH_CLI_VS_PORT_DETACH,   /* vs port detach --id <id> --port <port> */
   ESWITCH_CLI_FDB_SHOW,         /* fdb show [--id <id>] */
   ESWITCH_CLI_PORT_SHOW,        /* port show */
-  ESWITCH_CLI_ROUTER,           /* vr ... (delegated to the router parser) */
+  ESWITCH_CLI_ROUTER,           /* vr/link ... (delegated to router parser) */
 };
 
 struct eswitch_cli_command {

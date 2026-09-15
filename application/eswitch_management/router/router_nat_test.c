@@ -250,6 +250,23 @@ int main(void) {
   router_nat_flush(table,0);
   assert(table->count==0);
 
+  /* A downstream VR is represented by the NAT owner's logical-link RIF.
+   * Reverse NAT retains that RIF so the manager can run LPM through the peer
+   * VR instead of assuming a directly attached inside VF. */
+  {
+    struct router_nat_inside link_inside={.interface_id=11};
+    length=make_packet(original,6,0xc0a8c80a,41000,remote_ip,443);
+    assert(router_nat_outbound(table,&policy,public_ip,&link_inside,original,
+                               length,1,translated,sizeof(translated),&s1)==
+           ROUTER_NAT_TRANSLATED);
+    length=make_packet(original,6,remote_ip,443,public_ip,s1->public_port);
+    assert(router_nat_inbound(table,101,original,length,2,reverse,
+                              sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(reply->inside.interface_id==11 && reply->inside.vswitch_id==0 &&
+           reply->inside.port_id==0 && read32(reverse+30)==0xc0a8c80a);
+    router_nat_flush(table,101);
+  }
+
   /* Fill every slot, exercise hash collisions in both directions, flush and
    * reuse indices. Each reverse lookup must retain the exact inside owner. */
   policy.port_first=20000;

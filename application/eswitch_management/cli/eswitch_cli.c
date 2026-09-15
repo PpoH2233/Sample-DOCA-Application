@@ -94,7 +94,7 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
 
   /* The router group owns its own grammar, including the bare `vr` word so the
    * router parser reports the operation list. */
-  if (strcmp(resource, "vr") == 0) {
+  if (strcmp(resource, "vr") == 0 || strcmp(resource, "link") == 0) {
     out->verb = ESWITCH_CLI_ROUTER;
     return true;
   }
@@ -232,14 +232,18 @@ bool eswitch_cli_parse_line(const char *request,
 
 bool eswitch_cli_is_router_line(const char *request) {
   size_t i = 0;
+  size_t remaining;
 
   if (request == NULL)
     return false;
   while (request[i] == ' ' || request[i] == '\t')
     i++;
-  if (request[i] != 'v' || request[i + 1] != 'r')
-    return false;
-  switch (request[i + 2]) {
+  remaining = strlen(request + i);
+  size_t word_length;
+  if (remaining >= 2 && !strncmp(request+i,"vr",2)) word_length=2;
+  else if (remaining >= 4 && !strncmp(request+i,"link",4)) word_length=4;
+  else return false;
+  switch (request[i + word_length]) {
   case ' ':
   case '\t':
   case '\r':
@@ -336,11 +340,15 @@ void eswitch_cli_help(FILE *output, const char *program,
           "  fdb show [--id <id>]                     Show all or one "
           "learned FDB\n\n"
           "Virtual router (L3):\n"
+          "  link create|delete|show --id <link-id>   Manage a logical "
+          "router link\n"
           "  vr create|delete|show --id <id>\n"
           "  vr port attach --id <id> --port <port> --name <name>\n"
           "  vr port detach --id <id> --interface <name>\n"
           "  vr switch attach --id <id> --switch-id <vs> --name <name>\n"
           "  vr switch detach --id <id> --interface <name>\n"
+          "  vr link attach --id <id> --link-id <link-id> --name <name>\n"
+          "  vr link detach --id <id> --interface <name>\n"
           "  vr interface set --id <id> --interface <name> --mac <mac>\n"
           "  vr ip add|del --id <id> --interface <name> "
           "--address <ip/prefix>\n"

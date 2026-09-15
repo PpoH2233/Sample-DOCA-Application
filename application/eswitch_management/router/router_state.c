@@ -24,8 +24,9 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
   if(fd<0) return fail(out,size,strerror(errno));
   FILE *f=fdopen(fd,"w");
   if(!f) {close(fd); unlink(tmp); return fail(out,size,strerror(errno));}
-  fprintf(f,"router-state 1\nnext %u\n",c->next_interface_id);
+  fprintf(f,"router-state 2\nnext %u\n",c->next_interface_id);
   for(size_t i=0;i<c->vr_count;i++) fprintf(f,"vr create --id %u\n",c->vr_ids[i]);
+  for(size_t i=0;i<c->link_count;i++) fprintf(f,"link create --id %u\n",c->link_ids[i]);
   for(size_t i=0;i<c->interface_count;i++) {
     const struct router_interface *r=&c->interfaces[i]; char ip[INET_ADDRSTRLEN];
     fprintf(f,"identity %u %u %u %u\n",r->interface_id,r->port.host,r->port.pf,r->port.vf);
@@ -33,7 +34,9 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
      * both this spelling and the canonical public CLI spelling. */
     if(r->attachment==ROUTER_PORT)
       fprintf(f,"vr port-attach --id %u --name %s --port 0\n",r->vr_id,r->name);
-    else fprintf(f,"vr switch-attach --id %u --name %s --switch-id %u\n",r->vr_id,r->name,r->vswitch_id);
+    else if(r->attachment==ROUTER_VSWITCH)
+      fprintf(f,"vr switch-attach --id %u --name %s --switch-id %u\n",r->vr_id,r->name,r->vswitch_id);
+    else fprintf(f,"vr link attach --id %u --name %s --link-id %u\n",r->vr_id,r->name,r->link_id);
     fprintf(f,"vr interface set --id %u --interface %s --mac %02x:%02x:%02x:%02x:%02x:%02x\n",
       r->vr_id,r->name,r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
     if(r->has_address) fprintf(f,"vr ip add --id %u --interface %s --address %s/%u\n",
@@ -98,7 +101,8 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
   uint32_t next=0, identity=0;
   struct router_port_identity port={0};
   struct router_inventory inv={.context=&port,.port=replay_port,.switch_exists=replay_switch};
-  bool ok=fgets(line,sizeof(line),f) && !strcmp(line,"router-state 1\n");
+  bool ok=fgets(line,sizeof(line),f) &&
+          (!strcmp(line,"router-state 1\n") || !strcmp(line,"router-state 2\n"));
   if(ok) ok=fgets(line,sizeof(line),f) && uints(line,"next",&next,1) && next>0 && next<=65536;
   while(ok && fgets(line,sizeof(line),f)) {
     if(!strchr(line,'\n')) {ok=false;break;}
@@ -115,8 +119,10 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
     bool attachment=!strncmp(line,"vr port attach ",15) ||
       !strncmp(line,"vr switch attach ",17) ||
       !strncmp(line,"vr port-attach ",15) ||
-      !strncmp(line,"vr switch-attach ",17);
+      !strncmp(line,"vr switch-attach ",17) ||
+      !strncmp(line,"vr link attach ",15);
     bool permitted=attachment || !strncmp(line,"vr create ",10) ||
+      !strncmp(line,"link create ",12) ||
       !strncmp(line,"vr interface set ",17) || !strncmp(line,"vr ip add ",10) ||
       !strncmp(line,"vr route add ",13) || !strncmp(line,"vr nat enable ",14);
     if(!permitted || (attachment!=(identity!=0))) {ok=false;break;}

@@ -45,6 +45,11 @@ The complete canonical command set:
 | 23 | `vr nat enable --id <id> --interface <name> --address <interface\|ip> --port-range <first-last>` | mutation |
 | 24 | `vr nat disable --id <id>` | mutation |
 | 25 | `vr nat show --id <id>` | query |
+| 26 | `link create --id <link-id>` | mutation |
+| 27 | `link delete --id <link-id>` | mutation |
+| 28 | `link show --id <link-id>` | query |
+| 29 | `vr link attach --id <vr-id> --link-id <link-id> --name <name>` | mutation |
+| 30 | `vr link detach --id <vr-id> --interface <name>` | mutation |
 
 Grammar rules:
 
@@ -64,6 +69,7 @@ Grammar rules:
 | `<id>` for `vr` | Decimal integer, `1..65535`. `0` is rejected by the parser. |
 | `<port-id>` | Runtime DPDK port ID, `0..65535`. IDs are assigned at probe time and are **not** stable across daemon restarts. Discover them with `port show`. |
 | `<vs-id>` | An existing vSwitch ID. |
+| `<link-id>` | Logical point-to-point router-link ID, `1..65535`. A link accepts exactly two endpoints in different VRs. |
 | `<name>` | Router interface name, 1..31 characters from `[A-Za-z0-9_-]`. Unique within one VR. |
 | `<mac>` | `xx:xx:xx:xx:xx:xx`, lowercase or uppercase hex. Must be unicast (low bit of the first octet clear) and non-zero. Must be unique across all RIFs. |
 | `<ip/prefix>` | IPv4 host address with prefix length, for example `10.0.0.1/24`. Must be a usable unicast address: not `0.0.0.0/x`, not loopback, not multicast or reserved, not the network or broadcast address of its own prefix when the prefix is shorter than `/31`. |
@@ -73,9 +79,14 @@ Grammar rules:
 | `--address interface` | For `vr nat enable` only: use the uplink RIF's own address. |
 
 The `--name` option names a **new** interface, so it is used only by
-`vr port attach` and `vr switch attach`. Every command that refers to an
+`vr port attach`, `vr switch attach` and `vr link attach`. Every command that refers to an
 **existing** interface uses `--interface`. Supplying the wrong one is a syntax
 error.
+
+Router-link endpoints use the Arm dataplane in phase 1. Both endpoint
+addresses must be distinct members of the same prefix. A static route using a
+router-link must name the peer endpoint address as `--via`; arbitrary neighbor
+discovery and hardware LPM/CT promotion across a router-link are not performed.
 
 ## 2. Transport
 

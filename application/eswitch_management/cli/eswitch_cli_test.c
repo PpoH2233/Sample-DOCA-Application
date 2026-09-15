@@ -85,6 +85,8 @@ int main(void) {
   accept_verb("vr\n", ESWITCH_CLI_ROUTER, false);
   accept_verb("vr nonsense --whatever\n", ESWITCH_CLI_ROUTER, false);
   assert(eswitch_cli_is_router_line("vr show --id 5\n"));
+  accept_verb("link create --id 10\n", ESWITCH_CLI_ROUTER, false);
+  assert(eswitch_cli_is_router_line("link show --id 10\n"));
   assert(eswitch_cli_is_router_line("vr\n"));
   assert(!eswitch_cli_is_router_line("vrx show\n"));
   assert(!eswitch_cli_is_router_line("vs show\n"));

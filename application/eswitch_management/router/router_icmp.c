@@ -43,11 +43,10 @@ static uint16_t checksum(const uint8_t *bytes, size_t length) {
   return (uint16_t)~sum;
 }
 
-size_t router_icmp_echo_reply(const struct router_config *config,
-                              uint16_t vswitch_id, const uint8_t *packet,
-                              size_t length, uint8_t *output,
-                              size_t capacity) {
-  const struct router_interface *ingress_rif = NULL;
+static size_t reply_for_interface(const struct router_config *config,
+                                  const struct router_interface *ingress_rif,
+                                  const uint8_t *packet, size_t length,
+                                  uint8_t *output, size_t capacity) {
   const struct router_interface *local_rif = NULL;
   const uint8_t *ip;
   const uint8_t *icmp;
@@ -59,7 +58,7 @@ size_t router_icmp_echo_reply(const struct router_config *config,
   uint16_t fragment;
   size_t icmp_length;
 
-  if (config == NULL || packet == NULL || output == NULL || vswitch_id == 0 ||
+  if (config == NULL || ingress_rif == NULL || packet == NULL || output == NULL ||
       length < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN + ICMP_HEADER_LEN)
     return 0;
   if (packet[12] != 0x08 || packet[13] != 0x00 ||
@@ -82,17 +81,7 @@ size_t router_icmp_echo_reply(const struct router_config *config,
   if ((fragment & 0x3fffU) != 0) /* Reject MF and every non-zero offset. */
     return 0;
 
-  for (size_t i = 0; i < config->interface_count; i++) {
-    const struct router_interface *candidate = &config->interfaces[i];
-
-    if (candidate->attachment == ROUTER_VSWITCH &&
-        candidate->vswitch_id == vswitch_id && candidate->has_address &&
-        memcmp(packet, candidate->mac, 6) == 0) {
-      ingress_rif = candidate;
-      break;
-    }
-  }
-  if (ingress_rif == NULL)
+  if (!ingress_rif->has_address || memcmp(packet, ingress_rif->mac, 6) != 0)
     return 0;
   for (size_t i = 0; i < config->interface_count; i++) {
     const struct router_interface *candidate = &config->interfaces[i];
@@ -142,4 +131,29 @@ size_t router_icmp_echo_reply(const struct router_config *config,
   output_icmp[3] = 0;
   write16(output_icmp + 2, checksum(output_icmp, icmp_length));
   return frame_length;
+}
+
+size_t router_icmp_echo_reply(const struct router_config *config,
+                              uint16_t vswitch_id, const uint8_t *packet,
+                              size_t length, uint8_t *output,
+                              size_t capacity) {
+  if (!config || !vswitch_id) return 0;
+  for (size_t i=0;i<config->interface_count;i++) {
+    const struct router_interface *rif=&config->interfaces[i];
+    if(rif->attachment==ROUTER_VSWITCH && rif->vswitch_id==vswitch_id)
+      return reply_for_interface(config,rif,packet,length,output,capacity);
+  }
+  return 0;
+}
+
+size_t router_icmp_echo_reply_interface(const struct router_config *config,
+                                        uint16_t interface_id,
+                                        const uint8_t *packet, size_t length,
+                                        uint8_t *output, size_t capacity) {
+  if (!config || !interface_id) return 0;
+  for(size_t i=0;i<config->interface_count;i++)
+    if(config->interfaces[i].interface_id==interface_id)
+      return reply_for_interface(config,&config->interfaces[i],packet,length,
+                                 output,capacity);
+  return 0;
 }

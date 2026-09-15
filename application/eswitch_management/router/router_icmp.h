@@ -11,4 +11,10 @@ size_t router_icmp_echo_reply(const struct router_config *config,
                               size_t length, uint8_t *output,
                               size_t capacity);
 
+/* Interface-addressed variant used by public and logical router links. */
+size_t router_icmp_echo_reply_interface(const struct router_config *config,
+                                        uint16_t interface_id,
+                                        const uint8_t *packet, size_t length,
+                                        uint8_t *output, size_t capacity);
+
 #endif /* ROUTER_ICMP_H */

@@ -31,6 +31,26 @@ int main(void) {
   /* Canonical resource-first grammar. This section is torn down completely so
    * the legacy-alias section below starts from the same inventory. */
   command("vr create --id 300",true);
+  command("link create --id 10",true);
+  command("link create --id 10",false);
+  command("vr create --id 301",true);
+  command("vr link attach --id 300 --link-id 10 --name r1-r2",true);
+  command("vr link attach --id 301 --link-id 10 --name r2-r1",true);
+  command("vr link attach --id 301 --link-id 10 --name duplicate",false);
+  command("vr ip add --id 300 --interface r1-r2 --address 10.10.10.1/30",true);
+  command("vr ip add --id 301 --interface r2-r1 --address 10.10.10.2/30",true);
+  command("vr route add --id 300 --prefix 192.0.2.0/24 --via 10.10.10.3 --interface r1-r2",false);
+  command("vr route add --id 300 --prefix 192.0.2.0/24 --via 10.10.10.2 --interface r1-r2",true);
+  command("link show --id 10",true);
+  assert(strstr(response,"vr300/r1-r2") && strstr(response,"vr301/r2-r1"));
+  command("link delete --id 10",false);
+  command("vr route del --id 300 --prefix 192.0.2.0/24",true);
+  command("vr ip del --id 300 --interface r1-r2 --address 10.10.10.1/30",true);
+  command("vr ip del --id 301 --interface r2-r1 --address 10.10.10.2/30",true);
+  command("vr link detach --id 300 --interface r1-r2",true);
+  command("vr link detach --id 301 --interface r2-r1",true);
+  command("link delete --id 10",true);
+  command("vr delete --id 301",true);
   command("vr port attach --id 300 --port 7 --name up0",true);
   command("vr switch attach --id 300 --switch-id 200 --name lan0",true);
   command("vr interface set --id 300 --interface lan0 --mac 02:aa:bb:cc:dd:ee",true);
@@ -197,7 +217,35 @@ int main(void) {
          canonical.interfaces[1].vswitch_id==201);
   assert(unlink(canonical_path)==0);
 
-  /* Re-saving schema 1 does not silently change its grammar. */
+  /* Schema 2 persists logical links and stable endpoint interface IDs. */
+  struct router_config linked,linked_loaded;
+  bool linked_changed=false;
+  char linked_path[256];
+  router_config_init(&linked);
+  assert(router_command(&linked,&inventory,"vr create --id 500",response,
+                        sizeof(response),&linked_changed));
+  assert(router_command(&linked,&inventory,"vr create --id 501",response,
+                        sizeof(response),&linked_changed));
+  assert(router_command(&linked,&inventory,"link create --id 50",response,
+                        sizeof(response),&linked_changed));
+  assert(router_command(&linked,&inventory,
+      "vr link attach --id 500 --link-id 50 --name east",response,
+      sizeof(response),&linked_changed));
+  assert(router_command(&linked,&inventory,
+      "vr link attach --id 501 --link-id 50 --name west",response,
+      sizeof(response),&linked_changed));
+  snprintf(linked_path,sizeof(linked_path),"%s/router-linked.conf",dir);
+  assert(router_config_save(linked_path,&linked,response,sizeof(response)));
+  router_config_init(&linked_loaded);
+  assert(router_config_load(linked_path,&linked_loaded,response,sizeof(response)));
+  assert(linked_loaded.link_count==1 && linked_loaded.link_ids[0]==50);
+  assert(linked_loaded.interface_count==2);
+  assert(router_link_peer(&linked_loaded,
+      linked_loaded.interfaces[0].interface_id)==&linked_loaded.interfaces[1]);
+  assert(!memcmp(&linked,&linked_loaded,sizeof(linked)));
+  assert(unlink(linked_path)==0);
+
+  /* Re-saving legacy state upgrades it without changing its command grammar. */
   assert(router_config_save(legacy_path,&legacy,response,sizeof(response)));
   struct router_config rewritten;router_config_init(&rewritten);
   assert(router_config_load(legacy_path,&rewritten,response,sizeof(response)));

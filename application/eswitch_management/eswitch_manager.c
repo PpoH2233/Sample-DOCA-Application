@@ -591,74 +591,6 @@ static doca_error_t reply_gateway_arp(struct eswitch_manager *manager,
   }
 }
 
-static void reply_gateway_icmp(struct eswitch_manager *manager,
-                               struct rte_mbuf *request, uint16_t vs,
-                               uint16_t ingress) {
-  size_t request_length = rte_pktmbuf_pkt_len(request);
-  size_t capacity = request_length < 60 ? 60 : request_length;
-  uint8_t *scratch = NULL;
-  uint8_t *response = NULL;
-  const uint8_t *bytes;
-  size_t response_length;
-  uint16_t context_tag = 0;
-  int index;
-  doca_error_t result;
-
-  manager->icmp_seen++;
-  if (request_length < 42 || request_length > UINT16_MAX)
-    goto ignored;
-  scratch = malloc(request_length);
-  response = malloc(capacity);
-  if (scratch == NULL || response == NULL) {
-    manager->icmp_tx_drops++;
-    goto out;
-  }
-  bytes = rte_pktmbuf_read(request, 0, request_length, scratch);
-  if (bytes == NULL)
-    goto ignored;
-  response_length = router_icmp_echo_reply(
-      manager->router, vs, bytes, request_length, response, capacity);
-  if (response_length == 0)
-    goto ignored;
-  manager->icmp_built++;
-
-  index = find_port_index(manager, ingress);
-  if (index < 0 || manager->port_owner[index] != vs ||
-      manager->ports->items[index].ethernet->role !=
-          ETHERNET_PORT_ROLE_REPRESENTOR ||
-      manager->sf_io == NULL || !manager->sf_io->started) {
-    manager->icmp_tx_drops++;
-    goto out;
-  }
-  result = bind_sf_directed_context(manager, vs, ingress, response + 6,
-                                    &context_tag);
-  if (result != DOCA_SUCCESS) {
-    manager->icmp_tx_drops++;
-    fprintf(stderr, "ICMP SF RETURN BIND FAILED: vs=%u error=%s\n", vs,
-            doca_error_get_descr(result));
-    goto out;
-  }
-  result = sf_packet_io_send_context(manager->sf_io, response,
-                                     response_length, context_tag);
-  if (result != DOCA_SUCCESS) {
-    manager->icmp_tx_drops++;
-    fprintf(stderr, "ICMP TX DROP: stage=sf-send vs=%u port=%u\n", vs,
-            ingress);
-    goto out;
-  }
-  manager->icmp_replies++;
-  if (manager->packet_debug)
-    printf("ICMP ECHO SF TX SENT: vs=%u port=%u context-vlan=%u len=%zu\n",
-           vs, ingress, context_tag, response_length);
-  goto out;
-
-ignored:
-  manager->icmp_ignored++;
-out:
-  free(scratch);
-  free(response);
-}
-
 static doca_error_t bind_route_egress(
     struct eswitch_manager *manager, const struct router_interface *egress,
     uint16_t target_port_id, uint16_t *context_tag);
@@ -822,21 +754,124 @@ static void reply_uplink_arp(struct eswitch_manager *manager,
   }
 }
 
-static void route_ipv4_packet(struct eswitch_manager *manager,
-                              struct rte_mbuf *packet, uint16_t ingress_vs,
-                              uint16_t ingress_port, uint64_t now_ns) {
+/* A logical router link is deliberately an Arm-only adjacency in phase 1.
+ * Each traversal performs a fresh LPM lookup in the peer VR and therefore
+ * preserves router hop semantics (TTL is decremented once per VR). */
+#define ROUTER_LINK_MAX_HOPS 8U
+
+static void route_arm_frame(struct eswitch_manager *manager,
+                            const uint8_t *frame, size_t length,
+                            const struct router_interface *ingress,
+                            uint16_t ingress_port, uint8_t link_hops,
+                            uint16_t expected_egress_interface,
+                            uint64_t now_ns);
+
+static bool route_across_link(struct eswitch_manager *manager,
+                              const uint8_t *frame, size_t length,
+                              const struct router_interface *egress,
+                              uint32_t next_hop_ip, uint8_t link_hops,
+                              uint64_t now_ns) {
+  const struct router_interface *peer;
+  size_t capacity=length<60?60:length;
+  uint8_t *output;
+  size_t output_length;
+
+  if(link_hops>=ROUTER_LINK_MAX_HOPS) {
+    manager->route_ttl_expired++;
+    manager->router_link_drops++;
+    return false;
+  }
+  peer=router_link_peer(manager->router,egress->interface_id);
+  if(peer==NULL || !egress->has_address || !peer->has_address ||
+     next_hop_ip!=peer->address) {
+    manager->route_neighbor_misses++;
+    manager->router_link_drops++;
+    return false;
+  }
+  output=malloc(capacity);
+  if(output==NULL) {manager->route_tx_drops++;manager->router_link_drops++;return false;}
+  output_length=router_ipv4_rewrite(frame,length,egress->mac,peer->mac,
+                                    output,capacity);
+  if(output_length==0) {
+    manager->route_invalid++;
+    manager->router_link_drops++;
+    free(output);
+    return false;
+  }
+  if(manager->packet_debug)
+    printf("ROUTER LINK TX: link=%u from-vr=%u to-vr=%u next-hop="
+           "%u.%u.%u.%u len=%zu\n",egress->link_id,egress->vr_id,
+           peer->vr_id,(next_hop_ip>>24)&0xffU,(next_hop_ip>>16)&0xffU,
+           (next_hop_ip>>8)&0xffU,next_hop_ip&0xffU,output_length);
+  route_arm_frame(manager,output,output_length,peer,0,link_hops+1,0,now_ns);
+  manager->router_link_forwards++;
+  free(output);
+  return true;
+}
+
+static void route_arm_local_reply(struct eswitch_manager *manager,
+                                  const uint8_t *frame, size_t length,
+                                  const struct router_interface *ingress,
+                                  uint16_t ingress_port,uint8_t link_hops,
+                                  uint64_t now_ns) {
+  size_t capacity=length<60?60:length;
+  uint8_t *response=malloc(capacity);
+  size_t response_length;
+  uint16_t context_tag=0;
+  doca_error_t result;
+
+  manager->icmp_seen++;
+  if(response==NULL) {manager->icmp_tx_drops++;return;}
+  response_length=router_icmp_echo_reply_interface(
+      manager->router,ingress->interface_id,frame,length,response,capacity);
+  if(response_length==0) {manager->icmp_ignored++;free(response);return;}
+  manager->icmp_built++;
+  if(ingress->attachment==ROUTER_LINK) {
+    const struct router_interface *peer=router_link_peer(
+        manager->router,ingress->interface_id);
+    if(peer==NULL || link_hops>=ROUTER_LINK_MAX_HOPS) {
+      manager->icmp_tx_drops++;
+    } else {
+      route_arm_frame(manager,response,response_length,peer,0,link_hops+1,0,
+                      now_ns);
+      manager->router_link_forwards++;
+      manager->icmp_replies++;
+    }
+    free(response);
+    return;
+  }
+  int ingress_index=find_port_index(manager,ingress_port);
+  if(ingress->attachment!=ROUTER_VSWITCH || ingress_index<0 ||
+     manager->port_owner[ingress_index]!=ingress->vswitch_id) {
+    manager->icmp_tx_drops++;
+    free(response);
+    return;
+  }
+  result=bind_sf_directed_context(manager,ingress->vswitch_id,ingress_port,
+                                  ingress->mac,&context_tag);
+  if(result==DOCA_SUCCESS)
+    result=sf_packet_io_send_context(manager->sf_io,response,response_length,
+                                     context_tag);
+  if(result==DOCA_SUCCESS) manager->icmp_replies++;
+  else manager->icmp_tx_drops++;
+  free(response);
+}
+
+static void route_arm_frame(struct eswitch_manager *manager,
+                            const uint8_t *frame, size_t length,
+                            const struct router_interface *ingress,
+                            uint16_t ingress_port, uint8_t link_hops,
+                            uint16_t expected_egress_interface,
+                            uint64_t now_ns) {
   struct router_ipv4_decision decision;
   const struct router_interface *egress;
   const struct router_neighbor *neighbor;
   const struct router_nat_policy *nat_policy = NULL;
   const struct router_nat_session *nat_session = NULL;
   struct router_nat_inside inside = {0};
-  size_t length = rte_pktmbuf_pkt_len(packet);
   size_t capacity = length < 60 ? 60 : length;
-  uint8_t *scratch = NULL;
   uint8_t *translated = NULL;
   uint8_t *output = NULL;
-  const uint8_t *frame;
   const uint8_t *forward_frame;
   size_t output_length;
   uint16_t context_tag = 0;
@@ -844,22 +879,13 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
   enum router_ipv4_disposition disposition;
   enum router_nat_result nat_result;
 
-  scratch = malloc(length);
-  if (scratch == NULL) {
-    manager->route_tx_drops++;
-    return;
-  }
-  frame = rte_pktmbuf_read(packet, 0, length, scratch);
-  if (frame == NULL) {
-    manager->route_invalid++;
-    goto out;
-  }
-  disposition = router_ipv4_lookup(manager->router, ingress_vs, frame, length,
-                                   &decision);
+  disposition = router_ipv4_lookup_interface(manager->router,
+      ingress->interface_id,frame,length,&decision);
   if (disposition == ROUTER_IPV4_NOT_FOR_ROUTER)
     goto out;
   if (disposition == ROUTER_IPV4_LOCAL) {
-    reply_gateway_icmp(manager, packet, ingress_vs, ingress_port);
+    route_arm_local_reply(manager,frame,length,ingress,ingress_port,
+                          link_hops,now_ns);
     goto out;
   }
   manager->routed_seen++;
@@ -880,6 +906,16 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
                                  decision.egress_interface_id);
   if (egress == NULL) {
     manager->route_no_route++;
+    goto out;
+  }
+  if(expected_egress_interface!=0 &&
+     decision.egress_interface_id!=expected_egress_interface) {
+    manager->route_no_route++;
+    goto out;
+  }
+  if(egress->attachment==ROUTER_LINK) {
+    (void)route_across_link(manager,frame,length,egress,decision.next_hop_ip,
+                            link_hops,now_ns);
     goto out;
   }
   neighbor = router_neighbor_lookup(
@@ -912,9 +948,10 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
       manager->route_tx_drops++;
       goto out;
     }
-    inside.vswitch_id = ingress_vs;
+    inside.vswitch_id = ingress->attachment==ROUTER_VSWITCH ?
+                        ingress->vswitch_id : 0;
     inside.interface_id = decision.ingress_interface_id;
-    inside.port_id = ingress_port;
+    inside.port_id = ingress->attachment==ROUTER_VSWITCH ? ingress_port : 0;
     memcpy(inside.mac, frame + 6, sizeof(inside.mac));
     nat_result = router_nat_outbound(
         manager->nat, nat_policy,
@@ -985,7 +1022,8 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
            (nat_session->remote_ip >> 8) & 0xffU,
            nat_session->remote_ip & 0xffU, nat_session->remote_port);
   }
-  if (nat_session != NULL && manager->pipeline->hardware_ct_enabled &&
+  if (nat_session != NULL && ingress->attachment==ROUTER_VSWITCH &&
+      manager->pipeline->hardware_ct_enabled &&
       manager->pipeline->hardware_routing_enabled &&
       (nat_session->protocol == IPPROTO_TCP ||
        nat_session->protocol == IPPROTO_UDP)) {
@@ -1007,6 +1045,26 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
 out:
   free(output);
   free(translated);
+}
+
+static void route_ipv4_packet(struct eswitch_manager *manager,
+                              struct rte_mbuf *packet, uint16_t ingress_vs,
+                              uint16_t ingress_port, uint64_t now_ns) {
+  const struct router_interface *ingress=NULL;
+  size_t length=rte_pktmbuf_pkt_len(packet);
+  uint8_t *scratch=malloc(length);
+  const uint8_t *frame;
+  if(scratch==NULL) {manager->route_tx_drops++;return;}
+  frame=rte_pktmbuf_read(packet,0,length,scratch);
+  if(frame==NULL) {manager->route_invalid++;free(scratch);return;}
+  for(size_t i=0;i<manager->router->interface_count;i++) {
+    const struct router_interface *candidate=&manager->router->interfaces[i];
+    if(candidate->attachment==ROUTER_VSWITCH &&
+       candidate->vswitch_id==ingress_vs && candidate->has_address &&
+       !memcmp(frame,candidate->mac,6)) {ingress=candidate;break;}
+  }
+  if(ingress!=NULL)
+    route_arm_frame(manager,frame,length,ingress,ingress_port,0,0,now_ns);
   free(scratch);
 }
 
@@ -1014,29 +1072,21 @@ static void route_uplink_ipv4_packet(
     struct eswitch_manager *manager, struct rte_mbuf *packet,
     const struct router_interface *ingress, uint16_t ingress_port,
     uint64_t now_ns) {
-  struct router_ipv4_decision decision;
   const struct router_nat_policy *policy;
   const struct router_nat_session *session = NULL;
-  const struct router_interface *egress;
   size_t length = rte_pktmbuf_pkt_len(packet);
   size_t capacity = length < 60 ? 60 : length;
   uint8_t *scratch = NULL;
   uint8_t *translated = NULL;
-  uint8_t *output = NULL;
   const uint8_t *frame;
-  size_t output_length;
-  uint16_t context_tag = 0;
   enum router_nat_result nat_result;
-  enum router_ipv4_disposition disposition;
-  doca_error_t result;
 
   policy = router_nat_policy_find(manager->router, ingress->vr_id);
   if (policy == NULL || policy->interface_id != ingress->interface_id)
     return;
   scratch = malloc(length);
   translated = malloc(capacity);
-  output = malloc(capacity);
-  if (scratch == NULL || translated == NULL || output == NULL) {
+  if (scratch == NULL || translated == NULL) {
     manager->route_tx_drops++;
     goto out;
   }
@@ -1053,63 +1103,12 @@ static void route_uplink_ipv4_packet(
     goto out;
   }
 
-  manager->routed_seen++;
-  disposition = router_ipv4_lookup_interface(
-      manager->router, ingress->interface_id, translated, length, &decision);
-  if (disposition == ROUTER_IPV4_TTL_EXPIRED) {
-    manager->route_ttl_expired++;
-    goto out;
-  }
-  if (disposition == ROUTER_IPV4_INVALID) {
-    manager->route_invalid++;
-    goto out;
-  }
-  if (disposition != ROUTER_IPV4_FORWARD) {
-    manager->route_no_route++;
-    goto out;
-  }
-  egress = find_router_interface(manager, decision.vr_id,
-                                 decision.egress_interface_id);
-  if (session == NULL || egress == NULL ||
-      egress->attachment != ROUTER_VSWITCH ||
-      egress->interface_id != session->inside.interface_id ||
-      egress->vswitch_id != session->inside.vswitch_id) {
-    manager->route_no_route++;
-    goto out;
-  }
-  {
-    int inside_port_index = find_port_index(manager, session->inside.port_id);
-
-    if (inside_port_index < 0 ||
-        manager->port_owner[inside_port_index] != egress->vswitch_id) {
-      manager->route_tx_drops++;
-      goto out;
-    }
-  }
-  output_length = router_ipv4_rewrite(
-      translated, length, egress->mac, session->inside.mac, output, capacity);
-  if (output_length == 0) {
-    manager->route_invalid++;
-    goto out;
-  }
-  result = bind_sf_directed_context(
-      manager, egress->vswitch_id, session->inside.port_id, egress->mac,
-      &context_tag);
-  if (result == DOCA_SUCCESS)
-    result = sf_packet_io_send_context(manager->sf_io, output, output_length,
-                                       context_tag);
-  if (result != DOCA_SUCCESS) {
-    manager->route_tx_drops++;
-    fprintf(stderr,
-            "NAT IN TX DROP: vr=%u ingress-rif=%u target=%u error=%s\n",
-            ingress->vr_id, ingress->interface_id, session->inside.port_id,
-            doca_error_get_descr(result));
-    goto out;
-  }
-  manager->routed_forwarded++;
+  if(session==NULL) goto out;
+  route_arm_frame(manager,translated,length,ingress,ingress_port,0,
+                  session->inside.interface_id,now_ns);
   if (manager->packet_debug)
     printf("NAT IN: vr=%u ingress-port=%u public=%u.%u.%u.%u:%u "
-         "inside=%u.%u.%u.%u:%u vs=%u port=%u context-vlan=%u len=%zu\n",
+         "inside=%u.%u.%u.%u:%u return-rif=%u\n",
          ingress->vr_id, ingress_port,
          (session->public_ip >> 24) & 0xffU,
          (session->public_ip >> 16) & 0xffU,
@@ -1117,10 +1116,8 @@ static void route_uplink_ipv4_packet(
          session->public_port, (session->inside_ip >> 24) & 0xffU,
          (session->inside_ip >> 16) & 0xffU,
          (session->inside_ip >> 8) & 0xffU, session->inside_ip & 0xffU,
-         session->inside_port, session->inside.vswitch_id,
-         session->inside.port_id, context_tag, output_length);
+         session->inside_port,session->inside.interface_id);
 out:
-  free(output);
   free(translated);
   free(scratch);
 }
@@ -1400,12 +1397,13 @@ static size_t format_status(const struct eswitch_manager *manager,
                      switch_count,
                      manager->fdb.count);
   used = append_text(response, size, used,
-                     "routers=%zu "
+                     "routers=%zu router_links=%zu "
                      "router_dataplane=%s\n",
                      manager->router ? manager->router->vr_count : 0,
+                     manager->router ? manager->router->link_count : 0,
                      manager->pipeline->hardware_routing_enabled
-                         ? "DOCA_FLOW_LPM_PRIVATE_PLUS_ARM_SLOWPATH_NAT44"
-                         : "GATEWAY_ARP_ICMP_ARM_LPM_NAT44");
+                         ? "DOCA_FLOW_LPM_PRIVATE_PLUS_ARM_ROUTER_LINK_NAT44"
+                         : "GATEWAY_ARP_ICMP_ARM_LPM_ROUTER_LINK_NAT44");
   used = append_text(response, size, used,
       "hw_routing_configured=%s hw_state=%s hw_scope=private-vs-ipv4 "
       "hw_requested_capacity=%u hw_capacity=%u hw_routes=%zu "
@@ -1499,6 +1497,10 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->routed_seen, manager->routed_forwarded,
       manager->route_no_route, manager->route_ttl_expired,
       manager->route_invalid);
+  used = append_text(response, size, used,
+      "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
+      " max_hops=%u\n", manager->router_link_forwards,
+      manager->router_link_drops, ROUTER_LINK_MAX_HOPS);
   used = append_text(response, size, used,
       "neighbors=%zu neighbor_misses=%" PRIu64 " arp_probes=%" PRIu64
       " route_tx_drops=%" PRIu64 "\n",

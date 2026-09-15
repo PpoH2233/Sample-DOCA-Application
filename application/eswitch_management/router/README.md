@@ -1,12 +1,42 @@
 # Router implementation status
 
 This implementation provides private gateway ARP, local IPv4 ICMP echo,
-IPv4 routing between vSwitch RIFs, and stateful TCP/UDP plus ICMP Echo NAT
-through one public port per VR. Longest-prefix lookup, neighbor handling and NAT sessions currently
-run on Arm; DOCA Flow performs ingress classification and directed SF return.
+IPv4 routing between vSwitch RIFs, logical point-to-point router links, and
+stateful TCP/UDP plus ICMP Echo NAT
+through one public port per VR. Logical-link traversal, neighbor misses and
+unsupported traffic run on Arm; eligible private routes and direct TCP/UDP NAT
+sessions can use the existing DOCA Flow LPM/CT fast paths.
 Private addressed RIFs report `ACTIVE_ARM_LPM`. An addressed public RIF reports
 `ACTIVE_ARM_UPLINK`, or `ACTIVE_ARM_NAT` while its NAT policy is enabled. No API
 stub reports fabricated hardware-CT success.
+
+## Logical router-link (phase 1 Arm dataplane)
+
+A router-link is an in-process point-to-point adjacency with exactly two RIFs
+owned by different VRs. It consumes no representor. Forwarding across it
+rewrites Ethernet source/destination to the two RIF MACs, decrements TTL, then
+runs a fresh LPM lookup in the peer VR. An eight-hop limit fails closed on
+misconfigured loops. The peer IP is a static adjacency, so no synthetic ARP is
+emitted for the logical link.
+
+```sh
+eswitchctl link create --id 10
+eswitchctl vr link attach --id 101 --link-id 10 --name r1-r2
+eswitchctl vr link attach --id 102 --link-id 10 --name r2-r1
+eswitchctl vr ip add --id 101 --interface r1-r2 --address 10.10.10.1/30
+eswitchctl vr ip add --id 102 --interface r2-r1 --address 10.10.10.2/30
+eswitchctl vr route add --id 101 --prefix 192.168.200.0/24 --via 10.10.10.2 --interface r1-r2
+eswitchctl vr route add --id 102 --prefix 192.168.100.0/24 --via 10.10.10.1 --interface r2-r1
+eswitchctl vr route add --id 102 --prefix 0.0.0.0/0 --via 10.10.10.1 --interface r2-r1
+```
+
+Only R1 enables NAT on its physical public port. When a packet originates
+behind R2, R1 records its link RIF as the NAT return attachment. Reverse NAT
+performs DNAT and normal LPM again: R1 selects the link, R2 selects the tenant
+VS, and the final adjacency comes from R2's neighbor table. This removes the
+old assumption that every NAT inside endpoint is a VF directly attached to the
+NAT-owning VR. TCP/UDP flows involving a router-link remain on Arm and are not
+promoted to DOCA Flow CT in this phase.
 
 ## Private gateway ARP through the Arm system SF
 

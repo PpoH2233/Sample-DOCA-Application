@@ -143,6 +143,49 @@ int main(void) {
   }
   router_neighbor_age(&neighbors,UINT64_C(400000000000));
   assert(neighbors.count==0);
+
+  /* A logical link performs one lookup/rewrite in each VR. */
+  {
+    struct router_config linked;
+    struct router_ipv4_decision first,second;
+    uint8_t hop1[98],hop2[98];
+    const uint8_t r1_lan[6]={2,0,0,1,0,1};
+    const uint8_t r1_link[6]={2,0,0,1,0,2};
+    const uint8_t r2_link[6]={2,0,0,2,0,1};
+    const uint8_t r2_lan[6]={2,0,0,2,0,2};
+    router_config_init(&linked);
+    linked.vr_ids[0]=1;linked.vr_ids[1]=2;linked.vr_count=2;
+    linked.link_ids[0]=10;linked.link_count=1;linked.interface_count=4;
+    linked.interfaces[0]=(struct router_interface){.vr_id=1,.interface_id=10,
+      .attachment=ROUTER_VSWITCH,.vswitch_id=100,.has_address=true,
+      .address=0xc0a86401,.prefix=24};
+    linked.interfaces[1]=(struct router_interface){.vr_id=1,.interface_id=11,
+      .attachment=ROUTER_LINK,.link_id=10,.has_address=true,
+      .address=0x0a0a0a01,.prefix=30};
+    linked.interfaces[2]=(struct router_interface){.vr_id=2,.interface_id=12,
+      .attachment=ROUTER_LINK,.link_id=10,.has_address=true,
+      .address=0x0a0a0a02,.prefix=30};
+    linked.interfaces[3]=(struct router_interface){.vr_id=2,.interface_id=13,
+      .attachment=ROUTER_VSWITCH,.vswitch_id=200,.has_address=true,
+      .address=0xc0a8c801,.prefix=24};
+    memcpy(linked.interfaces[0].mac,r1_lan,6);
+    memcpy(linked.interfaces[1].mac,r1_link,6);
+    memcpy(linked.interfaces[2].mac,r2_link,6);
+    memcpy(linked.interfaces[3].mac,r2_lan,6);
+    linked.routes[0]=(struct router_route){.vr_id=1,.interface_id=11,
+      .prefix=0xc0a8c800,.gateway=0x0a0a0a02,.length=24};
+    linked.route_count=1;
+    make_ipv4(frame,r1_lan,0xc0a86432,0xc0a8c80a,64);
+    assert(router_ipv4_lookup_interface(&linked,10,frame,sizeof(frame),&first)==
+           ROUTER_IPV4_FORWARD && first.egress_interface_id==11);
+    assert(router_link_peer(&linked,11)==&linked.interfaces[2]);
+    assert(router_ipv4_rewrite(frame,sizeof(frame),r1_link,r2_link,hop1,
+                               sizeof(hop1))==98 && hop1[22]==63);
+    assert(router_ipv4_lookup_interface(&linked,12,hop1,sizeof(hop1),&second)==
+           ROUTER_IPV4_FORWARD && second.egress_interface_id==13);
+    assert(router_ipv4_rewrite(hop1,sizeof(hop1),r2_lan,vm_b,hop2,
+                               sizeof(hop2))==98 && hop2[22]==62);
+  }
   puts("PASS: VR LPM, connected/static selection, TTL/checksum rewrite and ARP neighbors");
   return 0;
 }

@@ -32,7 +32,7 @@ int main(void) {
   router_config_init(&config);
   config.interface_count = 1;
   config.interfaces[0] = (struct router_interface){
-      .vr_id=101,.vswitch_id=100,.attachment=ROUTER_VSWITCH,
+      .vr_id=101,.interface_id=1,.vswitch_id=100,.attachment=ROUTER_VSWITCH,
       .has_address=true,.address=0xc0a80001};
   memcpy(config.interfaces[0].mac, rif, 6);
 
@@ -51,6 +51,11 @@ int main(void) {
   assert(reply[34]==0 && reply[35]==0);
   assert(!memcmp(reply+26,request+30,4) && !memcmp(reply+30,request+26,4));
   assert(checksum(reply+14,20)==0 && checksum(reply+34,64)==0);
+  config.interfaces[0].attachment=ROUTER_LINK;
+  config.interfaces[0].link_id=10;
+  assert(router_icmp_echo_reply_interface(&config,1,request,sizeof(request),
+                                          reply,sizeof(reply))==98);
+  config.interfaces[0].attachment=ROUTER_VSWITCH;
 
   /* A router owns every RIF address in the same VR. Ping to a different RIF
    * IP must return on the ingress link, using ingress L2 identity but the

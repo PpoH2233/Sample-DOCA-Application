@@ -99,6 +99,7 @@ doca_error_t router_control_restore(struct eswitch_manager *m) {
     const struct router_interface *rif=&m->router->interfaces[r];
     bool found=false;
     if(rif->attachment==ROUTER_VSWITCH) found=inventory_switch(m,rif->vswitch_id);
+    else if(rif->attachment==ROUTER_LINK) found=router_has_link(m->router,rif->link_id);
     else for(uint16_t i=0;i<m->ports->count;i++) {
       const struct ethernet_port *p=m->ports->items[i].ethernet;
       if(p->role==ETHERNET_PORT_ROLE_REPRESENTOR && p->host_index==rif->port.host &&
