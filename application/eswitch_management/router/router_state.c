@@ -29,11 +29,11 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
   for(size_t i=0;i<c->interface_count;i++) {
     const struct router_interface *r=&c->interfaces[i]; char ip[INET_ADDRSTRLEN];
     fprintf(f,"identity %u %u %u %u\n",r->interface_id,r->port.host,r->port.pf,r->port.vf);
-    /* Newly saved state uses the canonical resource-first VR grammar. Load
-     * still accepts the legacy hyphenated attachment verbs. */
+    /* Keep the version-1 on-disk spelling downgrade-safe. The loader accepts
+     * both this spelling and the canonical public CLI spelling. */
     if(r->attachment==ROUTER_PORT)
-      fprintf(f,"vr port attach --id %u --name %s --port 0\n",r->vr_id,r->name);
-    else fprintf(f,"vr switch attach --id %u --name %s --switch-id %u\n",r->vr_id,r->name,r->vswitch_id);
+      fprintf(f,"vr port-attach --id %u --name %s --port 0\n",r->vr_id,r->name);
+    else fprintf(f,"vr switch-attach --id %u --name %s --switch-id %u\n",r->vr_id,r->name,r->vswitch_id);
     fprintf(f,"vr interface set --id %u --interface %s --mac %02x:%02x:%02x:%02x:%02x:%02x\n",
       r->vr_id,r->name,r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
     if(r->has_address) fprintf(f,"vr ip add --id %u --interface %s --address %s/%u\n",
@@ -109,8 +109,9 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
       for(size_t i=0;i<c->interface_count;i++) if(c->interfaces[i].interface_id==identity) ok=false;
       continue;
     }
-    /* Canonical nested attachment verbs, plus the version-1 hyphenated
-     * aliases so state written by an older daemon still restores. */
+    /* Accept canonical nested attachment verbs as well as the version-1
+     * on-disk spelling. This also restores state written by the brief CLI-v2
+     * development build that emitted canonical commands under schema 1. */
     bool attachment=!strncmp(line,"vr port attach ",15) ||
       !strncmp(line,"vr switch attach ",17) ||
       !strncmp(line,"vr port-attach ",15) ||

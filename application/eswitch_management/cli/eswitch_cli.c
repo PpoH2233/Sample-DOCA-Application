@@ -4,7 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ESWITCH_CLI_LINE_SIZE 512U
 #define ESWITCH_CLI_MAX_TOKENS 16U
 
 enum option_bit { OPTION_ID = 1u, OPTION_PORT = 2u };
@@ -115,7 +114,8 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
     if (strcmp(tokens[1], "create") == 0 || strcmp(tokens[1], "delete") == 0) {
       out->verb = strcmp(tokens[1], "create") == 0 ? ESWITCH_CLI_VS_CREATE
                                                    : ESWITCH_CLI_VS_DELETE;
-      return parse_options(2, token_count, tokens, OPTION_ID, OPTION_ID, out);
+      return parse_options(2, token_count, tokens, OPTION_ID, OPTION_ID, out) &&
+             out->id != 0;
     }
     if (strcmp(tokens[1], "show") == 0) {
       out->verb = ESWITCH_CLI_VS_SHOW;
@@ -131,7 +131,8 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
       else
         return false;
       return parse_options(3, token_count, tokens, OPTION_ID | OPTION_PORT,
-                           OPTION_ID | OPTION_PORT, out);
+                           OPTION_ID | OPTION_PORT, out) &&
+             out->id != 0;
     }
     return false;
   }
@@ -152,11 +153,11 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
   out->legacy = true;
   if (strcmp(resource, "vs-create") == 0) {
     out->verb = ESWITCH_CLI_VS_CREATE;
-    return parse_legacy_id(token_count, tokens, true, out);
+    return parse_legacy_id(token_count, tokens, true, out) && out->id != 0;
   }
   if (strcmp(resource, "vs-delete") == 0) {
     out->verb = ESWITCH_CLI_VS_DELETE;
-    return parse_legacy_id(token_count, tokens, true, out);
+    return parse_legacy_id(token_count, tokens, true, out) && out->id != 0;
   }
   if (strcmp(resource, "vs-list") == 0) {
     out->verb = ESWITCH_CLI_VS_SHOW;
@@ -168,11 +169,11 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
   }
   if (strcmp(resource, "vs-port-attach") == 0) {
     out->verb = ESWITCH_CLI_VS_PORT_ATTACH;
-    return parse_legacy_port(token_count, tokens, out);
+    return parse_legacy_port(token_count, tokens, out) && out->id != 0;
   }
   if (strcmp(resource, "vs-port-detach") == 0) {
     out->verb = ESWITCH_CLI_VS_PORT_DETACH;
-    return parse_legacy_port(token_count, tokens, out);
+    return parse_legacy_port(token_count, tokens, out) && out->id != 0;
   }
   if (strcmp(resource, "list-port-available") == 0) {
     out->verb = ESWITCH_CLI_PORT_SHOW;
@@ -197,7 +198,7 @@ static size_t tokenize(const char *request, char *buffer, size_t buffer_size,
   /* One command per connection: anything after the first line terminator is
    * not part of this request. */
   length = strcspn(request, "\r\n");
-  if (length >= buffer_size) {
+  if (length > ESWITCH_CLI_MAX_COMMAND_SIZE || length >= buffer_size) {
     *overflow = true;
     return 0;
   }
@@ -216,7 +217,7 @@ static size_t tokenize(const char *request, char *buffer, size_t buffer_size,
 
 bool eswitch_cli_parse_line(const char *request,
                             struct eswitch_cli_command *out) {
-  char buffer[ESWITCH_CLI_LINE_SIZE];
+  char buffer[ESWITCH_CLI_REQUEST_SIZE];
   const char *tokens[ESWITCH_CLI_MAX_TOKENS];
   bool overflow = false;
   size_t count = tokenize(request, buffer, sizeof(buffer), tokens,
@@ -287,13 +288,18 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
     return "Usage: vs delete --id <id>\n";
   if (token_count >= 2 && strcmp(tokens[1], "show") == 0)
     return "Usage: vs show [--id <id>]\n";
-  if (token_count >= 2 && strcmp(tokens[1], "port") == 0)
+  if (token_count >= 2 && strcmp(tokens[1], "port") == 0) {
+    if (token_count >= 3 && strcmp(tokens[2], "attach") == 0)
+      return "Usage: vs port attach --id <id> --port <port-id>\n";
+    if (token_count >= 3 && strcmp(tokens[2], "detach") == 0)
+      return "Usage: vs port detach --id <id> --port <port-id>\n";
     return "Usage: vs port attach|detach --id <id> --port <port-id>\n";
+  }
   return "Usage: vs create|delete|show|port attach|port detach ...\n";
 }
 
 const char *eswitch_cli_usage_for_line(const char *request) {
-  char buffer[ESWITCH_CLI_LINE_SIZE];
+  char buffer[ESWITCH_CLI_REQUEST_SIZE];
   const char *tokens[ESWITCH_CLI_MAX_TOKENS];
   bool overflow = false;
   size_t count = tokenize(request, buffer, sizeof(buffer), tokens,
@@ -347,8 +353,10 @@ void eswitch_cli_help(FILE *output, const char *program,
           "      --port-range <first-last>            TCP/UDP ports and ICMP "
           "Echo IDs\n"
           "  vr nat disable|show --id <id>\n\n"
-          "  Private VS gateway ARP, ICMP echo and Arm LPM routing are "
-          "active.\n"
+          "  Private VS gateway ARP and ICMP echo are active. Eligible "
+          "private routes\n"
+          "  use hardware LPM; unsupported cases fail open to the Arm slow "
+          "path.\n"
           "  Arm TCP/UDP/ICMP Echo NAT and uplink ARP are active; hardware CT "
           "is pending.\n\n"
           "  --help, -h                               Show this help\n\n"

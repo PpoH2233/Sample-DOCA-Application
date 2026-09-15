@@ -6,6 +6,8 @@
 
 #include <doca_error.h>
 
+#include "cli/eswitch_cli.h"
+
 typedef doca_error_t (*control_command_handler)(const char *request,
                                                 char *response,
                                                 size_t response_size,
@@ -14,9 +16,7 @@ typedef doca_error_t (*control_command_handler)(const char *request,
 struct control_server {
   int listen_fd;
   int client_fd;
-  /* Must be at least as large as the shared CLI line limit so a canonical
-   * command is never received truncated. See cli/eswitch_cli.h. */
-  char request[512];
+  char request[ESWITCH_CLI_REQUEST_SIZE];
   size_t request_length;
   char socket_path[108];
   control_command_handler handler;

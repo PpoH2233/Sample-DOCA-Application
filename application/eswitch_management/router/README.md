@@ -301,10 +301,10 @@ clang -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
 /tmp/eswitch-cli-test
 ```
 
-`router_test.c` covers the canonical grammar, the deprecated aliases, invalid
-grammar, and that saved state uses canonical syntax while legacy state still
-loads. `cli/eswitch_cli_test.c` covers the L2 grammar shared by `eswitchctl`
-and the daemon's raw-socket path.
+`router_test.c` covers the canonical grammar, deprecated aliases, invalid
+grammar, downgrade-safe schema-1 saves, and loading both schema-1 attachment
+spellings. `cli/eswitch_cli_test.c` covers the L2 grammar shared by
+`eswitchctl` and the daemon's raw-socket path.
 
 In the DOCA 3.4 environment (user-run):
 

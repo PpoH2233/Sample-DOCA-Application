@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
   const char *socket_path = getenv("ESWITCH_CONTROL_SOCKET");
   struct sockaddr_un address = {0};
   struct eswitch_cli_command parsed = {0};
-  char request[512] = {0};
+  char request[ESWITCH_CLI_REQUEST_SIZE] = {0};
   char response[16384];
   size_t used = 0;
   size_t sent_total = 0;

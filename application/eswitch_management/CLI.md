@@ -86,7 +86,7 @@ error.
 - One command per connection. The client writes the command terminated by
   `\n`, then half-closes the write side. Bytes after the first `\n` are
   ignored.
-- Maximum request line: 511 bytes of command text plus the `\n` terminator. A
+- Maximum request line: 510 bytes of command text plus the `\n` terminator. A
   longer line is a syntax error, never a truncated command.
 - The server writes the whole response and closes the connection. Response
   completion is signalled by EOF, not by a length prefix. A client must read
@@ -418,10 +418,12 @@ Contract-level notes:
 
 Implemented today: private-vSwitch gateway ARP, local ICMP echo, connected and
 static route LPM, neighbor discovery, IPv4 forwarding, and Arm-side TCP/UDP/ICMP
-Echo NAT with uplink ARP, all through the Arm system SF. Not implemented:
-hardware connection tracking, ICMP routing error generation, and hardware LPM
-offload. Status strings in `vr show` and `vr nat show` report which stage a RIF
-is in, so a client should surface them rather than assume full offload.
+Echo NAT with uplink ARP, all through the Arm system SF. Eligible private IPv4
+routes can be promoted to the DOCA Flow hardware LPM fast path; unsupported or
+resource-constrained cases fail open to the Arm slow path. Not implemented:
+hardware connection tracking and ICMP routing error generation. Status strings
+in `status`, `vr show` and `vr nat show` report the active/fallback stage, so a
+client should surface them rather than assume full offload.
 
 ## 6. Idempotency and error semantics
 
@@ -487,10 +489,10 @@ error codes, with two differences:
 version 1 rejected any argument to `vs-list`. It exists so a client can migrate
 the verb and the filter independently.
 
-Persisted router state written by this version uses the canonical
-`vr port attach` and `vr switch attach` lines. Loading accepts both spellings,
-so state written by version 1 restores unchanged, and is rewritten in canonical
-form on the next successful mutation.
+The public CLI uses canonical `vr port attach` and `vr switch attach` commands.
+The internal `router-state 1` file deliberately keeps the version-1 hyphenated
+spelling so a rollback to an older daemon remains possible. Loading accepts
+both spellings, including files emitted by CLI-v2 development builds.
 
 ## 8. Atomicity and rollback
 

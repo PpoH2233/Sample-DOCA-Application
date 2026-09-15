@@ -122,12 +122,15 @@ int main(void) {
   reject("vs create --id\n");
   reject("vs create --id 100 --id 101\n");
   reject("vs create --id 65536\n");
+  reject("vs create --id 0\n");
+  reject("vs delete --id 0\n");
   reject("vs create --id -1\n");
   reject("vs create --id abc\n");
   reject("vs create --id 100 --port 1\n");
   reject("vs remove --id 100\n");
   reject("vs port\n");
   reject("vs port attach --id 100\n");
+  reject("vs port attach --id 0 --port 1\n");
   reject("vs port attach --port 1\n");
   reject("vs port connect --id 100 --port 1\n");
   reject("vs port attach 100 1\n");
@@ -145,6 +148,8 @@ int main(void) {
   reject("list-port-available --id 1\n");
   reject("nonsense\n");
   reject("vs-porta-ttach --id 1 --port 1\n");
+  reject("vs-create 0\n");
+  reject("vs-port-attach 0 1\n");
 
   /* Whitespace and CRLF handling on the raw socket. */
   accept_port("  vs   port\tattach  --id 100 --port 1  \r\n",
@@ -160,6 +165,17 @@ int main(void) {
   memset(oversized, 'x', sizeof(oversized) - 1);
   oversized[sizeof(oversized) - 1] = '\0';
   reject(oversized);
+  char exact_limit[ESWITCH_CLI_REQUEST_SIZE];
+  memset(exact_limit, ' ', ESWITCH_CLI_MAX_COMMAND_SIZE);
+  memcpy(exact_limit, "status", strlen("status"));
+  exact_limit[ESWITCH_CLI_MAX_COMMAND_SIZE] = '\n';
+  exact_limit[ESWITCH_CLI_MAX_COMMAND_SIZE + 1] = '\0';
+  accept_verb(exact_limit, ESWITCH_CLI_STATUS, false);
+  char over_limit[ESWITCH_CLI_REQUEST_SIZE + 1];
+  memset(over_limit, ' ', ESWITCH_CLI_MAX_COMMAND_SIZE + 1);
+  memcpy(over_limit, "status", strlen("status"));
+  over_limit[ESWITCH_CLI_MAX_COMMAND_SIZE + 1] = '\0';
+  reject(over_limit);
   /* A long trailing payload behind a valid first line is still fine. */
   char trailing[900];
   snprintf(trailing, sizeof(trailing), "vs show --id 9\n");
@@ -178,10 +194,14 @@ int main(void) {
                 "port show"));
   assert(strstr(eswitch_cli_usage_for_line("vs create\n"),
                 "vs create --id <id>"));
+  assert(strstr(eswitch_cli_usage_for_line("vs port attach --id 0 --port 1\n"),
+                "vs port attach --id <id> --port <port-id>"));
+  assert(strstr(eswitch_cli_usage_for_line("vs port detach --id 0 --port 1\n"),
+                "vs port detach --id <id> --port <port-id>"));
   assert(strstr(eswitch_cli_usage_for_line("vs port bogus\n"),
                 "vs port attach|detach"));
   assert(strstr(eswitch_cli_usage_for_line("nonsense\n"), "--help"));
-  checks += 7;
+  checks += 9;
 
   /* Canonical help must not advertise the deprecated flat verbs. */
   FILE *help = tmpfile();

@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define ESWITCH_CLI_REQUEST_SIZE 512U
+#define ESWITCH_CLI_MAX_COMMAND_SIZE (ESWITCH_CLI_REQUEST_SIZE - 2U)
+
 /* Single source of truth for the L2 command grammar. It is shared by the
  * eswitchctl client-side validator and by the daemon's raw-socket parser so a
  * command accepted locally is always accepted on the wire, and so both sides
@@ -54,7 +57,9 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
 
 /* Parses one raw request line as received on the control socket. Space and tab
  * separate tokens; parsing stops at the first CR or LF, so one connection
- * carries exactly one command and trailing bytes are ignored. */
+ * carries exactly one command and trailing bytes are ignored. Command text is
+ * limited to ESWITCH_CLI_MAX_COMMAND_SIZE bytes, leaving room for LF and NUL
+ * in a transport buffer of ESWITCH_CLI_REQUEST_SIZE bytes. */
 bool eswitch_cli_parse_line(const char *request,
                             struct eswitch_cli_command *out);
 

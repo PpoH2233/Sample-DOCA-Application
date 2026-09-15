@@ -140,14 +140,13 @@ int main(void) {
   assert(!memcmp(&before,&loaded,sizeof(loaded)));
   assert(unlink(path)==0);
 
-  /* Newly saved state uses the canonical VR grammar. */
+  /* Schema 1 remains downgrade-safe and keeps its legacy on-disk spelling. */
   assert(router_config_save(path,&config,response,sizeof(response)));
   file=fopen(path,"r");assert(file);
   char saved[8192]={0};
   size_t saved_length=fread(saved,1,sizeof(saved)-1,file);
   assert(saved_length>0 && feof(file));assert(fclose(file)==0);
-  assert(strstr(saved,"vr port attach --id ") && strstr(saved,"vr switch attach --id "));
-  assert(!strstr(saved,"port-attach") && !strstr(saved,"switch-attach"));
+  assert(strstr(saved,"vr port-attach --id ") && strstr(saved,"vr switch-attach --id "));
 
   /* Legacy state written by a version-1 daemon still reloads. */
   char legacy_path[256];
@@ -174,7 +173,31 @@ int main(void) {
   assert(legacy.interfaces[1].attachment==ROUTER_VSWITCH &&
          legacy.interfaces[1].vswitch_id==200 &&
          !strcmp(legacy.interfaces[1].name,"lan0"));
-  /* Legacy state is re-saved in canonical form without changing the model. */
+
+  /* Accept state emitted by the CLI-v2 development build under schema 1. */
+  char canonical_path[256];
+  snprintf(canonical_path,sizeof(canonical_path),"%s/router-canonical.conf",dir);
+  file=fopen(canonical_path,"w");assert(file);
+  assert(fputs("router-state 1\nnext 3\n"
+               "vr create --id 401\n"
+               "identity 1 0 0 12\n"
+               "vr port attach --id 401 --name up1 --port 0\n"
+               "vr interface set --id 401 --interface up1 --mac 02:00:01:91:00:01\n"
+               "identity 2 0 0 0\n"
+               "vr switch attach --id 401 --name lan1 --switch-id 201\n"
+               "vr interface set --id 401 --interface lan1 --mac 02:00:01:91:00:02\n",
+               file)>=0);
+  assert(fclose(file)==0);
+  struct router_config canonical;router_config_init(&canonical);
+  assert(router_config_load(canonical_path,&canonical,response,sizeof(response)));
+  assert(canonical.vr_count==1 && canonical.interface_count==2);
+  assert(canonical.interfaces[0].attachment==ROUTER_PORT &&
+         canonical.interfaces[0].port.vf==12);
+  assert(canonical.interfaces[1].attachment==ROUTER_VSWITCH &&
+         canonical.interfaces[1].vswitch_id==201);
+  assert(unlink(canonical_path)==0);
+
+  /* Re-saving schema 1 does not silently change its grammar. */
   assert(router_config_save(legacy_path,&legacy,response,sizeof(response)));
   struct router_config rewritten;router_config_init(&rewritten);
   assert(router_config_load(legacy_path,&rewritten,response,sizeof(response)));
