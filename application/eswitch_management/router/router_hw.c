@@ -109,3 +109,50 @@ size_t router_hw_routes_build(const struct router_config *config,
   }
   return count;
 }
+
+static bool route_spec_equal(const struct router_hw_route *left,
+                             const struct router_hw_route *right) {
+  return left->vr_id == right->vr_id &&
+         left->egress_interface_id == right->egress_interface_id &&
+         left->egress_vswitch_id == right->egress_vswitch_id &&
+         left->target_port_id == right->target_port_id &&
+         left->prefix == right->prefix && left->length == right->length &&
+         memcmp(left->source_mac, right->source_mac,
+                sizeof(left->source_mac)) == 0 &&
+         memcmp(left->destination_mac, right->destination_mac,
+                sizeof(left->destination_mac)) == 0;
+}
+
+bool router_hw_route_plans_equal(
+    const struct router_config *left, const struct router_config *right,
+    const struct router_neighbor_table *neighbors, uint64_t now_ns) {
+  struct router_hw_route left_routes[ROUTER_HW_MAX_ROUTES];
+  struct router_hw_route right_routes[ROUTER_HW_MAX_ROUTES];
+  bool matched[ROUTER_HW_MAX_ROUTES] = {0};
+  size_t left_count, right_count;
+
+  if (left == NULL || right == NULL || neighbors == NULL)
+    return false;
+  left_count = router_hw_routes_build(left, neighbors, now_ns, left_routes,
+                                      ROUTER_HW_MAX_ROUTES);
+  right_count = router_hw_routes_build(right, neighbors, now_ns, right_routes,
+                                       ROUTER_HW_MAX_ROUTES);
+  if (left_count != right_count)
+    return false;
+  /* Treat the route plan as a set. Config serialization order is not a
+   * dataplane change and must not force an HWS transaction. */
+  for (size_t i = 0; i < left_count; i++) {
+    bool found = false;
+    for (size_t j = 0; j < right_count; j++) {
+      if (!matched[j] && route_spec_equal(&left_routes[i],
+                                           &right_routes[j])) {
+        matched[j] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+      return false;
+  }
+  return true;
+}

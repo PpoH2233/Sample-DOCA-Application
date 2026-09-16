@@ -1,9 +1,11 @@
 #include "../eswitch_manager.h"
 #include "router_control.h"
+#include "router_hw.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 bool router_control_port_reserved(const struct eswitch_manager *m,uint16_t index) {
   if(!m->router || index>=m->ports->count) return false;
@@ -54,6 +56,12 @@ static const struct router_interface *port_interface_at(
 }
 static bool state_path(const struct eswitch_manager *m,char *out,size_t size) {
   return snprintf(out,size,"%s.router",m->state_path)<(int)size;
+}
+
+static uint64_t monotonic_ns(void) {
+  struct timespec value;
+  if(clock_gettime(CLOCK_MONOTONIC,&value)!=0) return 0;
+  return (uint64_t)value.tv_sec*1000000000ULL+(uint64_t)value.tv_nsec;
 }
 
 static const struct router_interface *interface_by_id(
@@ -137,6 +145,8 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
     int removed=-1,added=-1;
     uint16_t removed_vr=0,added_vr=0;
     bool removed_detached=false,added_attached=false;
+    bool hw_plan_changed=!router_hw_route_plans_equal(
+        m->router,candidate,&m->neighbors,monotonic_ns());
 
     /* Any router mutation can invalidate a CT zone, adjacency, or NAT
      * tuple. Remove hardware entries before changing reachable dataplane
@@ -180,7 +190,7 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
         ok=false;
       }
     }
-    if(ok) {
+    if(ok && hw_plan_changed) {
       doca_error_t result=eswitch_manager_hw_routes_sync(m,candidate);
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR hardware route transaction failed: %s\n",
@@ -195,7 +205,8 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
     }
     if(ok) *m->router=*candidate;
     else {
-      (void)eswitch_manager_hw_routes_sync(m,m->router);
+      if(hw_plan_changed)
+        (void)eswitch_manager_hw_routes_sync(m,m->router);
       if(added_attached) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
       if(removed_detached) (void)eswitch_pipeline_attach_router_port(
           m->pipeline,(uint16_t)removed,removed_vr);

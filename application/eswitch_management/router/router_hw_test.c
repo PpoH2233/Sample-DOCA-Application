@@ -101,6 +101,25 @@ int main(void) {
       now + ROUTER_NEIGHBOR_REACHABLE_NS + 1, routes, ROUTER_HW_MAX_ROUTES);
   assert(count == 0);
 
-  puts("PASS: hardware route eligibility, VR isolation, private adjacency and aging");
+  /* Adding a default route through a public uplink is an Arm/NAT-only
+   * control-plane change. It must not trigger an HWS transaction merely to
+   * recover or revalidate an unchanged private route plan. */
+  {
+    struct router_config with_default = config;
+    with_default.routes[with_default.route_count++] = (struct router_route){
+        .vr_id = 101, .interface_id = 2, .prefix = 0,
+        .gateway = 0xcb007101U, .length = 0};
+    assert(router_hw_route_plans_equal(&config, &with_default, &neighbors,
+                                       now));
+
+    /* A resolved route through a private vSwitch remains hardware relevant. */
+    with_default.interfaces[1].attachment = ROUTER_VSWITCH;
+    with_default.interfaces[1].vswitch_id = 200;
+    with_default.routes[with_default.route_count - 1].gateway = 0xc0a80a0aU;
+    assert(!router_hw_route_plans_equal(&config, &with_default, &neighbors,
+                                        now));
+  }
+
+  puts("PASS: hardware route eligibility, plan diff, VR isolation, private adjacency and aging");
   return 0;
 }
