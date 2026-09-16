@@ -8,6 +8,11 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
+Contract revision: `doca34-arm-route-transaction-v26`. This revision includes
+logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
+private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
+aware control transactions.
+
 ## 1. Grammar
 
 Commands are resource-first:
@@ -128,14 +133,14 @@ def eswitch_request(command: str,
     return b"".join(chunks).decode()
 
 
-def eswitch_call(command: str) -> list[str]:
-    """Returns the payload lines, or raises on ERR."""
+def eswitch_call(command: str) -> tuple[str, list[str]]:
+    """Returns (status_line, payload_lines), or raises on ERR."""
     lines = eswitch_request(command).splitlines()
     if not lines or not lines[0].startswith(("OK", "ERR")):
         raise RuntimeError(f"malformed response: {lines!r}")
     if lines[0].startswith("ERR"):
         raise RuntimeError(lines[0])
-    return lines[1:]
+    return lines[0], lines[1:]
 ```
 
 ## 3. Response envelope
@@ -156,11 +161,15 @@ OK vr=<id> dataplane=<state>
 <zero or more payload lines>
 ```
 
+The current router state token is
+`ARM_LPM_ROUTER_LINK_NAT_MVP`. Treat it as an opaque capability/status string,
+not as a stable enum: later releases may report more hardware offload stages.
+
 Mutations return only the status line. `vr` mutations return a status line with
 a dataplane note:
 
 ```text
-OK configuration committed; private-vs-dataplane=ARM_LPM public-dataplane=ARM_NAT_MVP
+OK configuration committed; private-vs-dataplane=ARM_LPM router-link-dataplane=ARM public-dataplane=ARM_NAT_MVP
 ```
 
 Failure, for L2 commands and for the daemon-level checks:
@@ -182,6 +191,8 @@ Parsing rules for a client:
 - Test the first three bytes. `OK` and `ERR` are the only status tokens.
 - Payload lines are `key=value` pairs separated by single spaces, except
   `port show`, which is prose, and `vs show`, which uses a bracketed list.
+- Preserve the whole first line. `vr` queries and `link show` place object
+  attributes on the `OK ...` status line rather than in a payload line.
 - Treat unknown keys as forward-compatible additions and ignore them.
 - Never parse the `message=` text; branch on `code=` when present, otherwise on
   the command and the reason string.
@@ -439,16 +450,140 @@ implemented. Status strings
 in `status`, `vr show` and `vr nat show` report the active/fallback stage, so a
 client should surface them rather than assume full offload.
 
+#### 5.8.1 VR and interface lifecycle
+
+Create the VR first, then attach a backing object to create a named router
+interface (RIF). The interface name is the stable key used by later commands.
+
+```bash
+eswitchctl vr create --id 1
+eswitchctl vr switch attach --id 1 --switch-id 100 --name SW100
+eswitchctl vr port attach --id 1 --port 7 --name uplink
+eswitchctl vr interface set --id 1 --interface SW100 \
+  --mac 02:00:00:01:00:01
+eswitchctl vr ip add --id 1 --interface SW100 \
+  --address 192.168.100.1/24
+eswitchctl vr ip add --id 1 --interface uplink \
+  --address 161.246.6.38/16
+eswitchctl vr show --id 1
+```
+
+Representative response:
+
+```text
+OK vr=1 dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP
+SW100 ifindex=1 type=vs-link switch=100 mac=02:00:00:01:00:01 address=192.168.100.1/24 status=ACTIVE_ARM_LPM arp=PRIVATE_GATEWAY_ENABLED
+uplink ifindex=2 type=port-link host=1 pf=0 vf=7 mac=02:00:00:01:00:02 address=161.246.6.38/16 status=ACTIVE_ARM_UPLINK arp=PUBLIC_RIF_ENABLED
+```
+
+The exact `ifindex`, host/PF/VF identity and default generated MAC are runtime
+values. A REST implementation must parse keys, not compare whole lines.
+
+#### 5.8.2 Logical router-links
+
+A router-link is a logical point-to-point connection. Create it once, then
+attach one endpoint to each of two different VRs:
+
+```bash
+eswitchctl link create --id 10
+eswitchctl vr link attach --id 1 --link-id 10 --name r1-r2
+eswitchctl vr link attach --id 2 --link-id 10 --name r2-r1
+eswitchctl vr ip add --id 1 --interface r1-r2 --address 10.10.10.1/30
+eswitchctl vr ip add --id 2 --interface r2-r1 --address 10.10.10.2/30
+eswitchctl link show --id 10
+```
+
+```text
+OK link=10 dataplane=ARM endpoints=vr1/r1-r2,vr2/r2-r1
+```
+
+The link accepts at most two endpoints, they must belong to different VRs,
+and both addressed endpoints must use distinct addresses in the same prefix.
+A route through the link must use the other endpoint address as its gateway.
+Router-link forwarding is Arm slow path in this revision; it is deliberately
+excluded from hardware LPM and CT promotion.
+
+#### 5.8.3 Connected and static routes
+
+Connected routes are derived from RIF addresses and cannot be added or deleted
+directly. Static routes are keyed by `(vr, prefix)`:
+
+```bash
+eswitchctl vr route add --id 1 \
+  --prefix 192.168.200.0/24 --via 10.10.10.2 --interface r1-r2
+eswitchctl vr route add --id 1 \
+  --prefix 0.0.0.0/0 --via 161.246.6.254 --interface uplink
+eswitchctl vr route show --id 1
+```
+
+```text
+OK vr=1 dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP
+connected 192.168.100.0/24 interface=SW100
+connected 10.10.10.0/30 interface=r1-r2
+connected 161.246.0.0/16 interface=uplink
+static 192.168.200.0/24 via=10.10.10.2 ifindex=2
+static 0.0.0.0/0 via=161.246.6.254 ifindex=3
+```
+
+`ifindex` is the RIF's daemon-assigned interface ID. Resolve it to the stable
+interface name using `vr show --id <id>`.
+
+Hardware transaction rules:
+
+- A resolved route whose egress is a private vSwitch RIF may change the DOCA
+  Flow LPM plan and therefore triggers hardware synchronization.
+- Routes through an uplink/port RIF or a router-link are Arm-only and do not
+  trigger an unchanged hardware LPM transaction. In particular, adding a
+  default route through `uplink` must not fail merely because optional HWS
+  action memory is exhausted.
+- A failed hardware-relevant route transaction returns `ERR` and does not
+  publish the candidate configuration. Runtime resource degradation is
+  visible through `status` and falls back to Arm where supported.
+
+#### 5.8.4 NAT44 policy
+
+Configure the addressed uplink and its default route before enabling NAT:
+
+```bash
+eswitchctl vr nat enable --id 1 --interface uplink \
+  --address interface --port-range 20000-60999
+eswitchctl vr nat show --id 1
+```
+
+Representative response:
+
+```text
+OK vr=1 dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP
+nat=enabled mode=snat-pat protocols=tcp,udp interface=uplink address=161.246.6.38 ports=20000-60999 dataplane=ARM_ACTIVE hw-ct=PENDING
+```
+
+`--address interface` resolves to the current uplink RIF address. An explicit
+address is accepted only when it equals that address. The policy performs
+SNAT/PAT for TCP, UDP and ICMP Echo; TCP/UDP sessions are eligible for DOCA
+Flow CT promotion, while ICMP Echo remains on the Arm NAT path.
+The current `protocols=tcp,udp` field describes the port-bearing session types
+eligible for CT promotion; ICMP Echo support is exposed by the NAT contract and
+the `nat_icmp_echo_out`/`nat_icmp_echo_in` counters in `status`.
+
+Disable NAT before deleting the default route, uplink address or uplink RIF:
+
+```bash
+eswitchctl vr nat disable --id 1
+```
+
 ## 6. Idempotency and error semantics
 
-No command is idempotent. Every mutation is create-or-fail, delete-or-fail.
+No mutation command is idempotent. Every mutation is create-or-fail or
+delete-or-fail; query commands are safe to repeat.
 
 | Command | Repeating it on the same object |
 | --- | --- |
 | `vs create`, `vr create` | `ERR`, already exists |
+| `link create` | `ERR`, already exists |
 | `vs delete`, `vr delete` | `ERR`, not found |
-| `vs port attach`, `vr port attach`, `vr switch attach` | `ERR`, already attached or in use |
-| `vs port detach`, `vr port detach`, `vr switch detach` | `ERR`, not attached |
+| `link delete` | `ERR`, not found or endpoints remain attached |
+| `vs port attach`, `vr port attach`, `vr switch attach`, `vr link attach` | `ERR`, already attached or in use |
+| `vs port detach`, `vr port detach`, `vr switch detach`, `vr link detach` | `ERR`, not attached |
 | `vr ip add`, `vr route add`, `vr nat enable` | `ERR`, already exists or already enabled |
 | `vr ip del`, `vr route del`, `vr nat disable` | `ERR`, not found or not enabled |
 | any query | Safe to repeat; no side effects |
@@ -466,8 +601,11 @@ Consequences for an API layer that must be idempotent:
   hardware or persistence stage means the request was rolled back, but a
   `BAD_STATE` or transport failure leaves the outcome unknown until read back.
 
-Reconciliation reads, in order: `status`, `vs show`, `port show`, and
-`vr show --id <id>` per known VR.
+Reconciliation reads, in order: `status`, `vs show`, `port show`,
+`vr show --id <id>` per known VR, `vr route show --id <id>`,
+`vr nat show --id <id>`, and `link show --id <id>` per known link. There is no
+collection-level `vr show` or `link show` command in this revision; the API
+layer must retain the known VR and link IDs in its own desired-state store.
 
 ## 7. Canonical-to-legacy mapping
 
@@ -527,25 +665,33 @@ L2 mutations are staged, programmed, then persisted:
 
 A persistence failure triggers a topology rollback and returns `ERR`.
 
-`vr` mutations are transactional against a candidate configuration:
+`vr` and `link` mutations are transactional against a candidate
+configuration:
 
 1. The candidate is a full copy of the committed configuration. The parser and
    all model checks run on the candidate only, so a rejected command cannot
    modify committed state.
-2. Uplink port attach/detach is applied to the pipeline.
-3. Changed private RIFs have their SF bindings invalidated so the next ARP
+2. Existing hardware CT entries and the software NAT session table are flushed
+   before a topology/routing change so no session can retain a stale zone,
+   adjacency or egress decision.
+3. Uplink port attach/detach is applied to the pipeline.
+4. Changed private RIFs have their SF bindings invalidated so the next ARP
    rebuilds them from the committed configuration.
-4. Hardware routes are synchronized.
-5. The candidate is persisted to `${ESWITCH_STATE_FILE}.router`.
-6. Only then is the candidate published as the committed configuration, and
-   stale NAT sessions for removed policies are flushed.
+5. The current and candidate hardware-safe route plans are compared. Hardware
+   routes are synchronized only when that plan changes; Arm-only uplink,
+   default and router-link routes do not force an HWS transaction.
+6. The candidate is persisted to `${ESWITCH_STATE_FILE}.router`.
+7. Only then is the candidate published as the committed configuration.
 
-If any of steps 2 through 5 fails, the daemon reverses that step and the ones
-before it: hardware routes are resynchronized from the committed configuration,
-an added uplink is detached, and a removed uplink is reattached. The response is
-`ERR` and committed state is unchanged.
+If any of steps 3 through 6 fails, the daemon reverses the corresponding
+topology and hardware-plan changes: hardware routes are resynchronized when
+the plan changed, an added uplink is detached, and a removed uplink is
+reattached. The response is `ERR` and committed configuration is unchanged.
+Flushed CT/NAT sessions are ephemeral and cannot be restored; clients should
+expect active connections to reconnect after any successful or attempted
+router mutation that reaches the transaction stage.
 
-The `rename` in step 5 is the commit point. After a successful `rename` the
+The `rename` in step 6 is the commit point. After a successful `rename` the
 daemon never rolls back only the in-memory copy, because that would diverge
 from the on-disk state a restart would restore.
 
@@ -576,6 +722,9 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | Port | `GET /ports?assigned=false` | `port show` |
 | FDB | `GET /fdb` | `fdb show` |
 | FDB | `GET /fdb?vswitch={id}` | `fdb show --id {id}` |
+| Router link | `POST /router-links` `{"id":L}` | `link create --id L` |
+| Router link | `GET /router-links/{linkId}` | `link show --id {linkId}` |
+| Router link | `DELETE /router-links/{linkId}` | `link delete --id {linkId}` |
 | VR | `GET /routers/{id}` | `vr show --id {id}` |
 | VR | `POST /routers` `{"id":N}` | `vr create --id N` |
 | VR | `DELETE /routers/{id}` | `vr delete --id {id}` |
@@ -583,6 +732,8 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | VR uplink RIF | `DELETE /routers/{id}/interfaces/{name}` | `vr port detach --id {id} --interface {name}` |
 | VR private RIF | `PUT /routers/{id}/interfaces/{name}` `{"vswitch":V}` | `vr switch attach --id {id} --switch-id V --name {name}` |
 | VR private RIF | `DELETE /routers/{id}/interfaces/{name}` | `vr switch detach --id {id} --interface {name}` |
+| VR router-link RIF | `PUT /routers/{id}/interfaces/{name}` `{"routerLink":L}` | `vr link attach --id {id} --link-id L --name {name}` |
+| VR router-link RIF | `DELETE /routers/{id}/interfaces/{name}` | `vr link detach --id {id} --interface {name}` |
 | RIF MAC | `PATCH /routers/{id}/interfaces/{name}` `{"mac":M}` | `vr interface set --id {id} --interface {name} --mac M` |
 | RIF address | `PUT /routers/{id}/interfaces/{name}/addresses/{cidr}` | `vr ip add --id {id} --interface {name} --address {cidr}` |
 | RIF address | `DELETE /routers/{id}/interfaces/{name}/addresses/{cidr}` | `vr ip del --id {id} --interface {name} --address {cidr}` |
@@ -590,7 +741,7 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | Route | `PUT /routers/{id}/routes/{cidr}` `{"via":G,"interface":N}` | `vr route add --id {id} --prefix {cidr} --via G --interface N` |
 | Route | `DELETE /routers/{id}/routes/{cidr}` | `vr route del --id {id} --prefix {cidr}` |
 | NAT | `GET /routers/{id}/nat` | `vr nat show --id {id}` |
-| NAT | `PUT /routers/{id}/nat` | `vr nat enable --id {id} ...` |
+| NAT | `PUT /routers/{id}/nat` `{"interface":N,"address":"interface","portFirst":20000,"portLast":60999}` | `vr nat enable --id {id} --interface N --address interface --port-range 20000-60999` |
 | NAT | `DELETE /routers/{id}/nat` | `vr nat disable --id {id}` |
 
 Mapping rules for an adapter:
@@ -598,17 +749,93 @@ Mapping rules for an adapter:
 - Translate `code=` to a status code with the table in section 3. An `ERR`
   without `code=` is a model rejection and maps to `409 Conflict` when it names
   a dependency or an existing object, otherwise `400 Bad Request`.
-- Because no command is idempotent, a `PUT` handler must read before writing
-  and must treat `ALREADY_EXIST` and `NOT_FOUND` as convergence, per section 6.
+- Because mutation commands are not idempotent, a `PUT` handler must read
+  before writing and must treat `ALREADY_EXIST` and `NOT_FOUND` as convergence,
+  per section 6.
 - Do not expose DPDK port IDs as durable resource identifiers. Key ports by
   `host/pf/vf` from `port show`, and resolve the DPDK ID immediately before
   issuing an attach.
 - Router interface names are the stable, client-chosen keys for RIFs. The
   `ifindex` in `vr show` is daemon-assigned and changes when a RIF is
   recreated.
+- The three interface `PUT` variants are a JSON `oneOf`: exactly one of
+  `port`, `vswitch`, or `routerLink` must be present. For a generic interface
+  `DELETE`, read the interface `type` first and issue the matching
+  `vr port|switch|link detach` command.
 - Serialize your own writes. The daemon serializes execution, but a client that
   fans out concurrent mutations cannot predict which one observes the
   pre-change state.
+
+### 9.1 Request validation and command construction
+
+Do not accept an arbitrary CLI string in the REST body. Decode a typed JSON
+schema, validate it using the rules in section 1.1, then construct exactly one
+canonical command. In particular:
+
+- parse IDs and ports as integers, never as preformatted strings;
+- validate interface names with `^[A-Za-z0-9_-]{1,31}$`;
+- parse and canonicalize IP/CIDR values before interpolation;
+- allow only the literal `interface` or a validated IPv4 address for the NAT
+  address field;
+- enforce `1024 <= portFirst <= portLast <= 65535`;
+- reject newline, carriage return and whitespace in any scalar token.
+
+Example REST request:
+
+```http
+PUT /routers/1/routes/0.0.0.0%2F0
+Content-Type: application/json
+
+{"via":"161.246.6.254","interface":"uplink"}
+```
+
+After validation, the adapter sends this line directly to the Unix socket:
+
+```text
+vr route add --id 1 --prefix 0.0.0.0/0 --via 161.246.6.254 --interface uplink\n
+```
+
+Success can be normalized as:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"routerId":1,"prefix":"0.0.0.0/0","via":"161.246.6.254","interface":"uplink"}
+```
+
+The adapter should read `vr route show --id 1` after mutation and return the
+committed representation rather than translating the human-readable mutation
+message into JSON.
+
+### 9.2 Recommended REST mutation algorithm
+
+For a desired-state `PUT` or `DELETE`:
+
+1. Validate and canonicalize the HTTP input.
+2. Read the owning object with `vr show`, `vr route show`, `vr nat show`,
+   `vs show`, or `link show`.
+3. If the desired state already exists, return the current representation
+   without sending a mutation.
+4. Send one canonical command through the Unix socket and read until EOF.
+5. On `OK`, read back the object and return the committed state.
+6. On `ERR`, re-read before deciding whether the operation converged. Map the
+   error according to section 3; do not retry a hardware/resource error in a
+   tight loop.
+7. Apply a per-DPU write lock around steps 2 through 6. Reads may run without
+   that adapter lock, but the daemon itself still processes them serially.
+
+### 9.3 Parsing limitations relevant to an API implementation
+
+- `port show` is prose. Parse `DPDK port <id> (host=<h> pf=<p> vf=<v>)` and
+  store `host/pf/vf` as the durable identity; resolve the current DPDK ID on
+  every attach.
+- `vr route show` emits `ifindex`, not interface name, for static routes. Join
+  it with the `ifindex` returned by `vr show`.
+- `vs show` is the only collection read for configured topology. VR and
+  router-link IDs must be retained by the REST service or its database.
+- FDB and neighbor/NAT sessions are runtime state, not desired configuration.
+  Do not recreate them through REST after restart.
 
 ## 10. Examples
 
@@ -662,11 +889,106 @@ Raw socket, no `eswitchctl`:
 printf 'vs show --id 100\n' | socat - UNIX-CONNECT:/run/eswitch-management/control.sock
 ```
 
+### 10.1 Two VRs connected by a router-link, with NAT on R1
+
+This is the canonical acceptance topology for the REST adapter:
+
+```text
+VM1 -- VF/VS100 -- R1 -- 10.10.10.0/30 -- R2 -- VS99 -- VM2,VM3
+                       |
+                    uplink/NAT
+                       |
+                 161.246.6.254
+```
+
+The numeric DPDK port IDs below are examples. Resolve them from `port show` on
+the current daemon instance.
+
+```bash
+# L2 domains and VM membership.
+eswitchctl vs create --id 100
+eswitchctl vs port attach --id 100 --port 1
+eswitchctl vs create --id 99
+eswitchctl vs port attach --id 99 --port 2
+eswitchctl vs port attach --id 99 --port 3
+
+# Routers and private gateway RIFs.
+eswitchctl vr create --id 1
+eswitchctl vr switch attach --id 1 --switch-id 100 --name SW100
+eswitchctl vr interface set --id 1 --interface SW100 --mac 02:00:00:01:00:01
+eswitchctl vr ip add --id 1 --interface SW100 --address 192.168.100.1/24
+
+eswitchctl vr create --id 2
+eswitchctl vr switch attach --id 2 --switch-id 99 --name SW99
+eswitchctl vr interface set --id 2 --interface SW99 --mac 02:00:00:02:00:01
+eswitchctl vr ip add --id 2 --interface SW99 --address 192.168.200.1/24
+
+# Point-to-point router-link.
+eswitchctl link create --id 10
+eswitchctl vr link attach --id 1 --link-id 10 --name r1-r2
+eswitchctl vr link attach --id 2 --link-id 10 --name r2-r1
+eswitchctl vr interface set --id 1 --interface r1-r2 --mac 02:00:00:01:00:02
+eswitchctl vr interface set --id 2 --interface r2-r1 --mac 02:00:00:02:00:02
+eswitchctl vr ip add --id 1 --interface r1-r2 --address 10.10.10.1/30
+eswitchctl vr ip add --id 2 --interface r2-r1 --address 10.10.10.2/30
+
+# Routes between private networks.
+eswitchctl vr route add --id 1 --prefix 192.168.200.0/24 \
+  --via 10.10.10.2 --interface r1-r2
+eswitchctl vr route add --id 2 --prefix 192.168.100.0/24 \
+  --via 10.10.10.1 --interface r2-r1
+
+# R1 public uplink, default route and NAT.
+eswitchctl vr port attach --id 1 --port 7 --name uplink
+eswitchctl vr interface set --id 1 --interface uplink --mac 02:00:00:01:00:03
+eswitchctl vr ip add --id 1 --interface uplink --address 161.246.6.38/16
+eswitchctl vr route add --id 1 --prefix 0.0.0.0/0 \
+  --via 161.246.6.254 --interface uplink
+eswitchctl vr nat enable --id 1 --interface uplink --address interface \
+  --port-range 20000-60999
+
+# R2 reaches the Internet through R1; R1 performs NAT at its uplink.
+eswitchctl vr route add --id 2 --prefix 0.0.0.0/0 \
+  --via 10.10.10.1 --interface r2-r1
+
+# Read-back/acceptance checks.
+eswitchctl vs show
+eswitchctl link show --id 10
+eswitchctl vr show --id 1
+eswitchctl vr route show --id 1
+eswitchctl vr nat show --id 1
+eswitchctl vr show --id 2
+eswitchctl vr route show --id 2
+eswitchctl status
+```
+
+VM configuration used by the acceptance test:
+
+```bash
+# VM1
+ip addr add 192.168.100.10/24 dev <vm-data-interface>
+ip route replace default via 192.168.100.1 dev <vm-data-interface>
+
+# VM2/VM3 use unique addresses from 192.168.200.0/24.
+ip addr add 192.168.200.10/24 dev <vm-data-interface>
+ip route replace default via 192.168.200.1 dev <vm-data-interface>
+```
+
+Acceptance checks are VM1-to-VM2 ping in both directions, ping to each local
+gateway, and TCP/ICMP traffic from both private subnets through R1's NAT. The
+first packet may be delayed by ARP/neighbor resolution; subsequent packets
+should use the resolved Arm path and eligible private routes/sessions may be
+promoted to hardware.
+
 ## 11. Data plane limits
 
 - One untagged bridge domain per vSwitch.
 - At most 254 ports per vSwitch.
 - At most 64 vSwitches and 64 VRs.
+- At most 128 logical router-links, exactly two endpoints per completed link,
+  and at most 256 total RIFs across all VRs.
+- At most 512 static routes. Router-link forwarding is limited to 8 logical
+  hops as a loop guard.
 - One public uplink RIF per VR, one IPv4 address per RIF, one NAT policy per VR.
 - NAT is SNAT/PAT for TCP, UDP and ICMP Echo. The first packet is translated on
   Arm. With `ESWITCH_HW_CT=1`, TCP/UDP sessions are then installed atomically
