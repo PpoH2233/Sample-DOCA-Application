@@ -1,0 +1,335 @@
+#!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+##############################################################################
+# mock-eswitchctl - offline stand-in for the BlueField `eswitchctl` client.
+#
+# Emulates the eswitch-management control contract (CLI.md) against a flat
+# state directory so the dpu-eswitch extension wrapper can be exercised
+# without hardware.  Every command is appended to <state>/commands.log.
+#
+# State files:
+#   <state>/vs-<id>  -> comma-separated member DPDK port ids
+#   <state>/vr-<id>  -> "<name> ifindex=N type=... mac=... address=..." RIF
+#                       lines plus "route static <pfx> via <gw> if <name>"
+#                       and "nat enabled <ports>" lines
+##############################################################################
+
+set -u
+
+MOCK_STATE="${MOCK_STATE:?MOCK_STATE not set}"
+mkdir -p "${MOCK_STATE}"
+printf '%s\n' "$*" >> "${MOCK_STATE}/commands.log"
+
+vsf() { printf '%s/vs-%s' "${MOCK_STATE}" "$1"; }
+vrf() { printf '%s/vr-%s' "${MOCK_STATE}" "$1"; }
+err() { printf 'ERR %s\n' "$1"; exit 1; }
+
+opt() {
+    local want="$1"
+    shift
+    while [ $# -ge 2 ]; do
+        if [ "$1" = "${want}" ]; then
+            printf '%s' "$2"
+            return 0
+        fi
+        shift 1
+    done
+    printf ''
+}
+
+rif_port_owner() {
+    # port in use by another VR? prints the vr file or nothing
+    grep -rl "type=port-link .*vf=${1}" "${MOCK_STATE}" 2>/dev/null | grep -v "^$2\$" | head -n1
+}
+
+if [ -z "$1" ]; then
+    err "missing command"
+fi
+
+case "$1" in
+    status)
+        printf 'OK\n'
+        printf 'service=eSwitch Management state=running uptime=9s\n'
+        printf 'ports=4 assignable=3 assigned=1 available=2 vswitches=0 fdb=0\n'
+        exit 0 ;;
+esac
+
+if [ "$1" = "port" ] && [ "$2" = "show" ]; then
+    printf 'OK\n'
+    printf 'DPDK port 0 (uplink/parent)\n'
+    printf 'DPDK port 1 (host=1 pf=0 vf=1)\n'
+    printf 'DPDK port 2 (host=1 pf=0 vf=2)\n'
+    printf 'DPDK port 3 (host=1 pf=0 vf=3)\n'
+    exit 0
+fi
+
+if [ "$1" = "vs" ]; then
+    case "$2" in
+        show)
+            id=$(opt --id "$@")
+            if [ -z "${id}" ]; then
+                printf 'OK\n'
+                for f in "${MOCK_STATE}"/vs-*; do
+                    [ -f "${f}" ] || continue
+                    vid="${f##*/vs-}"
+                    printf 'vs=%s ports=[%s]\n' "${vid}" "$(cat "${f}")"
+                done
+                exit 0
+            fi
+            f=$(vsf "${id}")
+            [ -f "${f}" ] || err "code=4 message=vSwitch not found"
+            printf 'OK\n'
+            printf 'vs=%s ports=[%s]\n' "${id}" "$(cat "${f}")"
+            exit 0 ;;
+        create)
+            id=$(opt --id "$@")
+            f=$(vsf "${id}")
+            [ -f "${f}" ] && err "code=10 message=vSwitch exists"
+            : > "${f}"
+            printf 'OK\n'
+            exit 0 ;;
+        delete)
+            id=$(opt --id "$@")
+            f=$(vsf "${id}")
+            [ -f "${f}" ] || err "code=4 message=vSwitch not found"
+            rm -f "${f}"
+            printf 'OK\n'
+            exit 0 ;;
+        port)
+            case "$3" in
+                attach)
+                    id=$(opt --id "$@")
+                    port=$(opt --port "$@")
+                    f=$(vsf "${id}")
+                    [ -f "${f}" ] || err "code=4 message=vSwitch not found"
+                    members="$(cat "${f}")"
+                    printf ',%s,' "${members}" | grep -q ",${port}," && \
+                        err "code=7 message=port already attached"
+                    if [ -z "${members}" ]; then
+                        printf '%s' "${port}" > "${f}"
+                    else
+                        printf '%s,%s' "${members}" "${port}" > "${f}"
+                    fi
+                    printf 'OK\n'
+                    exit 0 ;;
+                detach)
+                    id=$(opt --id "$@")
+                    port=$(opt --port "$@")
+                    f=$(vsf "${id}")
+                    [ -f "${f}" ] || err "code=4 message=vSwitch not found"
+                    members="$(cat "${f}")"
+                    printf ',%s,' "${members}" | grep -q ",${port}," || \
+                        err "code=4 message=port not attached"
+                    rest="$(printf '%s' "${members}" | tr ',' '\n' | grep -vx "${port}" | paste -sd, -)"
+                    printf '%s' "${rest}" > "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        *)
+            err "code=2 message=Invalid input" ;;
+    esac
+fi
+
+if [ "$1" = "vr" ]; then
+    case "$2" in
+        create)
+            id=$(opt --id "$@")
+            f=$(vrf "${id}")
+            [ -f "${f}" ] && err "router exists"
+            : > "${f}"
+            printf 'OK\n'
+            exit 0 ;;
+        show)
+            id=$(opt --id "$@")
+            f=$(vrf "${id}")
+            [ -f "${f}" ] || err "router ${id} not found"
+            printf 'OK vr=%s dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP\n' "${id}"
+            cat "${f}"
+            exit 0 ;;
+        delete)
+            id=$(opt --id "$@")
+            f=$(vrf "${id}")
+            [ -f "${f}" ] || err "router ${id} not found"
+            grep -q '^rif ' "${f}" && err "router ${id} has interfaces"
+            rm -f "${f}"
+            printf 'OK\n'
+            exit 0 ;;
+        switch)
+            case "$3" in
+                attach)
+                    id=$(opt --id "$@")
+                    vs=$(opt --switch-id "$@")
+                    name=$(opt --name "$@")
+                    f=$(vrf "${id}")
+                    [ -f "${f}" ] || err "router ${id} not found"
+                    [ -f "$(vsf "${vs}")" ] || err "code=4 message=vSwitch not found"
+                    grep -qE "^${name} " "${f}" && err "already attached"
+                    printf '%s ifindex=%d type=vs-link switch=%s mac=- address=- status=ARM\n' \
+                        "${name}" "$(( $(wc -l < "${f}") + 1 ))" "${vs}" >> "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                detach)
+                    id=$(opt --id "$@")
+                    name=$(opt --interface "$@")
+                    f=$(vrf "${id}")
+                    grep -qE "^${name} " "${f}" || err "interface ${name} not attached"
+                    sed -i "\|^${name} |d" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        port)
+            case "$3" in
+                attach)
+                    id=$(opt --id "$@")
+                    port=$(opt --port "$@")
+                    name=$(opt --name "$@")
+                    f=$(vrf "${id}")
+                    [ -f "${f}" ] || err "router ${id} not found"
+                    owner=$(rif_port_owner "${port}" "${f}")
+                    [ -n "${owner}" ] && err "code=7 message=port reserved by ${owner}"
+                    grep -qE "^${name} " "${f}" && err "already attached"
+                    printf '%s ifindex=%d type=port-link host=1 pf=0 vf=%s mac=- address=- status=ARM\n' \
+                        "${name}" "$(( $(wc -l < "${f}") + 1 ))" "${port}" >> "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                detach)
+                    id=$(opt --id "$@")
+                    name=$(opt --interface "$@")
+                    f=$(vrf "${id}")
+                    grep -qE "^${name} " "${f}" || err "interface ${name} not attached"
+                    sed -i "\|^${name} |d" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        interface)
+            case "$3" in
+                set)
+                    id=$(opt --id "$@")
+                    name=$(opt --interface "$@")
+                    mac=$(opt --mac "$@")
+                    f=$(vrf "${id}")
+                    grep -qE "^${name} " "${f}" || err "interface ${name} not found"
+                    sed -i "\|^${name} |s|mac=[^ ]*|mac=${mac}|" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        ip)
+            f=$(vrf "$(opt --id "$@")")
+            case "$3" in
+                add)
+                    name=$(opt --interface "$@")
+                    addr=$(opt --address "$@")
+                    grep -qE "^${name} .*address=${addr} " "${f}" && err "address ${addr} exists"
+                    grep -qE "^${name} .*address=[0-9]" "${f}" && err "one address per interface"
+                    sed -i "\|^${name} |s|address=-|address=${addr}|" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                del)
+                    name=$(opt --interface "$@")
+                    addr=$(opt --address "$@")
+                    grep -qE "^${name} .*address=${addr} " "${f}" || err "address ${addr} not found"
+                    sed -i "\|^${name} |s|address=${addr}|address=-|" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        route)
+            case "$3" in
+                add)
+                    id=$(opt --id "$@")
+                    pfx=$(opt --prefix "$@")
+                    via=$(opt --via "$@")
+                    ifc=$(opt --interface "$@")
+                    f=$(vrf "${id}")
+                    grep -qF "route static ${pfx} " "${f}" && err "route ${pfx} exists"
+                    printf 'route static %s via %s if %s\n' "${pfx}" "${via}" "${ifc}" >> "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                del)
+                    id=$(opt --id "$@")
+                    pfx=$(opt --prefix "$@")
+                    f=$(vrf "${id}")
+                    grep -qF "route static ${pfx} " "${f}" || err "route ${pfx} not found"
+                    sed -i "\|^route static ${pfx} |d" "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                show)
+                    id=$(opt --id "$@")
+                    f=$(vrf "${id}")
+                    [ -f "${f}" ] || err "router ${id} not found"
+                    printf 'OK vr=%s dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP\n' "${id}"
+                    sed -n 's/^route static \([^ ]*\) via \([^ ]*\) if \([^ ]*\)$/static \1 via=\2 ifindex=\3/p' "${f}"
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        nat)
+            case "$3" in
+                enable)
+                    id=$(opt --id "$@")
+                    ifc=$(opt --interface "$@")
+                    rng=$(opt --port-range "$@")
+                    f=$(vrf "${id}")
+                    grep -q '^nat enabled' "${f}" && err "nat already enabled"
+                    grep -qE "^${ifc} .*type=port-link" "${f}" || err "interface ${ifc} is not a port-link"
+                    grep -qE "^${ifc} .*address=[0-9]" "${f}" || err "interface ${ifc} has no address"
+                    grep -qE '^route static 0.0.0.0/0 ' "${f}" || err "no default route through ${ifc}"
+                    printf 'nat enabled %s\n' "${rng}" >> "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                disable)
+                    id=$(opt --id "$@")
+                    f=$(vrf "${id}")
+                    grep -q '^nat enabled' "${f}" || err "nat not enabled"
+                    sed -i '\|^nat enabled|d' "${f}"
+                    printf 'OK\n'
+                    exit 0 ;;
+                show)
+                    id=$(opt --id "$@")
+                    f=$(vrf "${id}")
+                    [ -f "${f}" ] || err "router ${id} not found"
+                    printf 'OK vr=%s dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP\n' "${id}"
+                    if grep -q '^nat enabled ' "${f}"; then
+                        addr=$(sed -n 's/^\(rif\)\?uplink .*address=\([^ ]*\).*$/\2/p' "${f}" | head -n1)
+                        [ -z "${addr}" ] && addr=$(grep '^uplink ' "${f}" | grep -oE 'address=[^ ]*' | cut -d= -f2)
+                        pr=$(grep '^nat enabled ' "${f}" | awk '{print $3}')
+                        printf 'nat=enabled mode=snat-pat protocols=tcp,udp interface=uplink address=%s ports=%s\n' "${addr}" "${pr}"
+                    else
+                        printf 'nat=disabled\n'
+                    fi
+                    exit 0 ;;
+                *)
+                    err "code=2 message=Invalid input" ;;
+            esac ;;
+        *)
+            err "code=2 message=Invalid input" ;;
+    esac
+fi
+
+printf 'ERR unknown command: %s\n' "$*" >&2
+exit 1
