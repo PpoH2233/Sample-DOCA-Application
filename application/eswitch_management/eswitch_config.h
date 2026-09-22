@@ -6,7 +6,11 @@
 #define ESWITCH_SOCKET_PATH "/run/eswitch-management/control.sock"
 #define ESWITCH_STATE_PATH "/var/lib/eswitch-management/eswitch.conf"
 #define ESWITCH_MAX_VSWITCHES 64U
-#define ESWITCH_MAX_PERSISTED_MEMBERS 4096U
+#define ESWITCH_MAX_VLAN_MEMBERSHIPS 512U
+/* Persistence and the runtime pipeline must enforce the same limit.  Apart
+ * from rejecting an unrestorable configuration, a larger persistence-only
+ * table makes every ARM slow-path membership lookup scan thousands of slots. */
+#define ESWITCH_MAX_PERSISTED_MEMBERS ESWITCH_MAX_VLAN_MEMBERSHIPS
 #define ESWITCH_RESPONSE_SIZE (128U * 1024U)
 #define ESWITCH_HW_ROUTE_DEFAULT_CAPACITY 1024U
 #define ESWITCH_HW_ROUTE_MIN_CAPACITY 64U

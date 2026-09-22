@@ -10,8 +10,9 @@
 
 #define ROUTER_HW_MAX_ROUTES (ROUTER_MAX_NEIGHBORS + ROUTER_MAX_ROUTES)
 
-/* A resolved, hardware-safe route. Public port-links are deliberately absent:
- * packets that may require NAT remain on the Arm dataplane. */
+/* A resolved, hardware-safe route. Any NAT-policy interface is deliberately
+ * absent (port-link or VLAN-backed vs-link): packets that may require address
+ * translation must remain on the Arm/CT dataplane. */
 struct router_hw_route {
   uint16_t vr_id;
   uint16_t egress_interface_id;

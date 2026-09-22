@@ -61,6 +61,13 @@ int main(void) {
   accept_id("vs delete --id 100\n", ESWITCH_CLI_VS_DELETE, 100, false);
   accept_port("vs port attach --id 100 --port 1\n",
               ESWITCH_CLI_VS_PORT_ATTACH, 100, 1, false);
+  {
+    struct eswitch_cli_command trunk = line(
+        "vs port attach --id 100 --port 0 --mode trunk --vlan 6\n", true);
+    assert(trunk.verb == ESWITCH_CLI_VS_PORT_ATTACH);
+    assert(trunk.port_mode == ESWITCH_PORT_MODE_TRUNK);
+    assert(trunk.has_vlan && trunk.vlan_id == 6);
+  }
   accept_port("vs port detach --id 100 --port 1\n",
               ESWITCH_CLI_VS_PORT_DETACH, 100, 1, false);
   /* Named options are order independent. */
@@ -132,6 +139,12 @@ int main(void) {
   reject("vs remove --id 100\n");
   reject("vs port\n");
   reject("vs port attach --id 100\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk\n");
+  reject("vs port attach --id 100 --port 0 --mode access --vlan 6\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 0\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 4095\n");
+  reject("vs port detach --id 100 --port 0 --mode trunk --vlan 6\n");
+  reject("vs-port-detach --id 100 --port 0 --vlan 6\n");
   reject("vs port attach --id 0 --port 1\n");
   reject("vs port attach --port 1\n");
   reject("vs port connect --id 100 --port 1\n");

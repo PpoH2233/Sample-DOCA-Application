@@ -8,6 +8,7 @@
 #include <doca_error.h>
 
 #include "eswitch_config.h"
+#include "eswitch_vlan.h"
 
 enum eswitch_state_port_kind {
   ESWITCH_STATE_PORT_PARENT,
@@ -20,6 +21,8 @@ struct eswitch_state_member {
   uint32_t host_index;
   uint32_t pf_index;
   uint32_t vf_index;
+  enum eswitch_port_mode mode;
+  uint16_t vlan_id;
 };
 
 struct eswitch_state {

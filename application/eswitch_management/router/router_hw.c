@@ -16,6 +16,14 @@ static const struct router_interface *interface_by_id(
   return NULL;
 }
 
+static bool interface_is_nat_egress(const struct router_config *config,
+                                    const struct router_interface *rif) {
+  const struct router_nat_policy *policy;
+
+  policy = router_nat_policy_find(config, rif->vr_id);
+  return policy != NULL && policy->interface_id == rif->interface_id;
+}
+
 static bool static_route_wins(const struct router_config *config,
                               const struct router_interface *connected,
                               uint32_t destination) {
@@ -80,7 +88,8 @@ size_t router_hw_routes_build(const struct router_config *config,
     egress = interface_by_id(config, neighbor->vr_id,
                              neighbor->interface_id);
     if (egress == NULL || egress->attachment != ROUTER_VSWITCH ||
-        !egress->has_address || static_route_wins(config, egress, neighbor->ip))
+        !egress->has_address || interface_is_nat_egress(config, egress) ||
+        static_route_wins(config, egress, neighbor->ip))
       continue;
     if (!append_route(routes, capacity, &count, egress, neighbor,
                       neighbor->ip, 32))
@@ -96,7 +105,7 @@ size_t router_hw_routes_build(const struct router_config *config,
     const struct router_neighbor *neighbor;
 
     if (egress == NULL || egress->attachment != ROUTER_VSWITCH ||
-        !egress->has_address)
+        !egress->has_address || interface_is_nat_egress(config, egress))
       continue;
     neighbor = router_neighbor_lookup(neighbors, configured->vr_id,
                                       configured->interface_id,

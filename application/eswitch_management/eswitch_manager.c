@@ -177,7 +177,7 @@ static doca_error_t manager_to_state(const struct eswitch_manager *manager,
                                      struct eswitch_state *state) {
   doca_error_t result;
 
-  result = eswitch_state_init(manager->ports->count, state);
+  result = eswitch_state_init(ESWITCH_MAX_PERSISTED_MEMBERS, state);
   if (result != DOCA_SUCCESS)
     return result;
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
@@ -187,13 +187,18 @@ static doca_error_t manager_to_state(const struct eswitch_manager *manager,
     if (result != DOCA_SUCCESS)
       return result;
   }
-  for (uint16_t i = 0; i < manager->ports->count; i++) {
-    const struct ethernet_port *port = manager->ports->items[i].ethernet;
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    const struct eswitch_port_membership *configured =
+        &manager->memberships[i];
+    const struct ethernet_port *port;
     struct eswitch_state_member member = {0};
 
-    if (manager->port_owner[i] == 0)
+    if (!configured->active)
       continue;
-    member.vswitch_id = manager->port_owner[i];
+    port = manager->ports->items[configured->port_index].ethernet;
+    member.vswitch_id = configured->vswitch_id;
+    member.mode = configured->mode;
+    member.vlan_id = configured->vlan_id;
     if (port->role == ETHERNET_PORT_ROLE_PARENT) {
       member.kind = ESWITCH_STATE_PORT_PARENT;
     } else {
@@ -278,7 +283,8 @@ static doca_error_t restore_manager(struct eswitch_manager *manager) {
     }
     result = attach_port(
         manager, state.members[i].vswitch_id,
-        manager->ports->items[port_index].ethernet->port_id);
+        manager->ports->items[port_index].ethernet->port_id,
+        state.members[i].mode, state.members[i].vlan_id);
     if (result != DOCA_SUCCESS)
       goto out;
   }
@@ -306,8 +312,11 @@ static doca_error_t create_vswitch_persisted(struct eswitch_manager *manager,
 
 static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t vswitch_id,
-                                          uint16_t port_id) {
-  doca_error_t result = attach_port(manager, vswitch_id, port_id);
+                                          uint16_t port_id,
+                                          enum eswitch_port_mode mode,
+                                          uint16_t vlan_id) {
+  doca_error_t result = attach_port(manager, vswitch_id, port_id, mode,
+                                    vlan_id);
 
   if (result == DOCA_SUCCESS) {
     doca_error_t save_result = persist_manager(manager);
@@ -322,6 +331,8 @@ static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
 static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t vswitch_id,
                                           uint16_t port_id) {
+  enum eswitch_port_mode old_mode = ESWITCH_PORT_MODE_ACCESS;
+  uint16_t old_vlan = 0;
   int port_index;
   doca_error_t result;
 
@@ -332,8 +343,17 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
   port_index = find_port_index(manager, port_id);
   if (port_index < 0)
     return DOCA_ERROR_NOT_FOUND;
-  if (manager->port_owner[port_index] != vswitch_id)
+  if (!eswitch_port_in_vswitch(manager, vswitch_id, port_id))
     return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    const struct eswitch_port_membership *member = &manager->memberships[i];
+    if (member->active && member->vswitch_id == vswitch_id &&
+        member->port_id == port_id) {
+      old_mode = member->mode;
+      old_vlan = member->vlan_id;
+      break;
+    }
+  }
 
   result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
 
@@ -345,7 +365,8 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
   if (result == DOCA_SUCCESS) {
     doca_error_t save_result = persist_manager(manager);
     if (save_result != DOCA_SUCCESS) {
-      doca_error_t rollback = attach_port(manager, vswitch_id, port_id);
+      doca_error_t rollback = attach_port(manager, vswitch_id, port_id,
+                                          old_mode, old_vlan);
       return rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
@@ -354,19 +375,19 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
 
 static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
                                              uint16_t id) {
-  uint16_t *member_ports;
+  struct eswitch_port_membership *members;
   uint16_t member_count = 0;
   doca_error_t result;
 
   if (find_vswitch(manager, id) == NULL)
     return DOCA_ERROR_NOT_FOUND;
-  member_ports = calloc(manager->ports->count, sizeof(*member_ports));
-  if (member_ports == NULL)
+  members = calloc(ESWITCH_MAX_VLAN_MEMBERSHIPS, sizeof(*members));
+  if (members == NULL)
     return DOCA_ERROR_NO_MEMORY;
-  for (uint16_t i = 0; i < manager->ports->count; i++) {
-    if (manager->port_owner[i] == id)
-      member_ports[member_count++] =
-          manager->ports->items[i].ethernet->port_id;
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    if (manager->memberships[i].active &&
+        manager->memberships[i].vswitch_id == id)
+      members[member_count++] = manager->memberships[i];
   }
 
   result = delete_vswitch(manager, id);
@@ -375,11 +396,12 @@ static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
     if (save_result != DOCA_SUCCESS) {
       doca_error_t rollback = create_vswitch(manager, id);
       for (uint16_t i = 0; rollback == DOCA_SUCCESS && i < member_count; i++)
-        rollback = attach_port(manager, id, member_ports[i]);
+        rollback = attach_port(manager, id, members[i].port_id,
+                               members[i].mode, members[i].vlan_id);
       result = rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
-  free(member_ports);
+  free(members);
   return result;
 }
 
@@ -478,8 +500,9 @@ doca_error_t eswitch_manager_hw_routes_sync(
    * This closes the stale-adjacency window across port moves. */
   for (size_t i = 0; i < route_count;) {
     int index = find_port_index(manager, routes[i].target_port_id);
-    if (index >= 0 && manager->port_owner[index] ==
-                          routes[i].egress_vswitch_id) {
+    if (index >= 0 && eswitch_port_in_vswitch(
+                          manager, routes[i].egress_vswitch_id,
+                          routes[i].target_port_id)) {
       i++;
       continue;
     }
@@ -530,8 +553,7 @@ static doca_error_t reply_gateway_arp(struct eswitch_manager *manager,
   manager->arp_built++;
   int index = find_port_index(manager, ingress);
   if (index < 0 || ingress == UINT16_MAX ||
-      manager->port_owner[index] != vs ||
-      manager->ports->items[index].ethernet->role != ETHERNET_PORT_ROLE_REPRESENTOR ||
+      !eswitch_port_in_vswitch(manager, vs, ingress) ||
       manager->sf_io == NULL || !manager->sf_io->started) {
     manager->arp_target_drops++;
     manager->arp_tx_drops++;
@@ -656,7 +678,8 @@ static bool validate_route_neighbor(
   if (port_index < 0)
     return false;
   if (egress->attachment == ROUTER_VSWITCH)
-    return manager->port_owner[port_index] == egress->vswitch_id;
+    return eswitch_port_in_vswitch(manager, egress->vswitch_id,
+                                   neighbor->port_id);
 
   return port_index == find_router_interface_port_index(manager, egress);
 }
@@ -842,7 +865,7 @@ static void route_arm_local_reply(struct eswitch_manager *manager,
   }
   int ingress_index=find_port_index(manager,ingress_port);
   if(ingress->attachment!=ROUTER_VSWITCH || ingress_index<0 ||
-     manager->port_owner[ingress_index]!=ingress->vswitch_id) {
+     !eswitch_port_in_vswitch(manager,ingress->vswitch_id,ingress_port)) {
     manager->icmp_tx_drops++;
     free(response);
     return;
@@ -933,10 +956,11 @@ static void route_arm_frame(struct eswitch_manager *manager,
   }
 
   forward_frame = frame;
-  if (egress->attachment == ROUTER_PORT) {
-    nat_policy = router_nat_policy_find(manager->router, decision.vr_id);
-    if (nat_policy == NULL ||
-        nat_policy->interface_id != egress->interface_id) {
+  nat_policy = router_nat_policy_find(manager->router, decision.vr_id);
+  if (egress->attachment == ROUTER_PORT ||
+      (nat_policy != NULL &&
+       nat_policy->interface_id == egress->interface_id)) {
+    if (nat_policy == NULL || nat_policy->interface_id != egress->interface_id) {
       manager->route_tx_drops++;
       fprintf(stderr,
               "NAT OUT DROP: vr=%u egress-rif=%u reason=no-active-policy\n",
@@ -1032,8 +1056,10 @@ static void route_arm_frame(struct eswitch_manager *manager,
 
     if (inside_rif != NULL) {
       result = eswitch_pipeline_ct_promote(
-          manager->pipeline, nat_session, neighbor->port_id, egress->mac,
-          neighbor->mac, nat_session->inside.port_id, inside_rif->mac,
+          manager->pipeline, nat_session,
+          egress->attachment == ROUTER_VSWITCH ? egress->vswitch_id : 0,
+          neighbor->port_id, egress->mac, neighbor->mac,
+          inside_rif->vswitch_id, nat_session->inside.port_id, inside_rif->mac,
           nat_session->inside.mac);
       if (result != DOCA_SUCCESS && manager->packet_debug)
         fprintf(stderr, "NAT CT PROMOTION DEFERRED: vr=%u proto=%u "
@@ -1046,6 +1072,11 @@ out:
   free(output);
   free(translated);
 }
+
+static void route_uplink_ipv4_packet(
+    struct eswitch_manager *manager, struct rte_mbuf *packet,
+    const struct router_interface *ingress, uint16_t ingress_port,
+    uint64_t now_ns);
 
 static void route_ipv4_packet(struct eswitch_manager *manager,
                               struct rte_mbuf *packet, uint16_t ingress_vs,
@@ -1063,8 +1094,20 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
        candidate->vswitch_id==ingress_vs && candidate->has_address &&
        !memcmp(frame,candidate->mac,6)) {ingress=candidate;break;}
   }
-  if(ingress!=NULL)
+  if(ingress!=NULL) {
+    const struct router_nat_policy *policy =
+        router_nat_policy_find(manager->router, ingress->vr_id);
+    if (policy != NULL && policy->interface_id == ingress->interface_id) {
+      /* A packet arriving on the public NAT interface is always consumed by
+       * reverse NAT.  A reverse miss is a firewall drop, not permission to
+       * fall through into ordinary VR routing. */
+      route_uplink_ipv4_packet(manager, packet, ingress, ingress_port,
+                               now_ns);
+      free(scratch);
+      return;
+    }
     route_arm_frame(manager,frame,length,ingress,ingress_port,0,0,now_ns);
+  }
   free(scratch);
 }
 
@@ -1117,6 +1160,9 @@ static void route_uplink_ipv4_packet(
          (session->inside_ip >> 16) & 0xffU,
          (session->inside_ip >> 8) & 0xffU, session->inside_ip & 0xffU,
          session->inside_port,session->inside.interface_id);
+  free(translated);
+  free(scratch);
+  return;
 out:
   free(translated);
   free(scratch);
@@ -1136,10 +1182,12 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
 
   eswitch_metadata_decode(metadata, &domain_id, &port_id);
   port_index = find_port_index(manager, port_id);
-  if (port_index >= 0 && manager->port_owner[port_index] != domain_id)
+  if (port_index >= 0 &&
+      !eswitch_port_in_vswitch(manager, domain_id, port_id))
     uplink = find_router_port_interface(manager, port_id, domain_id);
   if (domain_id == 0 || port_index < 0 ||
-      (manager->port_owner[port_index] != domain_id && uplink == NULL)) {
+      (!eswitch_port_in_vswitch(manager, domain_id, port_id) &&
+       uplink == NULL)) {
     fprintf(stderr,
             "Discarding ARM copy with stale/invalid metadata: value=%" PRIu32
             "\n",
@@ -1358,8 +1406,12 @@ static size_t format_status(const struct eswitch_manager *manager,
     if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
       continue;
     assignable_port_count++;
-    assigned_count += (manager->port_owner[i] != 0 ||
-                       router_control_port_reserved(manager, i)) ? 1U : 0U;
+    bool member = false;
+    for (size_t j = 0; j < ESWITCH_MAX_PERSISTED_MEMBERS; j++)
+      member |= manager->memberships[j].active &&
+                manager->memberships[j].port_index == i;
+    assigned_count += (member || router_control_port_reserved(manager, i))
+                          ? 1U : 0U;
   }
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     const struct eswitch_sf_return_context *context =
@@ -1601,11 +1653,17 @@ static size_t format_vswitches(const struct eswitch_manager *manager,
     if (filter != 0 && vs->id != filter)
       continue;
     used = append_text(response, size, used, "vs=%u ports=[", vs->id);
-    for (uint16_t i = 0; i < manager->ports->count; i++) {
-      if (manager->port_owner[i] != vs->id)
+    for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+      const struct eswitch_port_membership *member = &manager->memberships[i];
+      if (!member->active || member->vswitch_id != vs->id)
         continue;
-      used = append_text(response, size, used, "%s%u", first ? "" : ",",
-                         manager->ports->items[i].ethernet->port_id);
+      if (member->mode == ESWITCH_PORT_MODE_TRUNK)
+        used = append_text(response, size, used,
+                           "%s%u:trunk/vlan=%u", first ? "" : ",",
+                           member->port_id, member->vlan_id);
+      else
+        used = append_text(response, size, used, "%s%u:access",
+                           first ? "" : ",", member->port_id);
       first = false;
     }
     used = append_text(response, size, used, "]\n");
@@ -1625,7 +1683,20 @@ static size_t format_available_ports(const struct eswitch_manager *manager,
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
     if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
       continue;
-    if (manager->port_owner[i] != 0 || router_control_port_reserved(manager, i))
+    bool access_member = false;
+    bool trunk_member = false;
+    for (size_t j = 0; j < ESWITCH_MAX_PERSISTED_MEMBERS; j++) {
+      const struct eswitch_port_membership *member = &manager->memberships[j];
+      if (!member->active || member->port_index != i)
+        continue;
+      access_member |= member->mode == ESWITCH_PORT_MODE_ACCESS;
+      trunk_member |= member->mode == ESWITCH_PORT_MODE_TRUNK;
+    }
+    /* A parent port remains selectable after its first trunk membership: the
+     * same physical trunk can carry another VLAN into another VS. Access
+     * ports and VF representors remain exclusive. */
+    if (access_member || router_control_port_reserved(manager, i) ||
+        (trunk_member && port->role != ETHERNET_PORT_ROLE_PARENT))
       continue;
     if (port->role == ETHERNET_PORT_ROLE_PARENT) {
       used = append_text(response, size, used,
@@ -1698,7 +1769,8 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     }
     result = delete_vswitch_persisted(manager, parsed.id);
   } else if (parsed.verb == ESWITCH_CLI_VS_PORT_ATTACH) {
-    result = attach_port_persisted(manager, parsed.id, parsed.port_id);
+    result = attach_port_persisted(manager, parsed.id, parsed.port_id,
+                                   parsed.port_mode, parsed.vlan_id);
   } else if (parsed.verb == ESWITCH_CLI_VS_PORT_DETACH) {
     result = detach_port_persisted(manager, parsed.id, parsed.port_id);
   } else {

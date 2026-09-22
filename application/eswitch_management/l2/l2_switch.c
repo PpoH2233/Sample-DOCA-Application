@@ -23,6 +23,28 @@ static int find_port_index(const struct eswitch_manager *manager,
   return -1;
 }
 
+static struct eswitch_port_membership *find_membership(
+    struct eswitch_manager *manager, uint16_t vswitch_id, uint16_t port_id) {
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    struct eswitch_port_membership *member = &manager->memberships[i];
+    if (member->active && member->vswitch_id == vswitch_id &&
+        member->port_id == port_id)
+      return member;
+  }
+  return NULL;
+}
+
+bool eswitch_port_in_vswitch(const struct eswitch_manager *manager,
+                             uint16_t vswitch_id, uint16_t port_id) {
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    const struct eswitch_port_membership *member = &manager->memberships[i];
+    if (member->active && member->vswitch_id == vswitch_id &&
+        member->port_id == port_id)
+      return true;
+  }
+  return false;
+}
+
 doca_error_t create_vswitch(struct eswitch_manager *manager,
                                    uint16_t id) {
   if (id == 0)
@@ -41,8 +63,10 @@ doca_error_t create_vswitch(struct eswitch_manager *manager,
 }
 
 doca_error_t attach_port(struct eswitch_manager *manager,
-                                uint16_t vswitch_id, uint16_t port_id) {
+                         uint16_t vswitch_id, uint16_t port_id,
+                         enum eswitch_port_mode mode, uint16_t vlan_id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
+  struct eswitch_port_membership *membership = NULL;
   int port_index;
   doca_error_t result;
 
@@ -54,34 +78,66 @@ doca_error_t attach_port(struct eswitch_manager *manager,
   if (manager->ports->items[port_index].ethernet->role ==
       ETHERNET_PORT_ROLE_SF_REPRESENTOR)
     return DOCA_ERROR_NOT_SUPPORTED;
-  if (manager->port_owner[port_index] != 0 ||
-      router_control_port_reserved(manager, (uint16_t)port_index))
+  if ((mode == ESWITCH_PORT_MODE_TRUNK && !eswitch_vlan_valid(vlan_id)) ||
+      (mode == ESWITCH_PORT_MODE_ACCESS && vlan_id != 0))
+    return DOCA_ERROR_INVALID_VALUE;
+  if (router_control_port_reserved(manager, (uint16_t)port_index))
     return DOCA_ERROR_IN_USE;
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    struct eswitch_port_membership *candidate = &manager->memberships[i];
+    if (!candidate->active) {
+      if (membership == NULL)
+        membership = candidate;
+      continue;
+    }
+    if (candidate->port_index != (uint16_t)port_index)
+      continue;
+    if (candidate->vswitch_id == vswitch_id ||
+        candidate->mode == ESWITCH_PORT_MODE_ACCESS ||
+        mode == ESWITCH_PORT_MODE_ACCESS || candidate->vlan_id == vlan_id)
+      return DOCA_ERROR_IN_USE;
+  }
+  if (membership == NULL ||
+      manager->membership_count >= ESWITCH_MAX_VLAN_MEMBERSHIPS)
+    return DOCA_ERROR_NO_MEMORY;
 
-  /* Prepare the egress membership before opening ingress.  Until the
-   * classifier is committed, packets cannot enter this vSwitch from port_id. */
-  result = eswitch_pipeline_flood_add_port(manager->pipeline, vswitch_id,
-                                           port_id, &vswitch->flood);
+  result = eswitch_pipeline_attach_port(manager->pipeline,
+                                        (uint16_t)port_index, vswitch_id,
+                                        mode, vlan_id);
   if (result != DOCA_SUCCESS)
     return result;
-  result = eswitch_pipeline_attach_port(manager->pipeline,
-                                        (uint16_t)port_index, vswitch_id);
+  result = eswitch_pipeline_flood_add_port(manager->pipeline, vswitch_id,
+                                           port_id, &vswitch->flood);
   if (result != DOCA_SUCCESS) {
-    doca_error_t cleanup = eswitch_pipeline_flood_remove_port(
-        manager->pipeline, port_id, &vswitch->flood);
-    if (cleanup == DOCA_SUCCESS && vswitch->flood.member_count == 0)
-      cleanup = eswitch_pipeline_destroy_flood_group(manager->pipeline,
-                                                      &vswitch->flood);
+    doca_error_t cleanup = eswitch_pipeline_detach_vswitch_port(
+        manager->pipeline, (uint16_t)port_index, vswitch_id);
+    if (cleanup == DOCA_SUCCESS)
+      cleanup = eswitch_pipeline_release_vswitch_port(
+          manager->pipeline, (uint16_t)port_index, vswitch_id);
     return cleanup == DOCA_SUCCESS ? result : cleanup;
   }
-  manager->port_owner[port_index] = vswitch_id;
-  printf("VSWITCH ATTACH: vs=%u dpdk-port=%u\n", vswitch_id, port_id);
+  *membership = (struct eswitch_port_membership){
+      .vswitch_id = vswitch_id,
+      .port_index = (uint16_t)port_index,
+      .port_id = port_id,
+      .vlan_id = vlan_id,
+      .mode = mode,
+      .active = true,
+  };
+  manager->membership_count++;
+  if (mode == ESWITCH_PORT_MODE_ACCESS)
+    manager->port_owner[port_index] = vswitch_id;
+  printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=%s vlan=%u\n", vswitch_id,
+         port_id, mode == ESWITCH_PORT_MODE_TRUNK ? "trunk" : "access",
+         vlan_id);
   return DOCA_SUCCESS;
 }
 
 doca_error_t detach_port(struct eswitch_manager *manager,
                                 uint16_t vswitch_id, uint16_t port_id) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
+  struct eswitch_port_membership *membership;
+  struct eswitch_port_membership saved_membership;
   struct router_neighbor_table *neighbor_backup = NULL;
   int port_index;
   doca_error_t result;
@@ -91,8 +147,10 @@ doca_error_t detach_port(struct eswitch_manager *manager,
   port_index = find_port_index(manager, port_id);
   if (port_index < 0)
     return DOCA_ERROR_NOT_FOUND;
-  if (manager->port_owner[port_index] != vswitch_id)
+  membership = find_membership(manager, vswitch_id, port_id);
+  if (membership == NULL)
     return DOCA_ERROR_INVALID_VALUE;
+  saved_membership = *membership;
   neighbor_backup = malloc(sizeof(*neighbor_backup));
   if (neighbor_backup == NULL)
     return DOCA_ERROR_NO_MEMORY;
@@ -100,8 +158,8 @@ doca_error_t detach_port(struct eswitch_manager *manager,
 
   /* Close ingress first. If a later hardware mutation fails, restore the
    * classifier and flood member while ownership is still unchanged. */
-  result = eswitch_pipeline_detach_port(manager->pipeline,
-                                        (uint16_t)port_index);
+  result = eswitch_pipeline_detach_vswitch_port(
+      manager->pipeline, (uint16_t)port_index, vswitch_id);
   if (result != DOCA_SUCCESS) {
     free(neighbor_backup);
     return result;
@@ -110,33 +168,65 @@ doca_error_t detach_port(struct eswitch_manager *manager,
                                               &vswitch->flood);
   if (result != DOCA_SUCCESS) {
     doca_error_t rollback = eswitch_pipeline_attach_port(
-        manager->pipeline, (uint16_t)port_index, vswitch_id);
+        manager->pipeline, (uint16_t)port_index, vswitch_id,
+        saved_membership.mode, saved_membership.vlan_id);
     free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
   result = eswitch_fdb_flush_port(&manager->fdb, vswitch_id, port_id,
                                   "port-detach");
   if (result != DOCA_SUCCESS) {
-    doca_error_t rollback = eswitch_pipeline_flood_add_port(
-        manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    doca_error_t rollback = eswitch_pipeline_attach_port(
+        manager->pipeline, (uint16_t)port_index, vswitch_id,
+        saved_membership.mode, saved_membership.vlan_id);
     if (rollback == DOCA_SUCCESS)
-      rollback = eswitch_pipeline_attach_port(
-          manager->pipeline, (uint16_t)port_index, vswitch_id);
+      rollback = eswitch_pipeline_flood_add_port(
+          manager->pipeline, vswitch_id, port_id, &vswitch->flood);
     free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
-  manager->port_owner[port_index] = 0;
+  /* Remove routes that reference the membership-specific egress gate before
+   * destroying that gate. Releasing the gate first leaves hardware entries
+   * pointing at it and produces Resource busy/stale forwarding failures. */
+  if (membership->mode == ESWITCH_PORT_MODE_ACCESS)
+    manager->port_owner[port_index] = 0;
+  *membership = (struct eswitch_port_membership){0};
+  manager->membership_count--;
   router_neighbor_invalidate_port(&manager->neighbors, port_id);
   result = eswitch_manager_hw_routes_sync(manager, manager->router);
   if (result != DOCA_SUCCESS) {
     doca_error_t rollback;
     manager->neighbors = *neighbor_backup;
-    manager->port_owner[port_index] = vswitch_id;
-    rollback = eswitch_pipeline_flood_add_port(
-        manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    *membership = saved_membership;
+    manager->membership_count++;
+    if (membership->mode == ESWITCH_PORT_MODE_ACCESS)
+      manager->port_owner[port_index] = vswitch_id;
+    rollback = eswitch_pipeline_attach_port(
+        manager->pipeline, (uint16_t)port_index, vswitch_id,
+        saved_membership.mode, saved_membership.vlan_id);
     if (rollback == DOCA_SUCCESS)
-      rollback = eswitch_pipeline_attach_port(
-          manager->pipeline, (uint16_t)port_index, vswitch_id);
+      rollback = eswitch_pipeline_flood_add_port(
+          manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    free(neighbor_backup);
+    return rollback == DOCA_SUCCESS ? result : rollback;
+  }
+  result = eswitch_pipeline_release_vswitch_port(
+      manager->pipeline, (uint16_t)port_index, vswitch_id);
+  if (result != DOCA_SUCCESS) {
+    doca_error_t rollback;
+    manager->neighbors = *neighbor_backup;
+    *membership = saved_membership;
+    manager->membership_count++;
+    if (membership->mode == ESWITCH_PORT_MODE_ACCESS)
+      manager->port_owner[port_index] = vswitch_id;
+    rollback = eswitch_pipeline_attach_port(
+        manager->pipeline, (uint16_t)port_index, vswitch_id,
+        saved_membership.mode, saved_membership.vlan_id);
+    if (rollback == DOCA_SUCCESS)
+      rollback = eswitch_pipeline_flood_add_port(
+          manager->pipeline, vswitch_id, port_id, &vswitch->flood);
+    if (rollback == DOCA_SUCCESS)
+      rollback = eswitch_manager_hw_routes_sync(manager, manager->router);
     free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
@@ -158,18 +248,32 @@ doca_error_t delete_vswitch(struct eswitch_manager *manager,
   result = eswitch_fdb_flush_vswitch(&manager->fdb, id, "vs-delete");
   if (result != DOCA_SUCCESS)
     return result;
-  for (uint16_t i = 0; i < manager->ports->count; i++) {
-    if (manager->port_owner[i] != id)
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    struct eswitch_port_membership *member = &manager->memberships[i];
+    if (!member->active || member->vswitch_id != id)
       continue;
-    result = eswitch_pipeline_detach_port(manager->pipeline, i);
+    result = eswitch_pipeline_detach_vswitch_port(
+        manager->pipeline, member->port_index, id);
     if (result != DOCA_SUCCESS)
       return result;
-    manager->port_owner[i] = 0;
   }
   result = eswitch_pipeline_destroy_flood_group(manager->pipeline,
                                                 &vswitch->flood);
   if (result != DOCA_SUCCESS)
     return result;
+  for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
+    struct eswitch_port_membership *member = &manager->memberships[i];
+    if (!member->active || member->vswitch_id != id)
+      continue;
+    result = eswitch_pipeline_release_vswitch_port(
+        manager->pipeline, member->port_index, id);
+    if (result != DOCA_SUCCESS)
+      return result;
+    if (member->mode == ESWITCH_PORT_MODE_ACCESS)
+      manager->port_owner[member->port_index] = 0;
+    *member = (struct eswitch_port_membership){0};
+    manager->membership_count--;
+  }
   printf("VSWITCH DELETE: id=%u\n", id);
   *vswitch = (struct managed_vswitch){0};
   return DOCA_SUCCESS;

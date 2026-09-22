@@ -97,7 +97,10 @@ payload assign '{
 "${WRAPPER}" assign-ip "${TEST_ROOT}/assign.json" 60 >"${TEST_ROOT}/assign.out" 2>"${TEST_ROOT}/assign.err"
 rc=$?
 chk "T2 assign rc" "0" "${rc}"
-chk "T2 uplink attach"  "1" "$(cmd_count 'vr port attach --id 100 --port 0 --name uplink')"
+chk "T2 WAN vs create"  "1" "$(cmd_count 'vs create --id 33323')"
+chk "T2 p0 VLAN trunk"  "1" "$(cmd_count 'vs port attach --id 33323 --port 0 --mode trunk --vlan 555')"
+chk "T2 uplink attach"  "1" "$(cmd_count 'vr switch attach --id 100 --switch-id 33323 --name uplink')"
+chk "T2 uplink mac"     "1" "$(cmd_count 'vr interface set --id 100 --interface uplink --mac 02:00:00:65:82:2b')"
 chk "T2 uplink address" "1" "$(cmd_count 'vr ip add --id 100 --interface uplink --address 203.0.113.10/24')"
 chk "T2 default route"  "1" "$(cmd_count 'vr route add --id 100 --prefix 0.0.0.0/0 --via 203.0.113.1 --interface uplink')"
 chk "T2 nat enable"     "1" "$(cmd_count 'vr nat enable --id 100 --interface uplink --address interface --port-range 20000-60999')"
@@ -108,7 +111,8 @@ chk "T2 nat enable"     "1" "$(cmd_count 'vr nat enable --id 100 --interface upl
 "${WRAPPER}" assign-ip "${TEST_ROOT}/assign.json" 60 >"${TEST_ROOT}/assign2.out" 2>"${TEST_ROOT}/assign2.err"
 rc=$?
 chk "T3 re-assign rc" "0" "${rc}"
-chk "T3 second uplink attach" "1" "$(cmd_count 'vr port attach --id 100 --port 0 --name uplink')"
+chk "T3 second uplink attach" "1" "$(cmd_count 'vr switch attach --id 100 --switch-id 33323 --name uplink')"
+chk "T3 second trunk attach"  "1" "$(cmd_count 'vs port attach --id 33323 --port 0 --mode trunk --vlan 555')"
 chk "T3 second nat enable"    "1" "$(cmd_count 'vr nat enable --id 100 --interface uplink --address interface --port-range 20000-60999')"
 chk "T3 second vs create"     "1" "$(cmd_count 'vs create --id 100')"
 
@@ -129,6 +133,8 @@ chk "T5 release rc" "0" "${rc}"
 chk "T5 nat disable"    "1" "$(cmd_count 'vr nat disable --id 100')"
 chk "T5 route del"      "1" "$(cmd_count 'vr route del --id 100 --prefix 0.0.0.0/0')"
 chk "T5 uplink address removed" "1" "$(cmd_count 'vr ip del --id 100 --interface uplink --address 203.0.113.10/24')"
+chk "T5 uplink detached" "1" "$(cmd_count 'vr switch detach --id 100 --interface uplink')"
+chk "T5 WAN vs deleted" "1" "$(cmd_count 'vs delete --id 33323')"
 
 # re-assign after release must re-apply NAT
 "${WRAPPER}" assign-ip "${TEST_ROOT}/assign.json" 60 >"${TEST_ROOT}/reassign.out" 2>"${TEST_ROOT}/reassign.err"
@@ -188,7 +194,7 @@ payload nofb '{
 "${WRAPPER}" implement-network "${TEST_ROOT}/nofb.json" 60 >"${TEST_ROOT}/nofb.out" 2>"${TEST_ROOT}/nofb.err"
 rc=$?
 chk "T9 fallback id rc" "0" "${rc}"
-chk "T9 vs create --id 43" "1" "$(cmd_count 'vs create --id 43')"
+chk "T9 vs create --id 4138" "1" "$(cmd_count 'vs create --id 4138')"
 
 # ---------------------------------------------------------------------------
 # T10: status command passes the daemon status through

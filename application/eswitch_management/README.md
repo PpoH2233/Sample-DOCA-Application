@@ -29,7 +29,10 @@ example `vs port attach --id 10 --port 1`. The version-1 flat verbs such as
 
 At startup every discovered DPDK port is **unassigned**. The root pipe has a
 DROP miss action, so an unassigned VF or uplink cannot exchange traffic through
-this application. A port belongs to at most one virtual switch.
+this application. An access membership is exclusive. A trunk port may belong
+to multiple virtual switches, but each `(port,VLAN)` tuple is unique. Trunk
+ingress is matched and stripped in hardware; its membership-specific egress
+gate restores the VLAN tag.
 
 ## Data path
 
@@ -68,11 +71,15 @@ available on the Arm dataplane with `hw_state=fallback-arm`.
 
 ```text
 endpoint
-   -> root classifier: physical ingress port
+   -> root classifier: physical ingress port + optional VLAN
+      -> trunk: match VLAN and pop 802.1Q; access: require untagged
       -> write pkt_meta = (vswitch_id << 16) | ingress_port_id
       -> router uplink: broadcast ARP hardware meter -> color gate -> Arm RSS
          -> IPv4 TCP/UDP -> CT hit -> adjacency -> egress
                          \-> CT miss -------------> Arm RSS
+      -> egress membership gate
+         -> access: forward untagged
+         -> trunk: push configured VLAN -> physical p0/VF
          -> other non-broadcast traffic -------------------------> Arm RSS
       -> source guard
          hit  -> destination FDB -> known-unicast egress

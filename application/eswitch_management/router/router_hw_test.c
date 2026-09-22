@@ -49,6 +49,21 @@ int main(void) {
   assert(routes[1].vr_id == 101 && routes[1].target_port_id == 3);
   assert(routes[2].vr_id == 202 && routes[2].target_port_id == 8);
 
+  /* A VLAN-backed public RIF is still NAT slow path. Attachment type alone
+   * must never promote it into LPM and bypass translation. */
+  {
+    struct router_config nat_config = config;
+    nat_config.nat_policies[nat_config.nat_policy_count++] =
+        (struct router_nat_policy){.vr_id = 101, .interface_id = 2,
+                                   .port_first = 20000,
+                                   .port_last = 60999};
+    count = router_hw_routes_build(&nat_config, &neighbors, now, routes,
+                                   ROUTER_HW_MAX_ROUTES);
+    assert(count == 2);
+    for (size_t i = 0; i < count; i++)
+      assert(routes[i].egress_interface_id != 2);
+  }
+
   /* A private static route is promoted only after its gateway resolves. */
   config.routes[config.route_count++] = (struct router_route){
       .vr_id = 101, .interface_id = 2, .prefix = 0xac100000U,

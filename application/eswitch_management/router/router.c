@@ -369,7 +369,7 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           for(size_t i=0;i<c->interface_count;i++)
             if(c->interfaces[i].interface_id==p->interface_id) name=c->interfaces[i].name;
           used=append(out,size,used,
-            "nat=enabled mode=snat-pat protocols=tcp,udp interface=%s "
+            "nat=enabled mode=snat-pat protocols=tcp,udp,icmp-echo interface=%s "
             "address=%s ports=%u-%u dataplane=ARM_ACTIVE "
             "hw-ct=PENDING\n",name,
             iptext(router_nat_policy_address(c,p),ip),p->port_first,p->port_last);
@@ -393,13 +393,13 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
             r->mac[0],r->mac[1],r->mac[2],r->mac[3],r->mac[4],r->mac[5]);
           if(r->has_address) {
             const struct router_nat_policy *p=router_nat_policy_find(c,q.id);
-            bool nat_active=r->attachment==ROUTER_PORT && p!=NULL &&
-                            p->interface_id==r->interface_id;
+            bool nat_active=p!=NULL && p->interface_id==r->interface_id;
             used=append(out,size,used,
               "address=%s/%u status=%s arp=%s\n",iptext(r->address,ip),r->prefix,
-              r->attachment==ROUTER_VSWITCH ? "ACTIVE_ARM_LPM" :
+              nat_active ? "ACTIVE_ARM_NAT" :
+              (r->attachment==ROUTER_VSWITCH ? "ACTIVE_ARM_LPM" :
                 (r->attachment==ROUTER_LINK ? "ACTIVE_ARM_ROUTER_LINK" :
-                 (nat_active ? "ACTIVE_ARM_NAT" : "ACTIVE_ARM_UPLINK")),
+                 "ACTIVE_ARM_UPLINK")),
               r->attachment==ROUTER_VSWITCH ? "PRIVATE_GATEWAY_ENABLED" :
                 (r->attachment==ROUTER_LINK ? "STATIC_PEER" : "PUBLIC_RIF_ENABLED"));
           }
@@ -527,8 +527,9 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           .prefix=q.address,.gateway=q.gateway,.length=q.prefix};
       } else if(q.op==NAT_ENABLE) {
         if(router_nat_policy_find(c,q.id)) return error(out,size,"NAT already enabled");
-        if(rif->attachment!=ROUTER_PORT || !rif->has_address)
-          return error(out,size,"NAT interface must be an addressed public port-link");
+        if((rif->attachment!=ROUTER_PORT &&
+            rif->attachment!=ROUTER_VSWITCH) || !rif->has_address)
+          return error(out,size,"NAT interface must be an addressed public port-link or vs-link");
         if(!default_route_uses(c,q.id,rif->interface_id))
           return error(out,size,"NAT interface must own the VR default route");
         if(!q.address_from_interface && q.address!=rif->address)

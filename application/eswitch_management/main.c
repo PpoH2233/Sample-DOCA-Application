@@ -149,6 +149,13 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
     required += ESWITCH_MAX_VSWITCHES *
                     DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
                 4096U;
+  /* Every trunk membership may need one VLAN-push action in its egress gate.
+   * Reserve this up front: growing the action pool after a Flow port starts is
+   * impossible, and otherwise the first p0 trunk can fail despite the ingress
+   * classifier having been installed successfully. */
+  required += ESWITCH_MAX_VLAN_MEMBERSHIPS *
+                  DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
+              4096U;
   /* CT owns its L3/L4 action memory, while the post-CT adjacency pipe uses
    * the parent switch-port pool for L2 and TTL rewrites. */
   if (hardware_ct_enabled)

@@ -28,8 +28,10 @@
 # Guest VMs connect through SR-IOV VFs of the BlueField passed by KVM; the
 # eSwitch FDB learns guest MACs, so no per-NIC programming is required.
 #
-# ID scheme: vswitch id = virtual router id = guest VLAN tag
-# (fallback: network_id % 65534 + 1 when no VLAN is assigned yet).
+# ID scheme: vswitch id = virtual router id = guest VLAN tag.  Networks that
+# do not have a VLAN yet use the reserved 4096..32767 range; public WAN VLANs
+# use 32769..36862.  Keeping these ranges disjoint avoids forwarding-domain
+# aliasing when a network later adds a p0 trunk.
 #
 # physical-network extension details (registration):
 #   hosts, host, port, username, password, sshkey  - consumed by dpu-eswitch.sh
@@ -37,8 +39,8 @@
 #   control.socket  - override control socket path (optional)
 #   vf.pool         - VF indexes pre-attached to each network vSwitch
 #                     ("all", "1-10", "1-6,10-20"; empty = manual attach)
-#   uplink.port     - DPDK port id of the public uplink RIF
-#                     (default: auto-detect the parent/uplink via `port show`)
+#   uplink.port     - legacy direct VF uplink selector (not used by VLAN WAN)
+#                     VLAN WAN always resolves the parent/uplink (p0) port
 #   nat.port.range  - SNAT/PAT port range (default 20000-60999)
 #
 # Exit codes: 0 success, 1 usage/configuration error.
@@ -177,21 +179,30 @@ is_ipv4() {
     printf '%s' "$1" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
 }
 
-# vswitch id = virtual router id = guest VLAN tag (1..65535); fall back to a
-# deterministic id derived from network_id when no VLAN is assigned yet.
+# vswitch id = virtual router id = guest VLAN tag (1..4094); fall back to a
+# deterministic id in 4096..32767 when no VLAN is assigned yet.  That range
+# is deliberately disjoint from guest VLAN and public-WAN forwarding domains.
 derive_vswitch_id() {
     local vlan="$1" net="$2" fb
-    if is_numeric "${vlan}" && [ "${vlan}" -ge 1 ] && [ "${vlan}" -le 65535 ]; then
+    if is_numeric "${vlan}" && [ "${vlan}" -ge 1 ] && [ "${vlan}" -le 4094 ]; then
         printf '%s' "${vlan}"
         return 0
     fi
     if is_numeric "${net}"; then
-        fb=$(( net % 65534 + 1 ))
+        fb=$(( net % 28672 + 4096 ))
         log "WARN: unusable vlan '${vlan}' - deriving vswitch id ${fb} from network_id ${net}"
         printf '%s' "${fb}"
         return 0
     fi
     return 1
+}
+
+# Public VLANs get a separate forwarding domain so the same p0 trunk can be a
+# member of many WAN broadcast domains without colliding with guest VLAN IDs.
+derive_public_vswitch_id() {
+    local vlan="$1"
+    is_numeric "${vlan}" && [ "${vlan}" -ge 1 ] && [ "${vlan}" -le 4094 ] || return 1
+    printf '%s' $((32768 + vlan))
 }
 
 # Deterministic, unicast, unique-per-VR RIF MAC.
@@ -342,7 +353,8 @@ vs_ports() {
     out=$(vs_show "$1") || { printf ''; return 1; }
     printf '%s\n' "${out}" | \
         grep -oE 'ports=\[[^]]*\]' | \
-        sed -E 's/ports=\[([^]]*)\]/\1/' | tr ',' ' '
+        sed -E 's/ports=\[([^]]*)\]/\1/' | tr ',' '\n' | \
+        sed -E 's/:.*$//' | tr '\n' ' '
 }
 
 # True when NAT is enabled on <vr> through RIF <iface>.
@@ -718,6 +730,41 @@ resolve_uplink_port() {
     return 1
 }
 
+# VLAN WAN always uses the physical parent representor (p0). A VF selected by
+# the legacy uplink.port detail cannot carry the physical trunk.
+resolve_parent_uplink_port() {
+    local out port
+    out=$(esw_run "port show") || { log "port show failed"; return 1; }
+    port=$(printf '%s\n' "${out}" | \
+        grep -oE '^DPDK port [0-9]+ \(uplink/parent\)' | \
+        grep -oE '[0-9]+' | head -n1)
+    if is_numeric "${port}"; then
+        printf '%s' "${port}"
+        return 0
+    fi
+    log "cannot resolve p0: no parent/uplink port in 'port show'"
+    return 1
+}
+
+ensure_trunk_member() {
+    local vs="$1" port="$2" vlan="$3" out descriptors
+    out=$(vs_show "${vs}" || true)
+    descriptors=$(printf '%s\n' "${out}" | grep -oE 'ports=\[[^]]*\]' | \
+        sed -E 's/ports=\[([^]]*)\]/\1/' | tr ',' '\n')
+    if printf '%s\n' "${descriptors}" | grep -qx "${port}:trunk/vlan=${vlan}"; then
+        return 0
+    fi
+    if printf '%s\n' "${descriptors}" | grep -qE "^${port}:"; then
+        log "port ${port} is already attached to vs=${vs} with a different mode/VLAN"
+        return 1
+    fi
+    if ! esw_run "vs port attach --id ${vs} --port ${port} --mode trunk --vlan ${vlan}" >/dev/null; then
+        log "trunk attach failed: vs=${vs} port=${port} vlan=${vlan}"
+        return 1
+    fi
+    log "trunk attached: vs=${vs} port=${port} vlan=${vlan}"
+}
+
 # ---------------------------------------------------------------------------
 # VF pool: pre-attach the configured VF representor range to the network
 # vSwitch so any guest VM may use any free VF of that pool.
@@ -812,23 +859,34 @@ ensure_default_route() {
 # Applies the daemon-required order: uplink RIF attach -> address ->
 # default route -> NAT enable; NAT is disabled first on address changes.
 ensure_public_uplink() {
-    local vr="$1" pub_ip="$2" prefix up line cur_addr want_addr
+    local vr="$1" pub_ip="$2" prefix up line cur_addr want_addr wan_vs
     is_ipv4 "${pub_ip}" || { log "assign-ip: missing/invalid public_ip"; return 1; }
+    wan_vs=$(derive_public_vswitch_id "${PUBLIC_VLAN}") || {
+        log "assign-ip: public_vlan must be in range 1-4094"; return 1;
+    }
     prefix="${PUBLIC_CIDR##*/}"
     is_numeric "${prefix}" || prefix="32"
     want_addr="${pub_ip}/${prefix}"
 
+    # Always reconcile the physical trunk before trusting restored router
+    # state. This repairs a missing p0 membership after daemon/container
+    # replacement without requiring the uplink RIF to be recreated.
+    up=$(resolve_parent_uplink_port) || return 1
+    ensure_vs "${wan_vs}" || return 1
+    ensure_trunk_member "${wan_vs}" "${up}" "${PUBLIC_VLAN}" || return 1
+    state_set uplink_port "${up}"
+    state_set public_vswitch_id "${wan_vs}"
+
     line=$(rif_line "${vr}" "uplink")
     if [ -z "${line}" ]; then
-        up=$(resolve_uplink_port) || { log "cannot resolve public uplink DPDK port"; return 1; }
-        if ! esw_run "vr port attach --id ${vr} --port ${up} --name uplink" >/dev/null; then
-            log "vr port attach --id ${vr} --port ${up} failed (public uplink busy? only one SNAT network per DPU is supported)"
-            return 1
-        fi
+        ensure_sw_rif "${vr}" "${wan_vs}" "uplink" "$(rif_mac "${wan_vs}")" "" || return 1
         line=$(rif_line "${vr}" "uplink")
         [ -n "${line}" ] || { log "uplink RIF not visible in vr show after attach"; return 1; }
-        log "ensure_public_uplink: vr=${vr} uplink port=${up}"
-        state_set uplink_port "${up}"
+        log "ensure_public_uplink: vr=${vr} uplink-vs=${wan_vs} p0-port=${up} vlan=${PUBLIC_VLAN}"
+    elif [ "$(line_field type "${line}")" != "vs-link" ] ||
+         [ "$(line_field switch "${line}")" != "${wan_vs}" ]; then
+        log "existing uplink is not WAN vs=${wan_vs}; release the old public IP before changing public VLAN"
+        return 1
     fi
 
     cur_addr=$(line_field address "${line}")
@@ -1085,8 +1143,13 @@ teardown_network() {
         done < <(alloc_list_for_network "${NETWORK_ID}")
     fi
 
+    local public_vs
+    public_vs=$(state_get public_vswitch_id)
     teardown_vr "${VR_ID}" || true
     teardown_vs "${VSWITCH_ID}" || true
+    if [ -n "${public_vs}" ] && [ "${public_vs}" != "${VSWITCH_ID}" ]; then
+        teardown_vs "${public_vs}" || true
+    fi
 
     if [ "${remove_state}" = "true" ]; then
         rm -rf "$(net_state_dir)" 2>/dev/null || true
@@ -1150,19 +1213,28 @@ cmd_release_ip() {
             esw_run "vr route del --id ${VR_ID} --prefix 0.0.0.0/0" >/dev/null || true
             log "release-ip: default route removed for vr=${VR_ID}"
         fi
-        local line cur_addr
+        local line cur_addr public_vs
         line=$(rif_line "${VR_ID}" "uplink")
         cur_addr=$(line_field address "${line}")
         if [ -n "${cur_addr}" ]; then
             esw_run "vr ip del --id ${VR_ID} --interface uplink --address ${cur_addr}" >/dev/null || true
             log "release-ip: uplink address ${cur_addr} removed"
         fi
+        if [ -n "${line}" ] && [ "$(line_field type "${line}")" = "vs-link" ]; then
+            esw_run "vr switch detach --id ${VR_ID} --interface uplink" >/dev/null 2>&1 || true
+        fi
+        public_vs=$(state_get public_vswitch_id)
+        if [ -n "${public_vs}" ]; then
+            teardown_vs "${public_vs}" || true
+        fi
     else
         log "release-ip: eswitch-management not reachable; skipping DPU cleanup"
     fi
 
     rm -f "$(net_state_dir)/public_ip" "$(net_state_dir)/public_vlan" \
-          "$(net_state_dir)/public_gateway" "$(net_state_dir)/public_cidr" 2>/dev/null || true
+          "$(net_state_dir)/public_gateway" "$(net_state_dir)/public_cidr" \
+          "$(net_state_dir)/public_vswitch_id" "$(net_state_dir)/uplink_port" \
+          2>/dev/null || true
     log "release-ip: done ${PUBLIC_IP} on network ${NETWORK_ID}"
     exit 0
 }

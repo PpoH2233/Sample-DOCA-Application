@@ -40,6 +40,13 @@ vsf() { printf '%s/vs-%s' "${MOCK_STATE}" "$1"; }
 vrf() { printf '%s/vr-%s' "${MOCK_STATE}" "$1"; }
 err() { printf 'ERR %s\n' "$1"; exit 1; }
 
+# Portable in-place rewrite (GNU and BSD sed use incompatible -i syntax).
+rewrite_sed() {
+    local expression="$1" file="$2" temporary="${2}.tmp.$$"
+    sed "${expression}" "${file}" > "${temporary}" || return 1
+    mv "${temporary}" "${file}"
+}
+
 opt() {
     local want="$1"
     shift
@@ -116,15 +123,25 @@ if [ "$1" = "vs" ]; then
                 attach)
                     id=$(opt --id "$@")
                     port=$(opt --port "$@")
+                    mode=$(opt --mode "$@")
+                    vlan=$(opt --vlan "$@")
+                    [ -n "${mode}" ] || mode=access
+                    if [ "${mode}" = trunk ]; then
+                        [ -n "${vlan}" ] || err "code=2 message=trunk requires vlan"
+                        descriptor="${port}:trunk/vlan=${vlan}"
+                    else
+                        descriptor="${port}:access"
+                    fi
                     f=$(vsf "${id}")
                     [ -f "${f}" ] || err "code=4 message=vSwitch not found"
                     members="$(cat "${f}")"
-                    printf ',%s,' "${members}" | grep -q ",${port}," && \
+                    printf '%s' "${members}" | tr ',' '\n' | \
+                        grep -qE "^${port}:" && \
                         err "code=7 message=port already attached"
                     if [ -z "${members}" ]; then
-                        printf '%s' "${port}" > "${f}"
+                        printf '%s' "${descriptor}" > "${f}"
                     else
-                        printf '%s,%s' "${members}" "${port}" > "${f}"
+                        printf '%s,%s' "${members}" "${descriptor}" > "${f}"
                     fi
                     printf 'OK\n'
                     exit 0 ;;
@@ -134,9 +151,11 @@ if [ "$1" = "vs" ]; then
                     f=$(vsf "${id}")
                     [ -f "${f}" ] || err "code=4 message=vSwitch not found"
                     members="$(cat "${f}")"
-                    printf ',%s,' "${members}" | grep -q ",${port}," || \
+                    printf '%s' "${members}" | tr ',' '\n' | \
+                        grep -qE "^${port}:" || \
                         err "code=4 message=port not attached"
-                    rest="$(printf '%s' "${members}" | tr ',' '\n' | grep -vx "${port}" | paste -sd, -)"
+                    rest="$(printf '%s' "${members}" | tr ',' '\n' | \
+                        grep -vE "^${port}:" | paste -sd, -)"
                     printf '%s' "${rest}" > "${f}"
                     printf 'OK\n'
                     exit 0 ;;
@@ -191,7 +210,7 @@ if [ "$1" = "vr" ]; then
                     name=$(opt --interface "$@")
                     f=$(vrf "${id}")
                     grep -qE "^${name} " "${f}" || err "interface ${name} not attached"
-                    sed -i "\|^${name} |d" "${f}"
+                    rewrite_sed "\|^${name} |d" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 *)
@@ -217,7 +236,7 @@ if [ "$1" = "vr" ]; then
                     name=$(opt --interface "$@")
                     f=$(vrf "${id}")
                     grep -qE "^${name} " "${f}" || err "interface ${name} not attached"
-                    sed -i "\|^${name} |d" "${f}"
+                    rewrite_sed "\|^${name} |d" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 *)
@@ -231,7 +250,7 @@ if [ "$1" = "vr" ]; then
                     mac=$(opt --mac "$@")
                     f=$(vrf "${id}")
                     grep -qE "^${name} " "${f}" || err "interface ${name} not found"
-                    sed -i "\|^${name} |s|mac=[^ ]*|mac=${mac}|" "${f}"
+                    rewrite_sed "\|^${name} |s|mac=[^ ]*|mac=${mac}|" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 *)
@@ -245,14 +264,14 @@ if [ "$1" = "vr" ]; then
                     addr=$(opt --address "$@")
                     grep -qE "^${name} .*address=${addr} " "${f}" && err "address ${addr} exists"
                     grep -qE "^${name} .*address=[0-9]" "${f}" && err "one address per interface"
-                    sed -i "\|^${name} |s|address=-|address=${addr}|" "${f}"
+                    rewrite_sed "\|^${name} |s|address=-|address=${addr}|" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 del)
                     name=$(opt --interface "$@")
                     addr=$(opt --address "$@")
                     grep -qE "^${name} .*address=${addr} " "${f}" || err "address ${addr} not found"
-                    sed -i "\|^${name} |s|address=${addr}|address=-|" "${f}"
+                    rewrite_sed "\|^${name} |s|address=${addr}|address=-|" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 *)
@@ -275,7 +294,7 @@ if [ "$1" = "vr" ]; then
                     pfx=$(opt --prefix "$@")
                     f=$(vrf "${id}")
                     grep -qF "route static ${pfx} " "${f}" || err "route ${pfx} not found"
-                    sed -i "\|^route static ${pfx} |d" "${f}"
+                    rewrite_sed "\|^route static ${pfx} |d" "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 show)
@@ -296,7 +315,7 @@ if [ "$1" = "vr" ]; then
                     rng=$(opt --port-range "$@")
                     f=$(vrf "${id}")
                     grep -q '^nat enabled' "${f}" && err "nat already enabled"
-                    grep -qE "^${ifc} .*type=port-link" "${f}" || err "interface ${ifc} is not a port-link"
+                    grep -qE "^${ifc} .*type=(port|vs)-link" "${f}" || err "interface ${ifc} is not a public link"
                     grep -qE "^${ifc} .*address=[0-9]" "${f}" || err "interface ${ifc} has no address"
                     grep -qE '^route static 0.0.0.0/0 ' "${f}" || err "no default route through ${ifc}"
                     printf 'nat enabled %s\n' "${rng}" >> "${f}"
@@ -306,7 +325,7 @@ if [ "$1" = "vr" ]; then
                     id=$(opt --id "$@")
                     f=$(vrf "${id}")
                     grep -q '^nat enabled' "${f}" || err "nat not enabled"
-                    sed -i '\|^nat enabled|d' "${f}"
+                    rewrite_sed '\|^nat enabled|d' "${f}"
                     printf 'OK\n'
                     exit 0 ;;
                 show)

@@ -13,6 +13,8 @@
 #include "../../ethernet_switch/flow_runtime.h"
 #include "../router/router_hw.h"
 #include "../router/router_nat.h"
+#include "../eswitch_config.h"
+#include "../eswitch_vlan.h"
 
 struct eswitch_rule {
   struct doca_flow_pipe_entry *entry;
@@ -23,6 +25,17 @@ struct eswitch_egress_gate {
   struct doca_flow_pipe *pipe;
   struct eswitch_rule drop_self;
   struct eswitch_rule forward;
+};
+
+struct eswitch_pipeline_membership {
+  uint16_t vswitch_id;
+  uint16_t port_index;
+  uint16_t port_id;
+  uint16_t vlan_id;
+  enum eswitch_port_mode mode;
+  struct eswitch_rule ingress;
+  struct eswitch_egress_gate egress;
+  bool active;
 };
 
 struct eswitch_flood_member {
@@ -45,6 +58,7 @@ struct eswitch_flood_group {
 
 struct eswitch_ct_adjacency {
   uint32_t id;
+  uint16_t vswitch_id;
   uint16_t target_port_id;
   uint8_t source_mac[6];
   uint8_t destination_mac[6];
@@ -140,6 +154,8 @@ struct eswitch_pipeline {
   struct eswitch_rule *uplink_arp_meter_rules; /* indexed like ports->items */
   struct eswitch_rule *uplink_catchall_rules; /* indexed like ports->items */
   struct eswitch_egress_gate *egress_gates; /* indexed like ports->items */
+  struct eswitch_pipeline_membership
+      memberships[ESWITCH_MAX_VLAN_MEMBERSHIPS];
   uint32_t uplink_arp_pps;
   uint32_t uplink_arp_burst;
   bool uplink_arp_filter_requested;
@@ -213,7 +229,9 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline);
 
 doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index,
-                                          uint16_t vswitch_id);
+                                          uint16_t vswitch_id,
+                                          enum eswitch_port_mode mode,
+                                          uint16_t vlan_id);
 /* Router-owned uplinks bypass L2 learning and go directly to the Arm RSS
  * slow path. The high metadata half carries the VR id for ingress isolation. */
 doca_error_t eswitch_pipeline_attach_router_port(
@@ -232,14 +250,22 @@ doca_error_t eswitch_pipeline_hw_route_stats(
 doca_error_t eswitch_pipeline_ct_promote(
     struct eswitch_pipeline *pipeline,
     const struct router_nat_session *session,
-    uint16_t origin_target_port, const uint8_t origin_source_mac[6],
+    uint16_t origin_target_vswitch, uint16_t origin_target_port,
+    const uint8_t origin_source_mac[6],
     const uint8_t origin_destination_mac[6],
-    uint16_t reply_target_port, const uint8_t reply_source_mac[6],
+    uint16_t reply_target_vswitch, uint16_t reply_target_port,
+    const uint8_t reply_source_mac[6],
     const uint8_t reply_destination_mac[6]);
 doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
                                        uint16_t vr_id);
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index);
+doca_error_t eswitch_pipeline_detach_vswitch_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_index,
+    uint16_t vswitch_id);
+doca_error_t eswitch_pipeline_release_vswitch_port(
+    struct eswitch_pipeline *pipeline, uint16_t port_index,
+    uint16_t vswitch_id);
 
 /* One flooding hash pipe per vSwitch; membership changes are incremental. */
 doca_error_t eswitch_pipeline_flood_add_port(

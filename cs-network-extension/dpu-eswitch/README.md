@@ -63,13 +63,15 @@ CloudStack already allocates a unique guest VLAN per isolated network, so the
 wrapper derives stable DPU identities from it:
 
 ```
-vswitch id = virtual router id = guest VLAN tag        (1..65535)
+vswitch id = virtual router id = guest VLAN tag        (1..4094)
+public WAN vswitch id = 32768 + public VLAN tag
 gateway RIF name = SW<vlan>                             (e.g. SW100)
 RIF MAC = 02:00:00:65:hi:lo                             (unicast, unique per VR)
 ```
 
 When no VLAN has been assigned yet the proxy stores only the host; the wrapper
-falls back to `network_id % 65534 + 1`.
+falls back to `network_id % 28672 + 4096` (range 4096..32767).  This range is
+separate from guest VLAN IDs and public WAN forwarding domains.
 
 ### Command → eswitchctl mapping
 
@@ -77,8 +79,8 @@ falls back to `network_id % 65534 + 1`.
 |---|---|---|
 | Provider/offering validation | `ensure-network-device` (proxy-local) | `status` — DPU reachability is probed by SSH; ids returned in stdout JSON |
 | First VM deploy | `implement-network` | `vs create`, `port show`, `vs port attach` (VF pool), `vr create`, `vr switch attach`, `vr interface set`, `vr ip add` |
-| SNAT IP acquisition | `assign-ip` | `vr show`, `port show`, `vr port attach` (uplink), `vr ip add/del`, `vr route add/del`, `vr nat enable/disable` |
-| SNAT IP release | `release-ip` | `vr nat disable`, `vr route del`, `vr ip del` |
+| SNAT IP acquisition | `assign-ip` | create WAN VS, attach p0 as VLAN trunk, attach WAN VS-RIF, address/default route/NAT |
+| SNAT IP release | `release-ip` | NAT disable, route/IP delete, WAN VS-RIF detach, trunk VS delete |
 | NIC lifecycle | `prepare-nic` / `release-nic` | none (the eSwitch FDB learns guest MACs) |
 | Restart cycle | `restore-network` | idempotent reconcile of the desired state |
 | Delete network | `shutdown-network` / `destroy-network` | reverse teardown (NAT → routes → addresses → RIFs → VR → VS) |
@@ -162,7 +164,7 @@ Registration details:
 | `hosts` | BlueField Arm endpoints (one DPU per KVM host) | — |
 | `username` / `sshkey` / `password` / `port` | SSH transport to the Arm host | `root`, port 22, agent auth |
 | `vf.pool` | VF indexes pre-attached to each network's vSwitch | manual attach |
-| `uplink.port` | DPDK port id of the public uplink RIF | auto-detect the parent/uplink port |
+| `uplink.port` | Legacy direct-VF uplink selector; ignored for VLAN WAN | — (p0/parent is auto-detected) |
 | `nat.port.range` | SNAT/PAT port range | `20000-60999` |
 | `eswitchctl.path` | explicit `eswitchctl` path | PATH lookup |
 | `control.socket` | control socket override | `/run/eswitch-management/control.sock` |
@@ -193,8 +195,10 @@ cmk createNetwork name=my-dpu-net displaytext="My DPU network" \
 
 `implement-network` creates, on the DPU: the vSwitch (`vs id = vlan`), the VR
 (`vr id = vlan`), the private gateway RIF (`SW<vlan>`, gateway IP) and attaches
-the VF pool.  `assign-ip` (source NAT) then attaches the parent port as the
-public uplink RIF, sets its address, the default route and enables SNAT/PAT.
+the VF pool. `assign-ip` (source NAT) creates a separate WAN vSwitch, attaches
+the physical parent/p0 as `--mode trunk --vlan <public_vlan>`, attaches that
+vSwitch to the VR as `uplink`, sets its address/default route and enables
+SNAT/PAT.
 
 Guest VMs get a passed-through BlueField VF; the eSwitch FDB learns the VM's
 MAC on first traffic — no per-NIC DPU configuration is needed.
@@ -205,10 +209,10 @@ MAC on first traffic — no per-NIC DPU configuration is needed.
 
 * One DPU per KVM host; every isolated network is pinned to exactly one DPU
   (`ensure-network-device` hashes `network_id` over the host list).
-* One SNAT-able network per DPU today: the daemon permits one public uplink
-  RIF per VR and a port serves one VR only.
-* VLAN-tagged public traffic requires the uplink-VLAN capability in the
-  daemon (phase-1 work); until then present the public side untagged.
+* Multiple VRs may share p0 when each WAN uses a distinct public VLAN. The
+  same `(p0,VLAN)` cannot belong to two WAN vSwitches.
+* Public WAN traffic is 802.1Q-tagged on p0 and normalized to untagged frames
+  inside the WAN vSwitch. QinQ and native/untagged WAN are not implemented.
 * No DHCP/DNS/UserData (static-IP guests), no StaticNat/PortForwarding/Firewall
   yet (DNAT is not implemented in the daemon; declare only `SourceNat,Gateway`).
 * Daemon limits apply: 64 vSwitches/VRs, 254 ports per vSwitch,

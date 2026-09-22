@@ -6,7 +6,12 @@
 
 #define ESWITCH_CLI_MAX_TOKENS 16U
 
-enum option_bit { OPTION_ID = 1u, OPTION_PORT = 2u };
+enum option_bit {
+  OPTION_ID = 1u,
+  OPTION_PORT = 2u,
+  OPTION_MODE = 4u,
+  OPTION_VLAN = 8u,
+};
 
 static bool parse_u16(const char *text, uint16_t *value) {
   unsigned long parsed;
@@ -46,6 +51,21 @@ static bool parse_options(size_t start, size_t count,
       if (!parse_u16(value, &out->port_id))
         return false;
       out->has_port = true;
+    } else if (strcmp(key, "--mode") == 0) {
+      bit = OPTION_MODE;
+      if (strcmp(value, "access") == 0)
+        out->port_mode = ESWITCH_PORT_MODE_ACCESS;
+      else if (strcmp(value, "trunk") == 0)
+        out->port_mode = ESWITCH_PORT_MODE_TRUNK;
+      else
+        return false;
+      out->has_mode = true;
+    } else if (strcmp(key, "--vlan") == 0) {
+      bit = OPTION_VLAN;
+      if (!parse_u16(value, &out->vlan_id) ||
+          !eswitch_vlan_valid(out->vlan_id))
+        return false;
+      out->has_vlan = true;
     } else {
       return false;
     }
@@ -77,8 +97,17 @@ static bool parse_legacy_port(size_t count, const char *const *tokens,
     out->has_port = true;
     return parse_u16(tokens[1], &out->id) && parse_u16(tokens[2], &out->port_id);
   }
-  return parse_options(1, count, tokens, OPTION_ID | OPTION_PORT,
+  return parse_options(1, count, tokens,
+                       OPTION_ID | OPTION_PORT | OPTION_MODE | OPTION_VLAN,
                        OPTION_ID | OPTION_PORT, out);
+}
+
+static bool valid_port_membership_options(struct eswitch_cli_command *out) {
+  if (!out->has_mode)
+    out->port_mode = ESWITCH_PORT_MODE_ACCESS;
+  if (out->port_mode == ESWITCH_PORT_MODE_TRUNK)
+    return out->has_vlan && eswitch_vlan_valid(out->vlan_id);
+  return !out->has_vlan;
 }
 
 bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
@@ -130,9 +159,13 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
         out->verb = ESWITCH_CLI_VS_PORT_DETACH;
       else
         return false;
-      return parse_options(3, token_count, tokens, OPTION_ID | OPTION_PORT,
-                           OPTION_ID | OPTION_PORT, out) &&
-             out->id != 0;
+      if (!parse_options(3, token_count, tokens,
+                         OPTION_ID | OPTION_PORT | OPTION_MODE | OPTION_VLAN,
+                         OPTION_ID | OPTION_PORT, out) || out->id == 0)
+        return false;
+      return out->verb == ESWITCH_CLI_VS_PORT_DETACH
+                 ? !out->has_mode && !out->has_vlan
+                 : valid_port_membership_options(out);
     }
     return false;
   }
@@ -169,11 +202,13 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
   }
   if (strcmp(resource, "vs-port-attach") == 0) {
     out->verb = ESWITCH_CLI_VS_PORT_ATTACH;
-    return parse_legacy_port(token_count, tokens, out) && out->id != 0;
+    return parse_legacy_port(token_count, tokens, out) && out->id != 0 &&
+           valid_port_membership_options(out);
   }
   if (strcmp(resource, "vs-port-detach") == 0) {
     out->verb = ESWITCH_CLI_VS_PORT_DETACH;
-    return parse_legacy_port(token_count, tokens, out) && out->id != 0;
+    return parse_legacy_port(token_count, tokens, out) && out->id != 0 &&
+           !out->has_mode && !out->has_vlan;
   }
   if (strcmp(resource, "list-port-available") == 0) {
     out->verb = ESWITCH_CLI_PORT_SHOW;
@@ -269,7 +304,8 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
   if (strcmp(resource, "vs-list") == 0)
     return "Usage: vs show [--id <id>]\n";
   if (strcmp(resource, "vs-port-attach") == 0)
-    return "Usage: vs port attach --id <id> --port <port-id>\n";
+    return "Usage: vs port attach --id <id> --port <port-id> "
+           "[--mode access|trunk] [--vlan <1-4094>]\n";
   if (strcmp(resource, "vs-port-detach") == 0)
     return "Usage: vs port detach --id <id> --port <port-id>\n";
   if (strcmp(resource, "show-fdb") == 0)
@@ -294,7 +330,8 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
     return "Usage: vs show [--id <id>]\n";
   if (token_count >= 2 && strcmp(tokens[1], "port") == 0) {
     if (token_count >= 3 && strcmp(tokens[2], "attach") == 0)
-      return "Usage: vs port attach --id <id> --port <port-id>\n";
+      return "Usage: vs port attach --id <id> --port <port-id> "
+             "[--mode access|trunk] [--vlan <1-4094>]\n";
     if (token_count >= 3 && strcmp(tokens[2], "detach") == 0)
       return "Usage: vs port detach --id <id> --port <port-id>\n";
     return "Usage: vs port attach|detach --id <id> --port <port-id>\n";
@@ -331,12 +368,14 @@ void eswitch_cli_help(FILE *output, const char *program,
           "switch\n"
           "  vs show [--id <id>]                      Show all or one "
           "virtual switch\n"
-          "  vs port attach --id <id> --port <port>   Attach an available "
-          "port\n"
+          "  vs port attach --id <id> --port <port> [--mode access|trunk] "
+          "[--vlan <1-4094>]\n"
+          "                                             Attach an access "
+          "port (default), or one VLAN on a trunk\n"
           "  vs port detach --id <id> --port <port>   Detach a member port\n\n"
           "Ports and forwarding tables:\n"
-          "  port show                                Show unassigned DPDK "
-          "ports\n"
+          "  port show                                Show assignable DPDK "
+          "ports (p0 remains visible for more VLANs)\n"
           "  fdb show [--id <id>]                     Show all or one "
           "learned FDB\n\n"
           "Virtual router (L3):\n"

@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-arm-route-transaction-v26`. This revision includes
+Contract revision: `doca34-vlan-trunk-p0-v27`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.
@@ -30,7 +30,7 @@ The complete canonical command set:
 | 3 | `vs create --id <id>` | mutation |
 | 4 | `vs delete --id <id>` | mutation |
 | 5 | `vs show [--id <id>]` | query |
-| 6 | `vs port attach --id <id> --port <port-id>` | mutation |
+| 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <1-4094>]` | mutation |
 | 7 | `vs port detach --id <id> --port <port-id>` | mutation |
 | 8 | `port show` | query |
 | 9 | `fdb show [--id <id>]` | query |
@@ -333,19 +333,24 @@ ERR vSwitch is attached to a VR; detach it first with: vr switch detach --id <vr
 
 ```bash
 eswitchctl vs port attach --id 100 --port 1
+eswitchctl vs port attach --id 32774 --port 0 --mode trunk --vlan 6
 eswitchctl vs port detach --id 100 --port 1
 ```
 
-A port, including the uplink, belongs to at most one vSwitch, and a port
-reserved by a VR cannot be attached. One vSwitch holds at most 254 ports.
+The default is an untagged access membership. A trunk membership requires one
+VLAN ID in the range 1-4094. A physical port may have multiple trunk
+memberships, but a given `(port,VLAN)` belongs to exactly one vSwitch. Access
+and trunk memberships cannot coexist on one port. A port reserved directly by
+a VR cannot be attached.
 
 `attach` performs, in order:
 
-1. Add one member entry to the vSwitch flooding HASH pipe. Existing members and
-   learned FDB rules are untouched.
-2. Add the root classifier entry that writes
+1. Add a root classifier entry. Access ingress must be untagged; trunk ingress
+   matches VLAN ID and pops the 802.1Q header.
+2. Write
    `(vswitch_id << 16) | ingress_port_id` into packet metadata.
-3. Mark the port owned by the vSwitch.
+3. Add a flood member through a per-membership egress gate. A trunk gate pushes
+   the configured VLAN before forwarding to the physical port.
 
 `detach` performs, in order:
 
@@ -358,6 +363,31 @@ The vSwitch and its empty flood group survive detaching the last port. With
 zero members, unknown traffic is dropped; with one member, its egress gate
 drops a packet returning to its own ingress.
 
+#### VLAN WAN on physical p0
+
+This example creates VLAN 6 as a WAN broadcast domain on p0 (assume `port
+show` reports the parent as DPDK port 0), attaches it to VR 101, and enables
+outbound NAT. Frames are untagged inside VS 32774 and carry tag 6 only on the
+physical wire:
+
+```bash
+eswitchctl vs create --id 32774
+eswitchctl vs port attach --id 32774 --port 0 --mode trunk --vlan 6
+
+eswitchctl vr switch attach --id 101 --switch-id 32774 --name uplink
+eswitchctl vr interface set --id 101 --interface uplink \
+  --mac 02:00:00:65:80:06
+eswitchctl vr ip add --id 101 --interface uplink \
+  --address 161.246.6.38/16
+eswitchctl vr route add --id 101 --prefix 0.0.0.0/0 \
+  --via 161.246.6.254 --interface uplink
+eswitchctl vr nat enable --id 101 --interface uplink \
+  --address interface --port-range 20000-60999
+```
+
+For another WAN VLAN on the same p0, create another VS and attach port 0 with
+the other VLAN. Reusing `(port 0, VLAN 6)` in a second VS is rejected.
+
 ### 5.5 `vs show`
 
 ```bash
@@ -367,8 +397,8 @@ eswitchctl vs show --id 100
 
 ```text
 OK
-vs=100 ports=[0,1,2]
-vs=200 ports=[3,4]
+vs=100 ports=[1:access,2:access]
+vs=32774 ports=[0:trunk/vlan=6]
 ```
 
 Without `--id` this is a collection read: `OK` plus one line per vSwitch, or
@@ -378,7 +408,9 @@ not exist. `--id 0` is treated as "no filter" and lists everything.
 
 ### 5.6 `port show`
 
-Unassigned DPDK ports, meaning ports owned by neither a vSwitch nor a VR.
+Assignable DPDK ports. An access-owned port and a port directly reserved by a
+VR are hidden. The physical parent remains visible after trunk attachment so
+additional VLAN memberships can be configured on the same p0.
 
 ```bash
 eswitchctl port show
@@ -435,8 +467,9 @@ Contract-level notes:
   the IP address first. `vr delete` requires that the VR has no interfaces.
 - One IPv4 address per interface, and overlapping subnets inside one VR are
   rejected.
-- `vr nat enable` requires an addressed public port-link that owns the VR's
-  default route, and the public address must equal that interface's address.
+- `vr nat enable` requires an addressed public port-link or vs-link that owns
+  the VR's default route, and the public address must equal that interface's
+  address. A VLAN WAN uses a vs-link whose vSwitch has p0 as a trunk member.
 
 Implemented today: private-vSwitch gateway ARP, local ICMP echo, connected and
 static route LPM, neighbor discovery, IPv4 forwarding, and Arm-side TCP/UDP/ICMP
@@ -717,7 +750,8 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | vSwitch | `GET /vswitches/{id}` | `vs show --id {id}` |
 | vSwitch | `POST /vswitches` `{"id":N}` | `vs create --id N` |
 | vSwitch | `DELETE /vswitches/{id}` | `vs delete --id {id}` |
-| vSwitch member | `PUT /vswitches/{id}/ports/{port}` | `vs port attach --id {id} --port {port}` |
+| vSwitch member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"access"}` | `vs port attach --id {id} --port {port}` |
+| vSwitch trunk member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"trunk","vlan":6}` | `vs port attach --id {id} --port {port} --mode trunk --vlan 6` |
 | vSwitch member | `DELETE /vswitches/{id}/ports/{port}` | `vs port detach --id {id} --port {port}` |
 | Port | `GET /ports?assigned=false` | `port show` |
 | FDB | `GET /fdb` | `fdb show` |

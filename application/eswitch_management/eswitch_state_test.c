@@ -14,6 +14,8 @@ int main(void) {
   struct eswitch_state_member parent = {
       .vswitch_id = 100,
       .kind = ESWITCH_STATE_PORT_PARENT,
+      .mode = ESWITCH_PORT_MODE_TRUNK,
+      .vlan_id = 6,
   };
   struct eswitch_state_member representor = {
       .vswitch_id = 100,
@@ -21,6 +23,12 @@ int main(void) {
       .host_index = 1,
       .pf_index = 0,
       .vf_index = 3,
+  };
+  struct eswitch_state_member conflicting_parent = {
+      .vswitch_id = 200,
+      .kind = ESWITCH_STATE_PORT_PARENT,
+      .mode = ESWITCH_PORT_MODE_TRUNK,
+      .vlan_id = 6,
   };
   bool exists = false;
 
@@ -32,6 +40,8 @@ int main(void) {
   assert(eswitch_state_add_switch(&written, 200) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &parent) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &representor) == DOCA_SUCCESS);
+  assert(eswitch_state_add_member(&written, &conflicting_parent) !=
+         DOCA_SUCCESS);
   assert(eswitch_state_save(path, &written) == DOCA_SUCCESS);
 
   assert(eswitch_state_init(8, &loaded) == DOCA_SUCCESS);
@@ -41,7 +51,11 @@ int main(void) {
   assert(loaded.switch_ids[0] == 100 && loaded.switch_ids[1] == 200);
   assert(loaded.member_count == 2);
   assert(loaded.members[0].kind == ESWITCH_STATE_PORT_PARENT);
+  assert(loaded.members[0].mode == ESWITCH_PORT_MODE_TRUNK);
+  assert(loaded.members[0].vlan_id == 6);
   assert(loaded.members[1].kind == ESWITCH_STATE_PORT_REPRESENTOR);
+  assert(loaded.members[1].mode == ESWITCH_PORT_MODE_ACCESS);
+  assert(loaded.members[1].vlan_id == 0);
   assert(loaded.members[1].host_index == 1);
   assert(loaded.members[1].pf_index == 0);
   assert(loaded.members[1].vf_index == 3);

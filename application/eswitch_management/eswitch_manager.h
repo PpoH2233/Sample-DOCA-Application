@@ -10,6 +10,7 @@
 
 #include "../ethernet_switch/dpdk_io.h"
 #include "eswitch_config.h"
+#include "eswitch_vlan.h"
 #include "l2/eswitch_fdb.h"
 #include "router/router.h"
 #include "router/router_neighbor.h"
@@ -47,6 +48,8 @@ struct eswitch_manager {
   uint64_t tx_log_ns, tx_snapshot_ns, tx_snapshot_seen;
   uint64_t next_hw_route_retry_ns, hw_route_retry_backoff_ns;
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];
+  struct eswitch_port_membership memberships[ESWITCH_MAX_PERSISTED_MEMBERS];
+  size_t membership_count;
   uint16_t *port_owner; /* indexed like ports->items; 0 means available */
   uint64_t started_ns;
   uint64_t next_aging_ns;
