@@ -444,7 +444,6 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         r.attachment=ROUTER_VSWITCH; r.vswitch_id=q.vswitch;
         if(!inv || !inv->switch_exists || !inv->switch_exists(inv->context,q.vswitch))
           return error(out,size,"vSwitch not found");
-        if(router_switch_reserved(c,q.vswitch)) return error(out,size,"vSwitch already attached to a VR");
       } else {
         size_t endpoints=0;
         r.attachment=ROUTER_LINK; r.link_id=q.link;
@@ -489,6 +488,11 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           uint8_t len=r->prefix<q.prefix?r->prefix:q.prefix;
           if(r->vr_id==q.id && r->has_address && (r->address&mask(len))==(q.address&mask(len)))
             return error(out,size,"overlapping interface subnets within VR are not supported");
+          if(r!=rif && rif->attachment==ROUTER_VSWITCH &&
+             r->attachment==ROUTER_VSWITCH &&
+             r->vswitch_id==rif->vswitch_id && r->has_address &&
+             r->address==q.address)
+            return error(out,size,"IPv4 address already assigned on shared vSwitch");
         }
         if(rif->attachment==ROUTER_LINK) {
           const struct router_interface *peer=router_link_peer(c,rif->interface_id);

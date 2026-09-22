@@ -140,8 +140,13 @@ size_t router_icmp_echo_reply(const struct router_config *config,
   if (!config || !vswitch_id) return 0;
   for (size_t i=0;i<config->interface_count;i++) {
     const struct router_interface *rif=&config->interfaces[i];
-    if(rif->attachment==ROUTER_VSWITCH && rif->vswitch_id==vswitch_id)
-      return reply_for_interface(config,rif,packet,length,output,capacity);
+    size_t reply_length;
+
+    if(rif->attachment!=ROUTER_VSWITCH || rif->vswitch_id!=vswitch_id)
+      continue;
+    reply_length=reply_for_interface(config,rif,packet,length,output,capacity);
+    if(reply_length!=0)
+      return reply_length;
   }
   return 0;
 }

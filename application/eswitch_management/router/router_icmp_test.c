@@ -76,7 +76,16 @@ int main(void) {
   assert(!router_icmp_echo_reply(&config,100,request,sizeof(request),reply,
                                  sizeof(reply)));
 
+  /* Two VR RIFs can share one bridge. The destination MAC selects the VR/RIF
+   * instead of the order in which interfaces were configured. */
+  config.interfaces[1].vswitch_id=100;
+  memcpy(request,remote_rif,6);
+  assert(router_icmp_echo_reply(&config,100,request,sizeof(request),reply,
+                                sizeof(reply))==98);
+  assert(!memcmp(reply+6,remote_rif,6));
+
   request[30]=192;request[31]=168;request[32]=0;request[33]=1;
+  memcpy(request,rif,6);
   put16(request+24,0);put16(request+24,checksum(request+14,20));
   assert(!router_icmp_echo_reply(&config,200,request,sizeof(request),reply,sizeof(reply)));
   memcpy(bad,request,sizeof(bad)); bad[34]=3;

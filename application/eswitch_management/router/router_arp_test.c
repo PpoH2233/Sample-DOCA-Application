@@ -13,7 +13,7 @@ int main(void) {
     .prefix=24,.mac={2,0,0,0x65,0,1}};
   c.interfaces[1]=c.interfaces[0];
   c.interfaces[1].vr_id=102;c.interfaces[1].interface_id=2;
-  c.interfaces[1].vswitch_id=200;c.interfaces[1].mac[3]=0x66;
+  c.interfaces[1].address=0xc0a80002;c.interfaces[1].mac[3]=0x66;
   uint8_t req[60]={
     255,255,255,255,255,255, 0x7e,0x83,0xa5,0x77,0x11,6, 8,6,
     0,1,8,0,6,4,0,1, 0x7e,0x83,0xa5,0x77,0x11,6, 192,168,0,10,
@@ -28,8 +28,10 @@ int main(void) {
   assert(!memcmp(reply+32,req+22,6));
   assert(!memcmp(reply+38,req+28,4));
   for(unsigned i=42;i<60;i++) assert(reply[i]==0);
-  assert(router_arp_reply(&c,200,req,60,reply,60)==60);
-  assert(reply[9]==0x66); /* same IP in another VR selects its own MAC */
+  memcpy(req+38,(uint8_t[]){192,168,0,2},4);
+  assert(router_arp_reply(&c,100,req,60,reply,60)==60);
+  assert(reply[9]==0x66); /* shared VS selects the RIF by target IP */
+  memcpy(req+38,(uint8_t[]){192,168,0,1},4);
   assert(!router_arp_reply(&c,300,req,60,reply,60));
   for(size_t n=0;n<42;n++) assert(!router_arp_reply(&c,100,req,n,reply,60));
   assert(!router_arp_reply(&c,100,req,60,reply,59));

@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-vlan-trunk-p0-v27`. This revision includes
+Contract revision: `doca34-shared-vs-multivr-v28`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.
@@ -388,6 +388,33 @@ eswitchctl vr nat enable --id 101 --interface uplink \
 For another WAN VLAN on the same p0, create another VS and attach port 0 with
 the other VLAN. Reusing `(port 0, VLAN 6)` in a second VS is rejected.
 
+The same VLAN-6 vSwitch can be used as a shared WAN bridge by multiple VRs.
+Each VR gets its own RIF MAC, address, default route, neighbor state, NAT zone,
+and SF/hardware routing context:
+
+```bash
+eswitchctl vr create --id 1
+eswitchctl vr switch attach --id 1 --switch-id 32774 --name wan6
+eswitchctl vr interface set --id 1 --interface wan6 --mac 02:00:00:01:06:01
+eswitchctl vr ip add --id 1 --interface wan6 --address 161.246.6.23/16
+eswitchctl vr route add --id 1 --prefix 0.0.0.0/0 \
+  --via 161.246.6.254 --interface wan6
+eswitchctl vr nat enable --id 1 --interface wan6 \
+  --address interface --port-range 20000-39999
+
+eswitchctl vr create --id 2
+eswitchctl vr switch attach --id 2 --switch-id 32774 --name wan6
+eswitchctl vr interface set --id 2 --interface wan6 --mac 02:00:00:02:06:01
+eswitchctl vr ip add --id 2 --interface wan6 --address 161.246.6.38/16
+eswitchctl vr route add --id 2 --prefix 0.0.0.0/0 \
+  --via 161.246.6.254 --interface wan6
+eswitchctl vr nat enable --id 2 --interface wan6 \
+  --address interface --port-range 40000-60999
+```
+
+Port ranges do not need to be disjoint when the VRs use distinct public IPs,
+but separating them makes captures and operational debugging easier.
+
 ### 5.5 `vs show`
 
 ```bash
@@ -458,8 +485,11 @@ Contract-level notes:
 
 - `vr port attach` reserves an available VF representor as a public uplink RIF.
   The MVP permits one public uplink per VR.
-- `vr switch attach` binds one existing vSwitch as a private gateway RIF. A
-  vSwitch belongs to at most one VR.
+- `vr switch attach` binds an existing vSwitch as a router RIF. A vSwitch is a
+  shared L2 broadcast domain and may be attached by multiple VRs, or by
+  multiple distinctly named interfaces in one VR. Destination RIF MAC/IP
+  selects the VR routing zone. RIF MACs remain globally unique and duplicate
+  IPv4 addresses on the same shared vSwitch are rejected.
 - `vr show` lists the VR's named RIFs with their type, identity, MAC, address
   and readiness. `vr route show` lists connected and static routes.
   `vr nat show` reports the SNAT/PAT policy.
@@ -615,7 +645,8 @@ delete-or-fail; query commands are safe to repeat.
 | `link create` | `ERR`, already exists |
 | `vs delete`, `vr delete` | `ERR`, not found |
 | `link delete` | `ERR`, not found or endpoints remain attached |
-| `vs port attach`, `vr port attach`, `vr switch attach`, `vr link attach` | `ERR`, already attached or in use |
+| `vs port attach`, `vr port attach`, `vr link attach` | `ERR`, already attached or in use |
+| `vr switch attach` | `ERR` only when the interface name already exists, the vSwitch is absent, or interface capacity is exhausted; sharing a vSwitch is supported |
 | `vs port detach`, `vr port detach`, `vr switch detach`, `vr link detach` | `ERR`, not attached |
 | `vr ip add`, `vr route add`, `vr nat enable` | `ERR`, already exists or already enabled |
 | `vr ip del`, `vr route del`, `vr nat disable` | `ERR`, not found or not enabled |

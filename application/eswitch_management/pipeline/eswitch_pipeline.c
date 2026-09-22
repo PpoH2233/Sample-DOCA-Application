@@ -966,9 +966,9 @@ static doca_error_t create_sf_return(struct eswitch_pipeline *pipeline) {
 }
 
 static doca_error_t bind_sf_return_context(
-    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t vswitch_id,
-    uint32_t rif_address, uint16_t target_port_id, bool directed,
-    const uint8_t rif_mac[6], uint16_t *context_tag) {
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t interface_id,
+    uint16_t vswitch_id, uint32_t rif_address, uint16_t target_port_id,
+    bool directed, const uint8_t rif_mac[6], uint16_t *context_tag) {
   struct eswitch_sf_return_context *free_context = NULL;
   struct doca_flow_match return_match = {0};
   struct doca_flow_match local_match = {0};
@@ -978,6 +978,7 @@ static doca_error_t bind_sf_return_context(
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created || vr_id == 0 ||
+      interface_id == 0 ||
       vswitch_id == 0 ||
       rif_mac == NULL || context_tag == NULL || (rif_mac[0] & 1U) != 0)
     return DOCA_ERROR_INVALID_VALUE;
@@ -989,10 +990,10 @@ static doca_error_t bind_sf_return_context(
         free_context = context;
       continue;
     }
-    if (context->vswitch_id == vswitch_id &&
+    if (context->interface_id == interface_id &&
         context->directed == directed &&
         (!directed || context->target_port_id == target_port_id)) {
-      if (context->vr_id != vr_id ||
+      if (context->vr_id != vr_id || context->vswitch_id != vswitch_id ||
           (!directed && context->rif_address != rif_address) ||
           memcmp(context->rif_mac, rif_mac, 6) != 0)
         return DOCA_ERROR_BAD_STATE;
@@ -1083,6 +1084,7 @@ static doca_error_t bind_sf_return_context(
     }
     if (pipeline->hardware_routing_enabled) {
       free_context->vr_id = vr_id;
+      free_context->interface_id = interface_id;
       free_context->vswitch_id = vswitch_id;
       free_context->rif_address = rif_address;
       memcpy(free_context->rif_mac, rif_mac, 6);
@@ -1121,6 +1123,7 @@ static doca_error_t bind_sf_return_context(
   }
 
   free_context->vr_id = vr_id;
+  free_context->interface_id = interface_id;
   free_context->vswitch_id = vswitch_id;
   free_context->rif_address = rif_address;
   free_context->context_tag = *context_tag;
@@ -1128,9 +1131,11 @@ static doca_error_t bind_sf_return_context(
   memcpy(free_context->rif_mac, rif_mac, 6);
   free_context->directed = directed;
   free_context->active = true;
-  printf("SF RETURN BIND: vs=%u context-vlan=%u mode=%s target=%u rif="
+  printf("SF RETURN BIND: vr=%u rif-id=%u vs=%u context-vlan=%u "
+         "mode=%s target=%u rif="
          "%02x:%02x:%02x:%02x:%02x:%02x sf-port=%u\n",
-         vswitch_id, *context_tag, directed ? "directed" : "flood",
+         vr_id, interface_id, vswitch_id, *context_tag,
+         directed ? "directed" : "flood",
          directed ? target_port_id : UINT16_MAX,
          rif_mac[0], rif_mac[1], rif_mac[2], rif_mac[3],
          rif_mac[4], rif_mac[5], pipeline->sf_port_id);
@@ -1138,24 +1143,27 @@ static doca_error_t bind_sf_return_context(
 }
 
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
-    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t vswitch_id,
-    uint32_t rif_address, const uint8_t rif_mac[6], uint16_t *context_tag) {
-  return bind_sf_return_context(pipeline, vr_id, vswitch_id, rif_address,
-                                UINT16_MAX, false, rif_mac, context_tag);
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t interface_id,
+    uint16_t vswitch_id, uint32_t rif_address, const uint8_t rif_mac[6],
+    uint16_t *context_tag) {
+  return bind_sf_return_context(pipeline, vr_id, interface_id, vswitch_id,
+                                rif_address, UINT16_MAX, false, rif_mac,
+                                context_tag);
 }
 
 doca_error_t eswitch_pipeline_sf_bind_egress(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    uint16_t target_port_id, const uint8_t rif_mac[6],
-    uint16_t *context_tag) {
-  return bind_sf_return_context(pipeline, vswitch_id, vswitch_id, 0,
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t interface_id,
+    uint16_t vswitch_id, uint16_t target_port_id,
+    const uint8_t rif_mac[6], uint16_t *context_tag) {
+  return bind_sf_return_context(pipeline, vr_id, interface_id, vswitch_id, 0,
                                 target_port_id, true, rif_mac, context_tag);
 }
 
 doca_error_t eswitch_pipeline_sf_unbind_egress(
-    struct eswitch_pipeline *pipeline, uint16_t domain_id,
-    uint16_t target_port_id) {
-  if (pipeline == NULL || !pipeline->created || domain_id == 0)
+    struct eswitch_pipeline *pipeline, uint16_t interface_id,
+    uint16_t domain_id, uint16_t target_port_id) {
+  if (pipeline == NULL || !pipeline->created || interface_id == 0 ||
+      domain_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     struct eswitch_sf_return_context *context =
@@ -1163,6 +1171,7 @@ doca_error_t eswitch_pipeline_sf_unbind_egress(
     doca_error_t result;
 
     if (!context->active || !context->directed ||
+        context->interface_id != interface_id ||
         context->vswitch_id != domain_id ||
         context->target_port_id != target_port_id)
       continue;
@@ -1179,6 +1188,60 @@ doca_error_t eswitch_pipeline_sf_unbind_egress(
   return DOCA_SUCCESS;
 }
 
+static doca_error_t remove_sf_return_context(
+    struct eswitch_pipeline *pipeline,
+    struct eswitch_sf_return_context *context) {
+  doca_error_t result;
+
+  if (context->route_selector_rule.entry != NULL) {
+    result = remove_rule(pipeline, &context->route_selector_rule,
+                         "unbind hardware router selector");
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  if (context->route_eligible_rule.entry != NULL) {
+    result = remove_rule(pipeline, &context->route_eligible_rule,
+                         "unbind hardware route eligibility");
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  if (context->local_ip_rule.entry != NULL) {
+    result = remove_rule(pipeline, &context->local_ip_rule,
+                         "unbind local RIF IPv4");
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  result = remove_rule(pipeline, &context->return_rule,
+                       "unbind SF return context");
+  if (result != DOCA_SUCCESS)
+    return result;
+  printf("SF RETURN UNBIND: vr=%u rif-id=%u vs=%u context-vlan=%u "
+         "mode=%s target=%u\n",
+         context->vr_id, context->interface_id, context->vswitch_id,
+         context->context_tag, context->directed ? "directed" : "flood",
+         context->directed ? context->target_port_id : UINT16_MAX);
+  *context = (struct eswitch_sf_return_context){0};
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_sf_unbind_rif(
+    struct eswitch_pipeline *pipeline, uint16_t interface_id) {
+  if (pipeline == NULL || !pipeline->created || interface_id == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+    doca_error_t result;
+
+    if (!context->active || context->interface_id != interface_id)
+      continue;
+    result = remove_sf_return_context(pipeline, context);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  return DOCA_SUCCESS;
+}
+
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(
     struct eswitch_pipeline *pipeline, uint16_t vswitch_id) {
   if (pipeline == NULL || !pipeline->created || vswitch_id == 0)
@@ -1186,37 +1249,11 @@ doca_error_t eswitch_pipeline_sf_unbind_vswitch(
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     struct eswitch_sf_return_context *context =
         &pipeline->sf_return_contexts[i];
-    doca_error_t result;
-
     if (!context->active || context->vswitch_id != vswitch_id)
       continue;
-    if (context->route_selector_rule.entry != NULL) {
-      result = remove_rule(pipeline, &context->route_selector_rule,
-                           "unbind hardware router selector");
-      if (result != DOCA_SUCCESS)
-        return result;
-    }
-    if (context->route_eligible_rule.entry != NULL) {
-      result = remove_rule(pipeline, &context->route_eligible_rule,
-                           "unbind hardware route eligibility");
-      if (result != DOCA_SUCCESS)
-        return result;
-    }
-    if (context->local_ip_rule.entry != NULL) {
-      result = remove_rule(pipeline, &context->local_ip_rule,
-                           "unbind local RIF IPv4");
-      if (result != DOCA_SUCCESS)
-        return result;
-    }
-    result = remove_rule(pipeline, &context->return_rule,
-                         "unbind SF return context");
+    doca_error_t result = remove_sf_return_context(pipeline, context);
     if (result != DOCA_SUCCESS)
       return result;
-    printf("SF RETURN UNBIND: vs=%u context-vlan=%u mode=%s target=%u\n",
-           vswitch_id, context->context_tag,
-           context->directed ? "directed" : "flood",
-           context->directed ? context->target_port_id : UINT16_MAX);
-    *context = (struct eswitch_sf_return_context){0};
   }
   return DOCA_SUCCESS;
 }

@@ -209,10 +209,14 @@ eswitchctl vr delete --id 100
 
 vSwitch 200 must already exist. An interface name is scoped to its VR; numeric
 interface IDs are stable and not reused during a configuration's lifetime.
-One public uplink per VR, one router attachment per vSwitch, one IPv4 address
-per interface. Connected routes are derived from addresses. Static routes
-require an on-link next hop. Overlapping interface subnets inside one VR are
-rejected; identical subnets in different VRs are permitted.
+One public port-link per VR and one IPv4 address per interface. A vSwitch is a
+shared L2 bridge: multiple VRs, or multiple distinctly named RIFs in one VR,
+may attach to it. Destination RIF MAC/IP selects the VR routing zone and each
+RIF owns a separate neighbor-table key and SF return context. RIF MACs are
+globally unique and duplicate IPv4 addresses on one shared vSwitch are
+rejected. Connected routes are derived from addresses. Static routes require
+an on-link next hop. Overlapping interface subnets inside one VR are rejected;
+identical subnets in different VRs are permitted when their addresses differ.
 
 The generated RIF MAC is a locally administered placeholder; configure the
 public VF's accepted MAC before enabling its dataplane.

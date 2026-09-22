@@ -96,8 +96,8 @@ static doca_error_t invalidate_changed_private_rifs(
        after->address==before->address && after->prefix==before->prefix &&
        memcmp(after->mac,before->mac,6)==0)
       continue;
-    doca_error_t result=eswitch_pipeline_sf_unbind_vswitch(
-        m->pipeline,before->vswitch_id);
+    doca_error_t result=eswitch_pipeline_sf_unbind_rif(
+        m->pipeline,before->interface_id);
     if(result!=DOCA_SUCCESS) return result;
   }
   return DOCA_SUCCESS;

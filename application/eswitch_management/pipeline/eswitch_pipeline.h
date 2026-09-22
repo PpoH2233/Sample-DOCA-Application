@@ -75,6 +75,7 @@ struct eswitch_ct_session {
 
 struct eswitch_sf_return_context {
   uint16_t vr_id;
+  uint16_t interface_id;
   uint16_t vswitch_id;
   uint16_t context_tag;
   uint16_t target_port_id;
@@ -177,22 +178,28 @@ uint32_t eswitch_metadata_encode(uint16_t vswitch_id, uint16_t port_id);
 void eswitch_metadata_decode(uint32_t metadata, uint16_t *vswitch_id,
                             uint16_t *port_id);
 
-/* Bind an internal SF VLAN tag to one VS and virtual RIF source identity. */
+/* Bind an internal SF VLAN tag to one RIF on a shared VS. */
 doca_error_t eswitch_pipeline_sf_bind_vswitch(
-    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t vswitch_id,
-    uint32_t rif_address, const uint8_t rif_mac[6], uint16_t *context_tag);
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t interface_id,
+    uint16_t vswitch_id, uint32_t rif_address, const uint8_t rif_mac[6],
+    uint16_t *context_tag);
 
 /* Bind an SF context directly to one known egress port. */
 doca_error_t eswitch_pipeline_sf_bind_egress(
-    struct eswitch_pipeline *pipeline, uint16_t vswitch_id,
-    uint16_t target_port_id, const uint8_t rif_mac[6],
-    uint16_t *context_tag);
+    struct eswitch_pipeline *pipeline, uint16_t vr_id, uint16_t interface_id,
+    uint16_t vswitch_id, uint16_t target_port_id,
+    const uint8_t rif_mac[6], uint16_t *context_tag);
 
 /* Remove one directed context without disturbing the other egresses that use
  * the same metadata domain. This is used when a public RIF MAC changes. */
 doca_error_t eswitch_pipeline_sf_unbind_egress(
-    struct eswitch_pipeline *pipeline, uint16_t domain_id,
-    uint16_t target_port_id);
+    struct eswitch_pipeline *pipeline, uint16_t interface_id,
+    uint16_t domain_id, uint16_t target_port_id);
+
+/* Remove every flood/directed return context owned by one router interface
+ * without disturbing other VRs attached to the same shared vSwitch. */
+doca_error_t eswitch_pipeline_sf_unbind_rif(
+    struct eswitch_pipeline *pipeline, uint16_t interface_id);
 
 /* Remove a previously installed SF return context. This is idempotent. */
 doca_error_t eswitch_pipeline_sf_unbind_vswitch(

@@ -103,14 +103,19 @@ int main(void) {
   command("vr port-attach --id 100 --port 8 --name p3",false);
   command("vr port-attach --id 101 --port 8 --name p1",true);
   command("vr switch-attach --id 100 --switch-id 200 --name p2",true);
-  command("vr switch-attach --id 101 --switch-id 200 --name p2",false);
+  /* A vSwitch is a shared L2 bridge. Multiple VRs, and multiple distinct
+   * RIFs in one VR, may attach to the same broadcast domain. */
+  command("vr switch-attach --id 101 --switch-id 200 --name shared0",true);
+  command("vr switch-attach --id 101 --switch-id 200 --name shared1",true);
   command("vr switch-attach --id 101 --switch-id 201 --name p2",true);
   command("vr delete --id 100",false);
   command("vr ip add --id 100 --interface p2 --address 192.168.0.0/24",false);
   command("vr ip add --id 100 --interface p2 --address 192.168.0.255/24",false);
   command("vr ip add --id 100 --interface p2 --address 192.168.0.1/33",false);
   command("vr ip add --id 100 --interface p2 --address 192.168.0.1/24",true);
-  command("vr ip add --id 101 --interface p2 --address 192.168.0.1/24",true);
+  command("vr ip add --id 101 --interface p2 --address 192.168.1.1/24",true);
+  command("vr ip add --id 101 --interface shared0 --address 192.168.0.1/24",false);
+  command("vr ip add --id 101 --interface shared0 --address 192.168.0.2/24",true);
   command("vr ip add --id 100 --interface p1 --address 192.168.0.2/24",false);
   command("vr ip add --id 100 --interface p1 --address 200.20.0.4/16",true);
   command("vr interface set --id 100 --interface p1 --mac ff:ff:ff:ff:ff:ff",false);
@@ -263,6 +268,10 @@ int main(void) {
   command("vr switch-detach --id 100 --interface p2",true);
   command("vr delete --id 100",true);
   assert(router_has_vr(&config,101));
+  assert(router_switch_reserved(&config,200));
+  command("vr ip del --id 101 --interface shared0 --address 192.168.0.2/24",true);
+  command("vr switch-detach --id 101 --interface shared0",true);
+  command("vr switch-detach --id 101 --interface shared1",true);
   assert(!router_switch_reserved(&config,200));
   struct router_port_identity released={0,0,11};
   assert(!router_port_reserved(&config,&released));

@@ -141,6 +141,30 @@ int main(void) {
     assert(neighbor && neighbor->port_id==9 &&
            !memcmp(neighbor->mac,public_neighbor_mac,6));
   }
+  {
+    struct router_config shared;
+    struct router_neighbor_table shared_neighbors={0};
+
+    router_config_init(&shared);
+    shared.interface_count=2;
+    shared.interfaces[0]=(struct router_interface){.vr_id=1,.interface_id=10,
+      .attachment=ROUTER_VSWITCH,.vswitch_id=6,.has_address=true,
+      .address=0xa1f60617,.prefix=16};
+    shared.interfaces[1]=(struct router_interface){.vr_id=2,.interface_id=20,
+      .attachment=ROUTER_VSWITCH,.vswitch_id=6,.has_address=true,
+      .address=0xa1f60626,.prefix=16};
+    memcpy(shared.interfaces[0].mac,(uint8_t[]){2,0,0,1,6,1},6);
+    memcpy(shared.interfaces[1].mac,(uint8_t[]){2,0,0,2,6,1},6);
+    memcpy(arp+6,vm_b,6);memcpy(arp+22,vm_b,6);
+    ip(arp+28,0xa1f606fe);memcpy(arp+32,shared.interfaces[1].mac,6);
+    ip(arp+38,shared.interfaces[1].address);
+    assert(router_neighbor_learn_arp(&shared_neighbors,&shared,6,0,arp,42,
+                                     UINT64_C(7000000000)));
+    assert(router_neighbor_lookup(&shared_neighbors,2,20,0xa1f606fe,
+                                  UINT64_C(8000000000))!=NULL);
+    assert(router_neighbor_lookup(&shared_neighbors,1,10,0xa1f606fe,
+                                  UINT64_C(8000000000))==NULL);
+  }
   router_neighbor_age(&neighbors,UINT64_C(400000000000));
   assert(neighbors.count==0);
 

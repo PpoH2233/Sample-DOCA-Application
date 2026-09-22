@@ -83,6 +83,22 @@ static const struct router_interface *find_router_interface(
   return NULL;
 }
 
+static const struct router_interface *find_router_vswitch_interface(
+    const struct eswitch_manager *manager, uint16_t vswitch_id,
+    const uint8_t rif_mac[6]) {
+  if (manager == NULL || manager->router == NULL || rif_mac == NULL)
+    return NULL;
+  for (size_t i = 0; i < manager->router->interface_count; i++) {
+    const struct router_interface *candidate = &manager->router->interfaces[i];
+
+    if (candidate->attachment == ROUTER_VSWITCH && candidate->has_address &&
+        candidate->vswitch_id == vswitch_id &&
+        memcmp(candidate->mac, rif_mac, 6) == 0)
+      return candidate;
+  }
+  return NULL;
+}
+
 static const struct router_interface *find_router_port_interface(
     const struct eswitch_manager *manager, uint16_t port_id, uint16_t vr_id) {
   int index = find_port_index(manager, port_id);
@@ -124,30 +140,23 @@ static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
                                            uint16_t vswitch_id,
                                            const uint8_t rif_mac[6],
                                            uint16_t *context_tag) {
-  const struct router_interface *rif = NULL;
-  for (size_t i = 0; manager->router != NULL &&
-                     i < manager->router->interface_count; i++) {
-    const struct router_interface *candidate = &manager->router->interfaces[i];
-    if (candidate->attachment == ROUTER_VSWITCH &&
-        candidate->vswitch_id == vswitch_id && candidate->has_address) {
-      rif = candidate;
-      break;
-    }
-  }
+  const struct router_interface *rif = find_router_vswitch_interface(
+      manager, vswitch_id, rif_mac);
   if (rif == NULL)
     return DOCA_ERROR_NOT_FOUND;
   doca_error_t result = eswitch_pipeline_sf_bind_vswitch(
-      manager->pipeline, rif->vr_id, vswitch_id, rif->address, rif_mac,
-      context_tag);
+      manager->pipeline, rif->vr_id, rif->interface_id, vswitch_id,
+      rif->address, rif_mac, context_tag);
 
   if (result != DOCA_ERROR_BAD_STATE)
     return result;
-  result = eswitch_pipeline_sf_unbind_vswitch(manager->pipeline, vswitch_id);
+  result = eswitch_pipeline_sf_unbind_rif(manager->pipeline,
+                                          rif->interface_id);
   if (result != DOCA_SUCCESS)
     return result;
   result = eswitch_pipeline_sf_bind_vswitch(
-      manager->pipeline, rif->vr_id, vswitch_id, rif->address, rif_mac,
-      context_tag);
+      manager->pipeline, rif->vr_id, rif->interface_id, vswitch_id,
+      rif->address, rif_mac, context_tag);
   if (result == DOCA_SUCCESS)
     printf("SF RETURN REBIND: vs=%u context-vlan=%u\n", vswitch_id,
            *context_tag);
@@ -155,8 +164,8 @@ static doca_error_t bind_sf_return_context(struct eswitch_manager *manager,
 }
 
 /* Directed router output already has a resolved destination port. Keep one
- * flood context per VS for local-RIF delivery/broadcast probes, then install
- * a separate context that jumps directly to the target egress gate. */
+ * flood context per RIF for local delivery/broadcast probes, then install a
+ * separate per-RIF context that jumps directly to the target egress gate. */
 static doca_error_t bind_sf_directed_context(
     struct eswitch_manager *manager, uint16_t vswitch_id,
     uint16_t target_port_id, const uint8_t rif_mac[6],
@@ -168,8 +177,13 @@ static doca_error_t bind_sf_directed_context(
                                   &flood_context_tag);
   if (result != DOCA_SUCCESS)
     return result;
+  const struct router_interface *rif = find_router_vswitch_interface(
+      manager, vswitch_id, rif_mac);
+  if (rif == NULL)
+    return DOCA_ERROR_NOT_FOUND;
   return eswitch_pipeline_sf_bind_egress(
-      manager->pipeline, vswitch_id, target_port_id, rif_mac, context_tag);
+      manager->pipeline, rif->vr_id, rif->interface_id, vswitch_id,
+      target_port_id, rif_mac, context_tag);
 }
 
 
@@ -694,17 +708,18 @@ static doca_error_t bind_route_egress(
                                     target_port_id, egress->mac, context_tag);
 
   result = eswitch_pipeline_sf_bind_egress(
-      manager->pipeline, egress->vr_id, target_port_id, egress->mac,
-      context_tag);
+      manager->pipeline, egress->vr_id, egress->interface_id, egress->vr_id,
+      target_port_id, egress->mac, context_tag);
   if (result != DOCA_ERROR_BAD_STATE)
     return result;
   result = eswitch_pipeline_sf_unbind_egress(
-      manager->pipeline, egress->vr_id, target_port_id);
+      manager->pipeline, egress->interface_id, egress->vr_id,
+      target_port_id);
   if (result != DOCA_SUCCESS)
     return result;
   return eswitch_pipeline_sf_bind_egress(
-      manager->pipeline, egress->vr_id, target_port_id, egress->mac,
-      context_tag);
+      manager->pipeline, egress->vr_id, egress->interface_id, egress->vr_id,
+      target_port_id, egress->mac, context_tag);
 }
 
 static void reply_uplink_arp(struct eswitch_manager *manager,
@@ -1608,8 +1623,10 @@ static size_t format_tx_debug(const struct eswitch_manager *manager,
       continue;
     }
     used = append_text(response, size, used,
-        "sf_context_tag=%u vs=%u mode=%s target=%u hits=%" PRIu64 "\n",
-        context->context_tag, context->vswitch_id,
+        "sf_context_tag=%u vr=%u rif=%u vs=%u mode=%s target=%u "
+        "hits=%" PRIu64 "\n",
+        context->context_tag, context->vr_id, context->interface_id,
+        context->vswitch_id,
         context->directed ? "directed" : "flood",
         context->directed ? context->target_port_id : UINT16_MAX,
         context_hits);

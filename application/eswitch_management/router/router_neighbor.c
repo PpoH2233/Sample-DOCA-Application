@@ -107,14 +107,21 @@ bool router_neighbor_learn_arp(struct router_neighbor_table *table,
                                uint16_t ingress_port_id,
                                const uint8_t *frame, size_t length,
                                uint64_t now_ns) {
-  if (!config || !ingress_vswitch_id) return false;
+  bool changed=false;
+  uint32_t target_ip;
+
+  if (!config || !ingress_vswitch_id || !frame || length<ARP_FRAME_LEN)
+    return false;
+  target_ip=read32(frame+38);
   for(size_t i=0;i<config->interface_count;i++) {
     const struct router_interface *rif=&config->interfaces[i];
     if(rif->attachment==ROUTER_VSWITCH &&
-       rif->vswitch_id==ingress_vswitch_id)
-      return learn_on_interface(table,rif,ingress_port_id,frame,length,now_ns);
+       rif->vswitch_id==ingress_vswitch_id && rif->has_address &&
+       rif->address==target_ip)
+      changed|=learn_on_interface(table,rif,ingress_port_id,frame,length,
+                                  now_ns);
   }
-  return false;
+  return changed;
 }
 
 bool router_neighbor_learn_arp_interface(
