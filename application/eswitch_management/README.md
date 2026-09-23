@@ -10,6 +10,11 @@ vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
 Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
 optional DOCA Flow CT promotion offloads established TCP/UDP NAT sessions.
 ICMP and all CT misses remain on the Arm slow path.
+Inbound traffic on a NAT RIF is processed by reverse NAT first. A reverse miss
+may continue only when the IPv4 destination is a local address owned by that
+VR; it then reaches the local interface/ICMP handler. Every non-local miss is
+still dropped fail-closed. Status exposes `nat_local_fallbacks` and
+`nat_fail_closed_drops` for this decision point.
 The Arm slow path proactively resolves configured static/default-route next
 hops and refreshes them before their five-minute reachability lifetime
 expires. While an adjacency is unresolved, a bounded queue retains pre-NAT

@@ -1098,15 +1098,32 @@ static void route_arm_local_reply(struct eswitch_manager *manager,
     free(response);
     return;
   }
-  int ingress_index=find_port_index(manager,ingress_port);
-  if(ingress->attachment!=ROUTER_VSWITCH || ingress_index<0 ||
-     !eswitch_port_in_vswitch(manager,ingress->vswitch_id,ingress_port)) {
+  if (ingress->attachment == ROUTER_VSWITCH) {
+    int ingress_index=find_port_index(manager,ingress_port);
+
+    if(ingress_index<0 ||
+       !eswitch_port_in_vswitch(manager,ingress->vswitch_id,ingress_port)) {
+      manager->icmp_tx_drops++;
+      free(response);
+      return;
+    }
+    result=bind_sf_directed_context(manager,ingress->vswitch_id,ingress_port,
+                                    ingress->mac,&context_tag);
+  } else if (ingress->attachment == ROUTER_PORT) {
+    int expected_index=find_router_interface_port_index(manager,ingress);
+
+    if(expected_index<0 ||
+       manager->ports->items[expected_index].ethernet->port_id!=ingress_port) {
+      manager->icmp_tx_drops++;
+      free(response);
+      return;
+    }
+    result=bind_route_egress(manager,ingress,ingress_port,&context_tag);
+  } else {
     manager->icmp_tx_drops++;
     free(response);
     return;
   }
-  result=bind_sf_directed_context(manager,ingress->vswitch_id,ingress_port,
-                                  ingress->mac,&context_tag);
   if(result==DOCA_SUCCESS)
     result=sf_packet_io_send_context(manager->sf_io,response,response_length,
                                      context_tag);
@@ -1386,9 +1403,9 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
     const struct router_nat_policy *policy =
         router_nat_policy_find(manager->router, ingress->vr_id);
     if (policy != NULL && policy->interface_id == ingress->interface_id) {
-      /* A packet arriving on the public NAT interface is always consumed by
-       * reverse NAT.  A reverse miss is a firewall drop, not permission to
-       * fall through into ordinary VR routing. */
+      /* Reverse NAT remains the first stage. Its miss path may continue only
+       * to the local-RIF classifier inside route_uplink_ipv4_packet(); it may
+       * never fall through into transit routing. */
       route_uplink_ipv4_packet(manager, packet, ingress, ingress_port,
                                now_ns);
       free(scratch);
@@ -1429,8 +1446,37 @@ static void route_uplink_ipv4_packet(
   nat_result = router_nat_inbound(manager->nat, ingress->vr_id, frame, length,
                                   now_ns, translated, capacity, &session);
   if (nat_result != ROUTER_NAT_TRANSLATED) {
+    struct router_ipv4_decision decision;
+    enum router_ipv4_disposition disposition = ROUTER_IPV4_INVALID;
+
     if (nat_result == ROUTER_NAT_INVALID)
       manager->route_invalid++;
+    else
+      disposition = router_ipv4_lookup_interface(
+          manager->router, ingress->interface_id, frame, length, &decision);
+    if (disposition == ROUTER_IPV4_LOCAL) {
+      /* The packet missed reverse NAT but addresses an interface owned by
+       * this VR. Local ICMP processing is allowed; non-local/transit misses
+       * remain fail-closed below. */
+      manager->nat_local_fallbacks++;
+      if (manager->packet_debug)
+        printf("NAT IN LOCAL FALLBACK: vr=%u ingress-rif=%u "
+               "destination=%u.%u.%u.%u nat-result=%u\n",
+               ingress->vr_id, ingress->interface_id,
+               (decision.destination_ip >> 24) & 0xffU,
+               (decision.destination_ip >> 16) & 0xffU,
+               (decision.destination_ip >> 8) & 0xffU,
+               decision.destination_ip & 0xffU, (unsigned)nat_result);
+      route_arm_frame(manager, frame, length, ingress, ingress_port, 0, 0,
+                      now_ns);
+    } else {
+      manager->nat_fail_closed_drops++;
+      if (manager->packet_debug)
+        printf("NAT IN FAIL-CLOSED: vr=%u ingress-rif=%u nat-result=%u "
+               "local-disposition=%u\n",
+               ingress->vr_id, ingress->interface_id, (unsigned)nat_result,
+               (unsigned)disposition);
+    }
     goto out;
   }
 
@@ -1814,7 +1860,9 @@ static size_t format_status(const struct eswitch_manager *manager,
       " nat_in=%" PRIu64 " nat_reverse_misses=%" PRIu64
       " nat_created=%" PRIu64 " nat_aged=%" PRIu64
       " nat_unsupported=%" PRIu64 " nat_invalid=%" PRIu64
-      " nat_port_alloc_failures=%" PRIu64 "\n",
+      " nat_port_alloc_failures=%" PRIu64
+      " nat_local_fallbacks=%" PRIu64
+      " nat_fail_closed_drops=%" PRIu64 "\n",
       manager->router ? manager->router->nat_policy_count : 0,
       manager->nat ? manager->nat->count : 0,
       manager->nat ? manager->nat->stats.outbound_packets : 0,
@@ -1824,7 +1872,8 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->nat ? manager->nat->stats.sessions_aged : 0,
       manager->nat ? manager->nat->stats.unsupported_packets : 0,
       manager->nat ? manager->nat->stats.invalid_packets : 0,
-      manager->nat ? manager->nat->stats.port_allocation_failures : 0);
+      manager->nat ? manager->nat->stats.port_allocation_failures : 0,
+      manager->nat_local_fallbacks, manager->nat_fail_closed_drops);
   used = append_text(response, size, used,
       "nat_icmp_echo_out=%" PRIu64 " nat_icmp_echo_in=%" PRIu64 "\n",
       manager->nat ? manager->nat->stats.icmp_echo_outbound_packets : 0,

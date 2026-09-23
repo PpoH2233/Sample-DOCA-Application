@@ -41,6 +41,7 @@ struct eswitch_manager {
   struct router_neighbor_table neighbors;
   struct router_pending_queue pending;
   struct router_nat_table *nat;
+  uint64_t nat_local_fallbacks, nat_fail_closed_drops;
   bool hardware_ct_supported;
   bool packet_debug;
   uint64_t routed_seen, routed_forwarded, route_no_route;

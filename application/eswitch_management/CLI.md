@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-neighbor-hold-prearm-v31`. This revision includes
+Contract revision: `doca34-nat-local-miss-v32`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.
@@ -283,6 +283,9 @@ ports=8 assignable=7 assigned=3 available=4 vswitches=1 fdb=2
 
 `ports` includes the reserved system SF; `assignable` excludes it. Ports
 reserved by a VR are counted as assigned and excluded from `available`.
+`nat_local_fallbacks` counts reverse-NAT misses that subsequently matched a
+local RIF address in the same VR. `nat_fail_closed_drops` counts misses that
+were not local and therefore were not allowed to enter ordinary routing.
 
 ### 5.2 `tx-debug`
 

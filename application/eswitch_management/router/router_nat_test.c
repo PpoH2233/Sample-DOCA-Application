@@ -204,6 +204,12 @@ int main(void) {
   assert(icmp_session2 && icmp_session2->public_port!=icmp_session->public_port &&
          table->count==5);
 
+  /* An Echo Request arriving at the public RIF is not a reverse-NAT reply.
+   * The manager may pass this result to its local-RIF ICMP classifier. */
+  length=make_icmp_echo(original,8,remote_ip,public_ip,0x4321,7);
+  assert(router_nat_inbound(table,101,original,length,10,reverse,
+                            sizeof(reverse),&reply)==ROUTER_NAT_UNSUPPORTED);
+
   length=make_icmp_echo(original,0,remote_ip,public_ip,
                         icmp_session->public_port,7);
   assert(router_nat_inbound(table,101,original,length,10,reverse,
