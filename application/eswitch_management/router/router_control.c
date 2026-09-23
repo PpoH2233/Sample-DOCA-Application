@@ -42,13 +42,15 @@ static bool inventory_switch(void *context,uint16_t id) {
       break;
     }
   if(!exists) return false;
-  /* A ranged trunk is a transparent tagged L2 transit domain. It deliberately
-   * keeps the 802.1Q header, while a router vs-link requires one untagged
-   * broadcast domain. Refuse an ambiguous RIF attachment. */
+  /* A ranged/list trunk and a VLAN-aware access member use a tagged internal
+   * broadcast domain, while a router vs-link currently requires an untagged
+   * domain. A legacy exact trunk is translated to untagged and remains valid. */
   for(size_t i=0;i<ESWITCH_MAX_PERSISTED_MEMBERS;i++) {
     const struct eswitch_port_membership *member=&m->memberships[i];
     if(member->active && member->vswitch_id==id &&
-       eswitch_vlan_is_range(member->vlan_id,member->vlan_last))
+       eswitch_vlan_uses_tagged_domain(
+           member->mode,member->vlan_id,member->vlan_last,
+           member->vlan_extra_id,member->vlan_extra_last))
       return false;
   }
   return true;

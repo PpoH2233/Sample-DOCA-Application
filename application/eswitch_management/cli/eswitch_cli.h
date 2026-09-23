@@ -46,6 +46,8 @@ struct eswitch_cli_command {
   uint16_t port_id;
   uint16_t vlan_id;
   uint16_t vlan_last;
+  uint16_t vlan_extra_id;
+  uint16_t vlan_extra_last;
   enum eswitch_port_mode port_mode;
   bool has_id;
   bool has_port;

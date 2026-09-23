@@ -30,14 +30,19 @@ example `vs port attach --id 10 --port 1`. The version-1 flat verbs such as
 At startup every discovered DPDK port is **unassigned**. The root pipe has a
 DROP miss action, so an unassigned VF or uplink cannot exchange traffic through
 this application. An access membership is exclusive. A trunk port may belong
-to multiple virtual switches, but each `(port,VLAN)` tuple is unique. An exact
-trunk VLAN is stripped on ingress and restored by its egress gate. An inclusive
-range such as `800-899` creates a transparent trunk-only VS: hardware allow-list
-rules retain the tag end to end and drop VLANs outside each member's range.
-Transparent ranged VSs cannot contain access/exact members or a router RIF.
-Tagged ranged traffic remains in the hardware flood path; the Arm learner does
-not create FDB entries for it. Two-port p0-to-VF trunk transit therefore stays
-fully hardware-forwarded while retaining VLAN isolation.
+to multiple virtual switches, but each `(port,VLAN)` tuple is unique. A
+multi-VLAN trunk, including the two-part allow-list `6,800-899`, retains its
+802.1Q tag end to end. Hardware rules drop VLANs outside the member allow-list.
+The legacy single-VID trunk continues to translate tagged wire traffic to the
+untagged internal router domain for backward compatibility. An access
+membership may remain legacy
+untagged or select one VID; the VLAN-aware form accepts only untagged wire
+traffic, pushes its VID inside the vSwitch, and pops it again on egress. Tagged
+traffic remains in the hardware flood path; the Arm learner does not create
+FDB entries for it. A VS containing a transparent multi-VLAN trunk or a
+VLAN-aware access member cannot currently be attached as a router RIF because
+VLAN-aware VR termination is not implemented yet. A legacy single-VID trunk
+remains the supported VLAN-to-VR translation path.
 
 ## Data path
 
@@ -77,16 +82,19 @@ available on the Arm dataplane with `hw_state=fallback-arm`.
 ```text
 endpoint
    -> root classifier: physical ingress port + optional VLAN
-      -> exact trunk: match VLAN and pop 802.1Q; access: require untagged
-      -> trunk range: exact hardware allow-list, retain 802.1Q
+      -> multi-VLAN trunk: exact hardware allow-list, retain 802.1Q
+      -> legacy single-VID trunk: match VID and pop 802.1Q
+      -> VLAN access: require untagged, push configured VID internally
+      -> legacy access: require untagged
       -> write pkt_meta = (vswitch_id << 16) | ingress_port_id
       -> router uplink: broadcast ARP hardware meter -> color gate -> Arm RSS
          -> IPv4 TCP/UDP -> CT hit -> adjacency -> egress
                          \-> CT miss -------------> Arm RSS
       -> egress membership gate
-         -> access: forward untagged
-         -> exact trunk: push configured VLAN -> physical p0/VF
-         -> trunk range: allow retained VLAN or DROP -> physical p0/VF
+         -> VLAN access: match configured VID and pop -> physical p0/VF
+         -> legacy access: forward untagged
+         -> multi-VLAN trunk: allow retained VLAN or DROP -> physical p0/VF
+         -> legacy single-VID trunk: push configured VID -> physical p0/VF
          -> other non-broadcast traffic -------------------------> Arm RSS
       -> source guard
          hit  -> destination FDB -> known-unicast egress
@@ -122,9 +130,10 @@ delivery proof.
 Treat this SF as a dedicated application endpoint while the daemon owns the
 eSwitch; ordinary host networking on the same SF is outside this design.
 
-The Arm copy learns `(vswitch_id, untagged VLAN 0, source MAC)`. An exact/access
-membership updates one root classifier entry; a transparent range updates one
-entry per allowed VLAN. Both update only one HASH flood member. A
+The current Arm FDB learner handles untagged frames; retained tagged frames use
+the hardware flood path. An access membership updates one root classifier
+entry; a trunk updates one exact entry per allowed VLAN. Both update only one
+HASH flood member. A
 learned destination uses one hardware rule keyed by `(vswitch_id, dst_mac)`;
 it is not expanded per ingress port. Detaching a port removes only MACs learned
 on that port, so unrelated FDB entries remain installed.
@@ -139,7 +148,7 @@ range.
 ## Hardware resource model
 
 For `M` attached memberships, `T` expanded VLAN classifier
-entries (one for exact/access, range width for a range), `V` non-empty
+entries (one for access, allow-list width for a trunk), `V` non-empty
 vSwitches and `F` learned MAC addresses, the dynamic steering state is
 approximately:
 
@@ -157,8 +166,8 @@ source-guard entries/counters F
 ```
 
 The important change from the original implementation is that destination FDB
-state is `O(F)`, not `O(F * M)`. Exact attach/detach is `O(1)`; a range is
-`O(range width)` but still does not rebuild unrelated flood paths. Operations are
+state is `O(F)`, not `O(F * M)`. Access attach/detach is `O(1)`; a trunk is
+`O(allow-list width)` but still does not rebuild unrelated flood paths. Operations are
 serialized in the manager loop. When a multi-step mutation fails, the manager
 attempts to restore the previous classifier, flood membership, and MAC-move
 forwarding state before returning `ERR`.
@@ -182,23 +191,24 @@ The file stores stable port identities rather than transient DPDK port IDs:
 
 ```text
 # eSwitch Management persistent state
-version 3
+version 4
 vswitch 100
 vswitch 300
-member 100 parent trunk 6 6
-member 100 representor 1 0 0 access 0 0
-member 300 parent trunk 800 899
-member 300 representor 1 0 10 trunk 800 899
+member 100 parent trunk 6 6 800 899
+member 100 representor 1 0 0 access 6 6 0 0
+member 300 parent trunk 800 899 0 0
+member 300 representor 1 0 10 trunk 800 899 0 0
 ```
 
 At startup the daemon probes current ports first, loads this file, maps
 `parent` or `(host,pf,vf)` to the current DPDK port ID, then recreates the
 vSwitches and attachments. Startup fails instead of silently omitting a
 configured port when an identity cannot be resolved or the file is invalid.
-Version 3 stores both ends of the inclusive VLAN interval; exact VLANs repeat
-the same value. Versions 1 and 2 remain readable and are upgraded on the next
-successful mutation. Learned dynamic FDB entries are not persisted and are
-relearned from traffic.
+Version 4 stores a primary VLAN interval and an optional second interval;
+exact VLANs repeat the same value and an absent second interval is `0 0`.
+Versions 1, 2 and 3 remain readable and are upgraded on the next successful
+mutation. Learned dynamic FDB entries are not persisted and are relearned from
+traffic.
 See [eswitch.conf.example](eswitch.conf.example) for a complete example.
 Manual edits are read only during startup; stop the daemon before editing the
 file, then start it again. While the daemon is running, use `eswitchctl` so

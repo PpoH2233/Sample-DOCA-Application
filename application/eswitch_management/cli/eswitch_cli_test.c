@@ -75,6 +75,20 @@ int main(void) {
     assert(range.port_mode == ESWITCH_PORT_MODE_TRUNK);
     assert(range.vlan_id == 800 && range.vlan_last == 899);
   }
+  {
+    struct eswitch_cli_command list = line(
+        "vs port attach --id 99 --port 0 --mode trunk --vlan 6,800-899\n",
+        true);
+    assert(list.port_mode == ESWITCH_PORT_MODE_TRUNK);
+    assert(list.vlan_id == 6 && list.vlan_last == 6);
+    assert(list.vlan_extra_id == 800 && list.vlan_extra_last == 899);
+  }
+  {
+    struct eswitch_cli_command access = line(
+        "vs port attach --id 99 --port 3 --mode access --vlan 6\n", true);
+    assert(access.port_mode == ESWITCH_PORT_MODE_ACCESS);
+    assert(access.vlan_id == 6 && access.vlan_last == 6);
+  }
   accept_port("vs port detach --id 100 --port 1\n",
               ESWITCH_CLI_VS_PORT_DETACH, 100, 1, false);
   /* Named options are order independent. */
@@ -147,7 +161,8 @@ int main(void) {
   reject("vs port\n");
   reject("vs port attach --id 100\n");
   reject("vs port attach --id 100 --port 0 --mode trunk\n");
-  reject("vs port attach --id 100 --port 0 --mode access --vlan 6\n");
+  reject("vs port attach --id 100 --port 0 --mode access --vlan 6-7\n");
+  reject("vs port attach --id 100 --port 0 --mode access --vlan 6,800-899\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 0\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 4095\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 900-800\n");
@@ -156,6 +171,8 @@ int main(void) {
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 800-\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan -899\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 800-850-899\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 6,6\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 6,800-899,900\n");
   reject("vs port detach --id 100 --port 0 --mode trunk --vlan 6\n");
   reject("vs-port-detach --id 100 --port 0 --vlan 6\n");
   reject("vs port attach --id 0 --port 1\n");

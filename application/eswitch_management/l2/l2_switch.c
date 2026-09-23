@@ -65,7 +65,8 @@ doca_error_t create_vswitch(struct eswitch_manager *manager,
 doca_error_t attach_port(struct eswitch_manager *manager,
                          uint16_t vswitch_id, uint16_t port_id,
                          enum eswitch_port_mode mode, uint16_t vlan_id,
-                         uint16_t vlan_last) {
+                         uint16_t vlan_last, uint16_t vlan_extra_id,
+                         uint16_t vlan_extra_last) {
   struct managed_vswitch *vswitch = find_vswitch(manager, vswitch_id);
   struct eswitch_port_membership *membership = NULL;
   int port_index;
@@ -80,17 +81,24 @@ doca_error_t attach_port(struct eswitch_manager *manager,
       ETHERNET_PORT_ROLE_SF_REPRESENTOR)
     return DOCA_ERROR_NOT_SUPPORTED;
   if ((mode == ESWITCH_PORT_MODE_TRUNK &&
-       !eswitch_vlan_range_valid(vlan_id, vlan_last)) ||
+       !eswitch_vlan_allowlist_valid(vlan_id, vlan_last, vlan_extra_id,
+                                     vlan_extra_last)) ||
       (mode == ESWITCH_PORT_MODE_ACCESS &&
-       (vlan_id != 0 || vlan_last != 0)))
+       ((vlan_id == 0) != (vlan_last == 0) || vlan_id != vlan_last ||
+        (vlan_id != 0 && !eswitch_vlan_valid(vlan_id)) ||
+        vlan_extra_id != 0 || vlan_extra_last != 0)))
     return DOCA_ERROR_INVALID_VALUE;
   if (router_control_port_reserved(manager, (uint16_t)port_index))
     return DOCA_ERROR_IN_USE;
-  if (eswitch_vlan_is_range(vlan_id, vlan_last) && manager->router != NULL &&
+  if (eswitch_vlan_uses_tagged_domain(mode, vlan_id, vlan_last,
+                                      vlan_extra_id, vlan_extra_last) &&
+      manager->router != NULL &&
       router_switch_reserved(manager->router, vswitch_id))
     return DOCA_ERROR_IN_USE;
   size_t vlan_rule_count = mode == ESWITCH_PORT_MODE_TRUNK
-                               ? eswitch_vlan_range_size(vlan_id, vlan_last)
+                               ? eswitch_vlan_allowlist_size(
+                                     vlan_id, vlan_last, vlan_extra_id,
+                                     vlan_extra_last)
                                : 1U;
   for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
     struct eswitch_port_membership *candidate = &manager->memberships[i];
@@ -100,27 +108,27 @@ doca_error_t attach_port(struct eswitch_manager *manager,
       continue;
     }
     if (candidate->mode == ESWITCH_PORT_MODE_TRUNK)
-      vlan_rule_count += eswitch_vlan_range_size(candidate->vlan_id,
-                                                  candidate->vlan_last);
+      vlan_rule_count += eswitch_vlan_allowlist_size(
+          candidate->vlan_id, candidate->vlan_last,
+          candidate->vlan_extra_id, candidate->vlan_extra_last);
     else
       vlan_rule_count++;
     if (candidate->vswitch_id == vswitch_id &&
-        (eswitch_vlan_is_range(candidate->vlan_id, candidate->vlan_last) ||
-         eswitch_vlan_is_range(vlan_id, vlan_last))) {
-      /* A transparent range vSwitch keeps the original tag end to end. It
-       * cannot share a broadcast domain with a pop/push or access member. */
-      if (!eswitch_vlan_is_range(candidate->vlan_id, candidate->vlan_last) ||
-          !eswitch_vlan_is_range(vlan_id, vlan_last))
-        return DOCA_ERROR_IN_USE;
-    }
+        eswitch_vlan_uses_tagged_domain(
+            candidate->mode, candidate->vlan_id, candidate->vlan_last,
+            candidate->vlan_extra_id, candidate->vlan_extra_last) !=
+            eswitch_vlan_uses_tagged_domain(mode, vlan_id, vlan_last,
+                                            vlan_extra_id, vlan_extra_last))
+      return DOCA_ERROR_IN_USE;
     if (candidate->port_index != (uint16_t)port_index)
       continue;
     if (candidate->vswitch_id == vswitch_id ||
         candidate->mode == ESWITCH_PORT_MODE_ACCESS ||
         mode == ESWITCH_PORT_MODE_ACCESS ||
-        eswitch_vlan_ranges_overlap(candidate->vlan_id,
-                                    candidate->vlan_last, vlan_id,
-                                    vlan_last))
+        eswitch_vlan_allowlists_overlap(
+            candidate->vlan_id, candidate->vlan_last,
+            candidate->vlan_extra_id, candidate->vlan_extra_last, vlan_id,
+            vlan_last, vlan_extra_id, vlan_extra_last))
       return DOCA_ERROR_IN_USE;
   }
   if (membership == NULL ||
@@ -130,7 +138,8 @@ doca_error_t attach_port(struct eswitch_manager *manager,
 
   result = eswitch_pipeline_attach_port(manager->pipeline,
                                         (uint16_t)port_index, vswitch_id,
-                                        mode, vlan_id, vlan_last);
+                                        mode, vlan_id, vlan_last,
+                                        vlan_extra_id, vlan_extra_last);
   if (result != DOCA_SUCCESS)
     return result;
   result = eswitch_pipeline_flood_add_port(manager->pipeline, vswitch_id,
@@ -149,20 +158,40 @@ doca_error_t attach_port(struct eswitch_manager *manager,
       .port_id = port_id,
       .vlan_id = vlan_id,
       .vlan_last = eswitch_vlan_range_last(vlan_id, vlan_last),
+      .vlan_extra_id = vlan_extra_id,
+      .vlan_extra_last =
+          eswitch_vlan_extra_present(vlan_extra_id, vlan_extra_last)
+              ? eswitch_vlan_range_last(vlan_extra_id, vlan_extra_last)
+              : 0,
       .mode = mode,
       .active = true,
   };
   manager->membership_count++;
   if (mode == ESWITCH_PORT_MODE_ACCESS)
     manager->port_owner[port_index] = vswitch_id;
-  if (eswitch_vlan_is_range(vlan_id, vlan_last))
-    printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=trunk vlan=%u-%u "
-           "path=transparent\n", vswitch_id, port_id, vlan_id,
-           eswitch_vlan_range_last(vlan_id, vlan_last));
-  else
+  if (eswitch_vlan_is_transparent_trunk(mode, vlan_id, vlan_last,
+                                        vlan_extra_id, vlan_extra_last)) {
+    if (vlan_extra_id != 0)
+      printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=trunk "
+             "vlan=%u-%u,%u-%u path=transparent\n", vswitch_id, port_id,
+             vlan_id, eswitch_vlan_range_last(vlan_id, vlan_last),
+             vlan_extra_id,
+             eswitch_vlan_range_last(vlan_extra_id, vlan_extra_last));
+    else {
+      if (vlan_id == eswitch_vlan_range_last(vlan_id, vlan_last)) {
+        printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=trunk "
+               "vlan=%u path=transparent\n", vswitch_id, port_id, vlan_id);
+      } else {
+        printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=trunk "
+               "vlan=%u-%u path=transparent\n", vswitch_id, port_id,
+               vlan_id, eswitch_vlan_range_last(vlan_id, vlan_last));
+      }
+    }
+  } else {
     printf("VSWITCH ATTACH: vs=%u dpdk-port=%u mode=%s vlan=%u\n", vswitch_id,
            port_id, mode == ESWITCH_PORT_MODE_TRUNK ? "trunk" : "access",
            vlan_id);
+  }
   return DOCA_SUCCESS;
 }
 
@@ -203,7 +232,8 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     doca_error_t rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id,
         saved_membership.mode, saved_membership.vlan_id,
-        saved_membership.vlan_last);
+        saved_membership.vlan_last, saved_membership.vlan_extra_id,
+        saved_membership.vlan_extra_last);
     free(neighbor_backup);
     return rollback == DOCA_SUCCESS ? result : rollback;
   }
@@ -213,7 +243,8 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     doca_error_t rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id,
         saved_membership.mode, saved_membership.vlan_id,
-        saved_membership.vlan_last);
+        saved_membership.vlan_last, saved_membership.vlan_extra_id,
+        saved_membership.vlan_extra_last);
     if (rollback == DOCA_SUCCESS)
       rollback = eswitch_pipeline_flood_add_port(
           manager->pipeline, vswitch_id, port_id, &vswitch->flood);
@@ -239,7 +270,8 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id,
         saved_membership.mode, saved_membership.vlan_id,
-        saved_membership.vlan_last);
+        saved_membership.vlan_last, saved_membership.vlan_extra_id,
+        saved_membership.vlan_extra_last);
     if (rollback == DOCA_SUCCESS)
       rollback = eswitch_pipeline_flood_add_port(
           manager->pipeline, vswitch_id, port_id, &vswitch->flood);
@@ -258,7 +290,8 @@ doca_error_t detach_port(struct eswitch_manager *manager,
     rollback = eswitch_pipeline_attach_port(
         manager->pipeline, (uint16_t)port_index, vswitch_id,
         saved_membership.mode, saved_membership.vlan_id,
-        saved_membership.vlan_last);
+        saved_membership.vlan_last, saved_membership.vlan_extra_id,
+        saved_membership.vlan_extra_last);
     if (rollback == DOCA_SUCCESS)
       rollback = eswitch_pipeline_flood_add_port(
           manager->pipeline, vswitch_id, port_id, &vswitch->flood);

@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-transparent-trunk-range-v29`. This revision includes
+Contract revision: `doca34-vlan-trunk-allowlist-v30`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.
@@ -30,7 +30,7 @@ The complete canonical command set:
 | 3 | `vs create --id <id>` | mutation |
 | 4 | `vs delete --id <id>` | mutation |
 | 5 | `vs show [--id <id>]` | query |
-| 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <vid\|first-last>]` | mutation |
+| 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <interval[,interval]>]` | mutation |
 | 7 | `vs port detach --id <id> --port <port-id>` | mutation |
 | 8 | `port show` | query |
 | 9 | `fdb show [--id <id>]` | query |
@@ -80,6 +80,7 @@ Grammar rules:
 | `<ip/prefix>` | IPv4 host address with prefix length, for example `10.0.0.1/24`. Must be a usable unicast address: not `0.0.0.0/x`, not loopback, not multicast or reserved, not the network or broadcast address of its own prefix when the prefix is shorter than `/31`. |
 | `<cidr>` | IPv4 prefix with zero host bits, for example `10.0.0.0/8` or `0.0.0.0/0`. |
 | `<ip>` for `--via` | IPv4 next hop. Must be on-link for the named interface and not the interface's own address. |
+| `<interval[,interval]>` | One VLAN VID, one inclusive VLAN range, or two comma-separated intervals; VIDs are `1..4094` and intervals must not overlap. Access mode permits only one VID. |
 | `<first-last>` | NAT port range. `first >= 1024` and `first <= last`. Applies to TCP and UDP ports and to ICMP Echo identifiers. |
 | `--address interface` | For `vr nat enable` only: use the uplink RIF's own address. |
 
@@ -333,48 +334,66 @@ ERR vSwitch is attached to a VR; detach it first with: vr switch detach --id <vr
 
 ```bash
 eswitchctl vs port attach --id 100 --port 1
+eswitchctl vs port attach --id 100 --port 4 --mode access --vlan 6
 eswitchctl vs port attach --id 32774 --port 0 --mode trunk --vlan 6
 eswitchctl vs port attach --id 300 --port 0 --mode trunk --vlan 800-899
+eswitchctl vs port attach --id 99 --port 0 --mode trunk --vlan 6,800-899
 eswitchctl vs port detach --id 100 --port 1
 ```
 
-The default is an untagged access membership. A trunk membership accepts one
-VLAN ID or one inclusive range; every endpoint must be in 1-4094 and the first
-must not exceed the last. A physical port may have multiple trunk memberships,
-but a given `(port,VLAN)` belongs to exactly one vSwitch. Access and trunk
-memberships cannot coexist on one port. A port reserved directly by a VR cannot
-be attached.
+The default is a legacy untagged access membership. `--mode access --vlan 6`
+is a VLAN-6 access membership: its physical wire side is untagged, ingress
+pushes VID 6 inside the vSwitch, and egress accepts only VID 6 before popping
+the tag. Access accepts exactly one VID, never a range or list.
 
-An exact VLAN remains a routed/translated broadcast domain: ingress pops its
-802.1Q tag and its egress gate pushes that VLAN again. A range is deliberately
-a **transparent L2 trunk domain**. The tag stays in the packet, ingress and
-egress hardware rules enforce the configured inclusive allow-list, and an
-egress VLAN outside that port's range drops. All members of a ranged VS must
-also be ranged trunks; an access member, exact-VLAN member, or VR vs-link is
-rejected. This prevents VLANs 800-899 from being collapsed into one untagged
-broadcast domain. Use an exact-VLAN VS when a VR/NAT interface must terminate a
-VLAN.
+A trunk membership accepts one VID, one inclusive range, or exactly two
+comma-separated intervals. Thus `6,800-899` means VLAN 6 plus every VLAN from
+800 through 899; it does not mean 6 through 899. A range or comma-list is a
+transparent trunk: the 802.1Q tag is preserved on ingress and egress, including
+VID 6 in `6,800-899`. Hardware exact-match rules drop tagged traffic outside
+the allow-list and untagged traffic does not match. A single-VID trunk retains
+the pre-v30 translated behavior (pop on ingress, push on egress) so existing
+VLAN WAN/VR configurations remain compatible. Every endpoint must be in
+1-4094 and intervals may not overlap.
 
-A range expands to one exact ingress rule and one exact egress rule per VLAN.
+A physical port may have multiple trunk memberships, but a given
+`(port,VLAN)` belongs to exactly one vSwitch. Access and trunk memberships
+cannot coexist on one physical port. A port reserved directly by a VR cannot
+be attached. A vSwitch may contain VLAN-aware access members together with
+trunk members; egress gates ensure that each access member receives only its
+configured VID. A tagged internal domain (range/list trunk plus VLAN-aware
+access) cannot be mixed in one vSwitch with an untagged internal domain
+(legacy access plus legacy single-VID trunk).
+
+The tagged internal domain used by a range/list trunk or VLAN-aware access
+member cannot yet terminate on `vr switch attach`; that operation is rejected.
+For the existing VLAN WAN/NAT path, use a dedicated vSwitch with one legacy
+single-VID trunk, which translates the VLAN to the router's untagged domain.
+
+A trunk allow-list expands to one exact ingress rule and one exact egress rule
+per VLAN.
 The aggregate expanded ingress count is limited to
-`ESWITCH_MAX_VLAN_MEMBERSHIPS` (512), so `800-899` consumes 100 classifier
+`ESWITCH_MAX_VLAN_MEMBERSHIPS` (512), so `6,800-899` consumes 101 classifier
 slots. Attach and persistence are transactional; an overlapping `(port,VLAN)`
 or insufficient capacity leaves the previous configuration unchanged.
 
-Example: transparently carry VLANs 800-899 between p0 and a host-facing VF.
+Example: transparently carry VLAN 6 and VLANs 800-899 between p0 and a
+host-facing VF, while another VF is an untagged access endpoint for VLAN 6.
 Use `port show` for the actual DPDK IDs; `0` and `4` are examples only:
 
 ```bash
 eswitchctl vs create --id 300
 eswitchctl vs port attach --id 300 --port 0 \
-  --mode trunk --vlan 800-899
+  --mode trunk --vlan 6,800-899
 eswitchctl vs port attach --id 300 --port 4 \
-  --mode trunk --vlan 800-899
+  --mode trunk --vlan 6,800-899
+eswitchctl vs port attach --id 300 --port 3 \
+  --mode access --vlan 6
 eswitchctl vs show --id 300
 ```
 
 The tagged frame stays in hardware. The current Arm FDB learner intentionally
-ignores retained tagged frames, so ranged VS traffic uses the hardware flood
+ignores retained tagged frames, so trunk traffic uses the hardware flood
 group rather than learned unicast. With two trunk members, split horizon drops
 the ingress copy and the other member receives one copy. VLAN-aware FDB
 learning is a separate future optimization; it is not required for correct
@@ -382,18 +401,20 @@ two-port trunk transit.
 
 `attach` performs, in order:
 
-1. Add root classifier entries. Access ingress must be untagged; an exact trunk
-   matches VLAN ID and pops the 802.1Q header; a range creates exact allow-list
-   entries and preserves the tag.
+1. Add root classifier entries. Access ingress must be untagged and a
+   VLAN-aware access port pushes its VID. A multi-VLAN trunk creates one exact
+   allow-list entry per permitted VID and preserves the tag. A legacy
+   single-VID trunk pops that tag.
 2. Write
    `(vswitch_id << 16) | ingress_port_id` into packet metadata.
-3. Add a flood member through a per-membership egress gate. An exact trunk gate
-   pushes its configured VLAN. A ranged gate forwards only frames whose
-   retained tag is within that port's range.
+3. Add a flood member through a per-membership egress gate. A multi-VLAN trunk
+   forwards only frames whose retained tag is in its allow-list. A legacy
+   single-VID trunk pushes its tag. A VLAN-aware access gate matches its VID
+   and pops the tag before physical transmission.
 
 `detach` performs, in order:
 
-1. Remove the port's root classifier entry or range entries, stopping new
+1. Remove the port's root classifier entry or allow-list entries, stopping new
    ingress.
 2. Remove only that port's member entry from the flooding HASH pipe.
 3. Remove only FDB entries whose learned egress is the detached port.
@@ -464,10 +485,13 @@ eswitchctl vs show --id 100
 
 ```text
 OK
-vs=100 ports=[1:access,2:access]
+vs=100 ports=[1:access,2:access/vlan=6]
 vs=32774 ports=[0:trunk/vlan=6]
-vs=300 ports=[0:trunk/vlan=800-899,10:trunk/vlan=800-899]
+vs=300 ports=[0:trunk/vlan=6+800-899,10:trunk/vlan=6+800-899,3:access/vlan=6]
 ```
+
+`vs show` uses `+` between disjoint VLAN intervals so commas remain an
+unambiguous separator between member ports. CLI input continues to use a comma.
 
 Without `--id` this is a collection read: `OK` plus one line per vSwitch, or
 `(empty)` when none exist. With `--id` it is a single-object read: `OK` plus
@@ -822,8 +846,8 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | vSwitch | `GET /vswitches/{id}` | `vs show --id {id}` |
 | vSwitch | `POST /vswitches` `{"id":N}` | `vs create --id N` |
 | vSwitch | `DELETE /vswitches/{id}` | `vs delete --id {id}` |
-| vSwitch member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"access"}` | `vs port attach --id {id} --port {port}` |
-| vSwitch trunk member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"trunk","vlan":6}` or `{"mode":"trunk","vlan_first":800,"vlan_last":899}` | `vs port attach --id {id} --port {port} --mode trunk --vlan 6` or `--vlan 800-899` |
+| vSwitch access member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"access"}` or `{"mode":"access","vlan":6}` | `vs port attach --id {id} --port {port}` or `--mode access --vlan 6` |
+| vSwitch trunk member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"trunk","vlans":"6,800-899"}` | `vs port attach --id {id} --port {port} --mode trunk --vlan 6,800-899` |
 | vSwitch member | `DELETE /vswitches/{id}/ports/{port}` | `vs port detach --id {id} --port {port}` |
 | Port | `GET /ports?assigned=false` | `port show` |
 | FDB | `GET /fdb` | `fdb show` |

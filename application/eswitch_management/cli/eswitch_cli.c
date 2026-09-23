@@ -27,8 +27,8 @@ static bool parse_u16(const char *text, uint16_t *value) {
   return true;
 }
 
-static bool parse_vlan_spec(const char *text, uint16_t *first,
-                            uint16_t *last) {
+static bool parse_vlan_interval(const char *text, uint16_t *first,
+                                uint16_t *last) {
   const char *separator;
   char first_text[16];
   char last_text[16];
@@ -55,6 +55,37 @@ static bool parse_vlan_spec(const char *text, uint16_t *first,
   strcpy(last_text, separator + 1);
   return parse_u16(first_text, first) && parse_u16(last_text, last) &&
          eswitch_vlan_range_valid(*first, *last);
+}
+
+static bool parse_vlan_spec(const char *text, uint16_t *first,
+                            uint16_t *last, uint16_t *extra_first,
+                            uint16_t *extra_last) {
+  const char *comma;
+  char left[32];
+  char right[32];
+  size_t left_length;
+
+  if (text == NULL || first == NULL || last == NULL ||
+      extra_first == NULL || extra_last == NULL)
+    return false;
+  comma = strchr(text, ',');
+  if (comma == NULL) {
+    *extra_first = 0;
+    *extra_last = 0;
+    return parse_vlan_interval(text, first, last);
+  }
+  if (comma == text || comma[1] == '\0' || strchr(comma + 1, ',') != NULL)
+    return false;
+  left_length = (size_t)(comma - text);
+  if (left_length >= sizeof(left) || strlen(comma + 1) >= sizeof(right))
+    return false;
+  memcpy(left, text, left_length);
+  left[left_length] = '\0';
+  strcpy(right, comma + 1);
+  return parse_vlan_interval(left, first, last) &&
+         parse_vlan_interval(right, extra_first, extra_last) &&
+         eswitch_vlan_allowlist_valid(*first, *last, *extra_first,
+                                      *extra_last);
 }
 
 /* Canonical option scanning: named options only, each at most once, in any
@@ -92,7 +123,8 @@ static bool parse_options(size_t start, size_t count,
       out->has_mode = true;
     } else if (strcmp(key, "--vlan") == 0) {
       bit = OPTION_VLAN;
-      if (!parse_vlan_spec(value, &out->vlan_id, &out->vlan_last))
+      if (!parse_vlan_spec(value, &out->vlan_id, &out->vlan_last,
+                           &out->vlan_extra_id, &out->vlan_extra_last))
         return false;
       out->has_vlan = true;
     } else {
@@ -136,8 +168,11 @@ static bool valid_port_membership_options(struct eswitch_cli_command *out) {
     out->port_mode = ESWITCH_PORT_MODE_ACCESS;
   if (out->port_mode == ESWITCH_PORT_MODE_TRUNK)
     return out->has_vlan &&
-           eswitch_vlan_range_valid(out->vlan_id, out->vlan_last);
-  return !out->has_vlan;
+           eswitch_vlan_allowlist_valid(
+               out->vlan_id, out->vlan_last, out->vlan_extra_id,
+               out->vlan_extra_last);
+  return !out->has_vlan ||
+         (out->vlan_id == out->vlan_last && out->vlan_extra_id == 0);
 }
 
 bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
@@ -335,7 +370,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
     return "Usage: vs show [--id <id>]\n";
   if (strcmp(resource, "vs-port-attach") == 0)
     return "Usage: vs port attach --id <id> --port <port-id> "
-           "[--mode access|trunk] [--vlan <vid|first-last>]\n";
+           "[--mode access|trunk] [--vlan <interval[,interval]>]\n";
   if (strcmp(resource, "vs-port-detach") == 0)
     return "Usage: vs port detach --id <id> --port <port-id>\n";
   if (strcmp(resource, "show-fdb") == 0)
@@ -361,7 +396,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
   if (token_count >= 2 && strcmp(tokens[1], "port") == 0) {
     if (token_count >= 3 && strcmp(tokens[2], "attach") == 0)
       return "Usage: vs port attach --id <id> --port <port-id> "
-             "[--mode access|trunk] [--vlan <vid|first-last>]\n";
+             "[--mode access|trunk] [--vlan <interval[,interval]>]\n";
     if (token_count >= 3 && strcmp(tokens[2], "detach") == 0)
       return "Usage: vs port detach --id <id> --port <port-id>\n";
     return "Usage: vs port attach|detach --id <id> --port <port-id>\n";
@@ -399,7 +434,7 @@ void eswitch_cli_help(FILE *output, const char *program,
           "  vs show [--id <id>]                      Show all or one "
           "virtual switch\n"
           "  vs port attach --id <id> --port <port> [--mode access|trunk] "
-          "[--vlan <vid|first-last>]\n"
+          "[--vlan <interval[,interval]>]\n"
           "                                             Attach an access "
           "port (default), an exact VLAN, or a transparent VLAN range\n"
           "  vs port detach --id <id> --port <port>   Detach a member port\n\n"

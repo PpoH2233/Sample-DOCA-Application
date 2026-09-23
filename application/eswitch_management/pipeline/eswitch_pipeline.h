@@ -35,6 +35,8 @@ struct eswitch_pipeline_membership {
   uint16_t port_id;
   uint16_t vlan_id;
   uint16_t vlan_last;
+  uint16_t vlan_extra_id;
+  uint16_t vlan_extra_last;
   enum eswitch_port_mode mode;
   struct eswitch_rule ingress;
   struct eswitch_rule *range_ingress;
@@ -244,7 +246,9 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t vswitch_id,
                                           enum eswitch_port_mode mode,
                                           uint16_t vlan_id,
-                                          uint16_t vlan_last);
+                                          uint16_t vlan_last,
+                                          uint16_t vlan_extra_id,
+                                          uint16_t vlan_extra_last);
 /* Router-owned uplinks bypass L2 learning and go directly to the Arm RSS
  * slow path. The high metadata half carries the VR id for ingress isolation. */
 doca_error_t eswitch_pipeline_attach_router_port(

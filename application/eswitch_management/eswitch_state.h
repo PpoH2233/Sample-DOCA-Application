@@ -24,6 +24,8 @@ struct eswitch_state_member {
   enum eswitch_port_mode mode;
   uint16_t vlan_id;
   uint16_t vlan_last;
+  uint16_t vlan_extra_id;
+  uint16_t vlan_extra_last;
 };
 
 struct eswitch_state {
