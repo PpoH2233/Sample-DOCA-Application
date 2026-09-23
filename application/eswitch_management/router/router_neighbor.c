@@ -169,6 +169,23 @@ bool router_neighbor_should_probe(struct router_neighbor_table *table,
   return true;
 }
 
+bool router_neighbor_needs_refresh(const struct router_neighbor_table *table,
+                                   uint16_t vr_id, uint16_t interface_id,
+                                   uint32_t ip, uint64_t now_ns) {
+  if (table == NULL || vr_id == 0 || interface_id == 0 || ip == 0)
+    return false;
+  for (size_t i = 0; i < ROUTER_MAX_NEIGHBORS; i++) {
+    const struct router_neighbor *neighbor = &table->entries[i];
+
+    if (!neighbor->used || neighbor->vr_id != vr_id ||
+        neighbor->interface_id != interface_id || neighbor->ip != ip)
+      continue;
+    return !neighbor->resolved || neighbor->last_seen_ns == 0 ||
+           now_ns - neighbor->last_seen_ns >= ROUTER_NEIGHBOR_REFRESH_DUE_NS;
+  }
+  return true;
+}
+
 void router_neighbor_age(struct router_neighbor_table *table, uint64_t now_ns) {
   if (table == NULL)
     return;

@@ -120,8 +120,14 @@ int main(void) {
   neighbor=router_neighbor_lookup(&neighbors,101,2,0xc0a80132,
                                   UINT64_C(303000000000));
   assert(neighbor && neighbor->port_id==7 && !memcmp(neighbor->mac,vm_b,6));
+  assert(!router_neighbor_needs_refresh(&neighbors,101,2,0xc0a80132,
+                                        UINT64_C(100000000000)));
+  assert(router_neighbor_needs_refresh(&neighbors,101,2,0xc0a80132,
+                                       UINT64_C(245000000000)));
   assert(router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,
                                       UINT64_C(3000000000)));
+  assert(router_neighbor_needs_refresh(&neighbors,101,2,0xc0a80140,
+                                       UINT64_C(3000000000)));
   assert(!router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,
                                        UINT64_C(3500000000)));
   assert(router_neighbor_should_probe(&neighbors,101,2,0xc0a80140,

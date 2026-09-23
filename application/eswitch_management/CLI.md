@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-vlan-trunk-allowlist-v30`. This revision includes
+Contract revision: `doca34-neighbor-hold-prearm-v31`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.

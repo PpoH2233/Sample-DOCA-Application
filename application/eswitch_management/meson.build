@@ -45,6 +45,7 @@ executable(
     'router/router_forward.c',
     'router/router_icmp.c',
     'router/router_neighbor.c',
+    'router/router_pending.c',
     'router/router_hw.c',
     'router/router_nat.c',
     'router/router_nat_ct.c',
@@ -128,6 +129,14 @@ forward_test = executable(
   install: false,
 )
 test('eswitch-router-forward', forward_test)
+
+pending_test = executable(
+  'eswitch-router-pending-test',
+  ['router/router_pending_test.c', 'router/router_pending.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-pending', pending_test)
 
 nat_test = executable(
   'eswitch-router-nat-test',

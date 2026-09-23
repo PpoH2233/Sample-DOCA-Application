@@ -9,6 +9,7 @@
 
 #define ROUTER_MAX_NEIGHBORS 512U
 #define ROUTER_NEIGHBOR_REACHABLE_NS UINT64_C(300000000000)
+#define ROUTER_NEIGHBOR_REFRESH_DUE_NS UINT64_C(240000000000)
 #define ROUTER_NEIGHBOR_PROBE_NS UINT64_C(1000000000)
 #define ROUTER_NEIGHBOR_REFRESH_NS UINT64_C(1000000000)
 
@@ -52,6 +53,12 @@ const struct router_neighbor *router_neighbor_lookup(
 bool router_neighbor_should_probe(struct router_neighbor_table *table,
                                   uint16_t vr_id, uint16_t interface_id,
                                   uint32_t ip, uint64_t now_ns);
+
+/* True for an unresolved adjacency or one nearing expiry. The caller still
+ * uses router_neighbor_should_probe() to enforce the probe-rate limit. */
+bool router_neighbor_needs_refresh(const struct router_neighbor_table *table,
+                                   uint16_t vr_id, uint16_t interface_id,
+                                   uint32_t ip, uint64_t now_ns);
 
 void router_neighbor_age(struct router_neighbor_table *table, uint64_t now_ns);
 void router_neighbor_invalidate_port(struct router_neighbor_table *table,

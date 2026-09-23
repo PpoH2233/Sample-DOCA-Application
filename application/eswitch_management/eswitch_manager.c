@@ -329,6 +329,26 @@ static doca_error_t create_vswitch_persisted(struct eswitch_manager *manager,
   return result;
 }
 
+static doca_error_t unarm_router_member(struct eswitch_manager *manager,
+                                        uint16_t vswitch_id,
+                                        uint16_t port_id) {
+  if (manager->router == NULL)
+    return DOCA_SUCCESS;
+  for (size_t i = 0; i < manager->router->interface_count; i++) {
+    const struct router_interface *rif = &manager->router->interfaces[i];
+    doca_error_t result;
+
+    if (rif->attachment != ROUTER_VSWITCH ||
+        rif->vswitch_id != vswitch_id)
+      continue;
+    result = eswitch_pipeline_sf_unbind_egress(
+        manager->pipeline, rif->interface_id, vswitch_id, port_id);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  return DOCA_SUCCESS;
+}
+
 static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t vswitch_id,
                                           uint16_t port_id,
@@ -341,10 +361,21 @@ static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
                                     vlan_id, vlan_last, vlan_extra_id,
                                     vlan_extra_last);
 
+  if (result == DOCA_SUCCESS && manager->router != NULL) {
+    result = eswitch_manager_router_prearm(manager, manager->router);
+    if (result != DOCA_SUCCESS) {
+      doca_error_t cleanup = unarm_router_member(manager, vswitch_id, port_id);
+      if (cleanup == DOCA_SUCCESS)
+        cleanup = detach_port(manager, vswitch_id, port_id);
+      return cleanup == DOCA_SUCCESS ? result : cleanup;
+    }
+  }
   if (result == DOCA_SUCCESS) {
     doca_error_t save_result = persist_manager(manager);
     if (save_result != DOCA_SUCCESS) {
-      doca_error_t rollback = detach_port(manager, vswitch_id, port_id);
+      doca_error_t rollback = unarm_router_member(manager, vswitch_id, port_id);
+      if (rollback == DOCA_SUCCESS)
+        rollback = detach_port(manager, vswitch_id, port_id);
       return rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
@@ -388,7 +419,12 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
 
   if (result == DOCA_SUCCESS) {
     router_nat_flush(manager->nat, 0);
+    result = unarm_router_member(manager, vswitch_id, port_id);
+  }
+  if (result == DOCA_SUCCESS) {
     result = detach_port(manager, vswitch_id, port_id);
+    if (result != DOCA_SUCCESS && manager->router != NULL)
+      (void)eswitch_manager_router_prearm(manager, manager->router);
   }
 
   if (result == DOCA_SUCCESS) {
@@ -398,6 +434,8 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
                                           old_mode, old_vlan, old_vlan_last,
                                           old_vlan_extra,
                                           old_vlan_extra_last);
+      if (rollback == DOCA_SUCCESS && manager->router != NULL)
+        rollback = eswitch_manager_router_prearm(manager, manager->router);
       return rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
@@ -497,6 +535,9 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   result = restore_manager(manager);
   if (result == DOCA_SUCCESS)
     result = router_control_restore(manager);
+  if (result == DOCA_SUCCESS)
+    result = eswitch_manager_router_prepare(manager, manager->router,
+                                            manager->started_ns);
   if (result == DOCA_SUCCESS)
     result = eswitch_manager_hw_routes_sync(manager, manager->router);
   if (result != DOCA_SUCCESS)
@@ -651,7 +692,128 @@ static doca_error_t bind_route_egress(
     struct eswitch_manager *manager, const struct router_interface *egress,
     uint16_t target_port_id, uint16_t *context_tag);
 
-static void send_route_neighbor_probe(
+static bool sf_context_exists(const struct eswitch_pipeline *pipeline,
+                              uint16_t interface_id, bool directed,
+                              uint16_t target_port_id) {
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    const struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+
+    if (context->active && context->interface_id == interface_id &&
+        context->directed == directed &&
+        (!directed || context->target_port_id == target_port_id))
+      return true;
+  }
+  return false;
+}
+
+/* Reserve the whole desired context set before programming HWS. This keeps a
+ * large topology from failing halfway through pre-arm and leaving only some
+ * VM return paths ready. */
+static doca_error_t preflight_router_contexts(
+    const struct eswitch_manager *manager,
+    const struct router_config *config) {
+  size_t active = 0;
+  size_t missing = 0;
+
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
+    active += manager->pipeline->sf_return_contexts[i].active ? 1U : 0U;
+  for (size_t r = 0; r < config->interface_count; r++) {
+    const struct router_interface *rif = &config->interfaces[r];
+
+    if (!rif->has_address || rif->attachment == ROUTER_LINK)
+      continue;
+    if (rif->attachment == ROUTER_VSWITCH) {
+      if (!sf_context_exists(manager->pipeline, rif->interface_id, false,
+                             UINT16_MAX))
+        missing++;
+      for (size_t m = 0; m < ESWITCH_MAX_PERSISTED_MEMBERS; m++) {
+        const struct eswitch_port_membership *member =
+            &manager->memberships[m];
+
+        if (member->active && member->vswitch_id == rif->vswitch_id &&
+            !sf_context_exists(manager->pipeline, rif->interface_id, true,
+                               member->port_id))
+          missing++;
+      }
+      continue;
+    }
+    {
+      int port_index = find_router_interface_port_index(manager, rif);
+
+      if (port_index < 0)
+        return DOCA_ERROR_NOT_FOUND;
+      if (!sf_context_exists(
+              manager->pipeline, rif->interface_id, true,
+              manager->ports->items[port_index].ethernet->port_id))
+        missing++;
+    }
+  }
+  if (active + missing > ESWITCH_MAX_SF_RETURN_CONTEXTS) {
+    fprintf(stderr,
+            "SF RETURN PRE-ARM CAPACITY: active=%zu missing=%zu limit=%u\n",
+            active, missing, ESWITCH_MAX_SF_RETURN_CONTEXTS);
+    return DOCA_ERROR_NO_MEMORY;
+  }
+  return DOCA_SUCCESS;
+}
+
+static doca_error_t prearm_router_contexts(
+    struct eswitch_manager *manager, const struct router_config *config) {
+  doca_error_t result = preflight_router_contexts(manager, config);
+
+  if (result != DOCA_SUCCESS)
+    return result;
+  for (size_t r = 0; r < config->interface_count; r++) {
+    const struct router_interface *rif = &config->interfaces[r];
+    uint16_t context_tag;
+
+    if (!rif->has_address || rif->attachment == ROUTER_LINK)
+      continue;
+    if (rif->attachment == ROUTER_VSWITCH) {
+      result = eswitch_pipeline_sf_bind_vswitch(
+          manager->pipeline, rif->vr_id, rif->interface_id, rif->vswitch_id,
+          rif->address, rif->mac, &context_tag);
+      if (result != DOCA_SUCCESS)
+        return result;
+      for (size_t m = 0; m < ESWITCH_MAX_PERSISTED_MEMBERS; m++) {
+        const struct eswitch_port_membership *member =
+            &manager->memberships[m];
+
+        if (!member->active || member->vswitch_id != rif->vswitch_id)
+          continue;
+        result = eswitch_pipeline_sf_bind_egress(
+            manager->pipeline, rif->vr_id, rif->interface_id,
+            rif->vswitch_id, member->port_id, rif->mac, &context_tag);
+        if (result != DOCA_SUCCESS)
+          return result;
+      }
+      continue;
+    }
+    {
+      int port_index = find_router_interface_port_index(manager, rif);
+
+      if (port_index < 0)
+        return DOCA_ERROR_NOT_FOUND;
+      result = eswitch_pipeline_sf_bind_egress(
+          manager->pipeline, rif->vr_id, rif->interface_id, rif->vr_id,
+          manager->ports->items[port_index].ethernet->port_id, rif->mac,
+          &context_tag);
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
+  }
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_manager_router_prearm(
+    struct eswitch_manager *manager, const struct router_config *config) {
+  if (manager == NULL || config == NULL || manager->pipeline == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  return prearm_router_contexts(manager, config);
+}
+
+static bool send_route_neighbor_probe(
     struct eswitch_manager *manager, const struct router_interface *egress,
     uint32_t target_ip, uint64_t now_ns) {
   uint8_t request[60];
@@ -660,10 +822,10 @@ static void send_route_neighbor_probe(
 
   if (!router_neighbor_should_probe(&manager->neighbors, egress->vr_id,
                                     egress->interface_id, target_ip, now_ns))
-    return;
+    return false;
   if (router_arp_request(egress, target_ip, request, sizeof(request)) == 0) {
     manager->route_tx_drops++;
-    return;
+    return false;
   }
   if (egress->attachment == ROUTER_VSWITCH) {
     result = bind_sf_return_context(manager, egress->vswitch_id, egress->mac,
@@ -673,7 +835,7 @@ static void send_route_neighbor_probe(
 
     if (port_index < 0) {
       manager->route_tx_drops++;
-      return;
+      return false;
     }
     result = bind_route_egress(
         manager, egress,
@@ -687,7 +849,7 @@ static void send_route_neighbor_probe(
     fprintf(stderr, "ROUTE ARP PROBE DROP: vr=%u rif=%u error=%s\n",
             egress->vr_id, egress->interface_id,
             doca_error_get_descr(result));
-    return;
+    return false;
   }
   manager->route_arp_probes++;
   if (manager->packet_debug)
@@ -698,6 +860,44 @@ static void send_route_neighbor_probe(
            egress->vswitch_id,
            (target_ip >> 24) & 0xffU, (target_ip >> 16) & 0xffU,
            (target_ip >> 8) & 0xffU, target_ip & 0xffU, context_tag);
+  return true;
+}
+
+static void probe_configured_next_hops(struct eswitch_manager *manager,
+                                       const struct router_config *config,
+                                       uint64_t now_ns) {
+  for (size_t i = 0; i < config->route_count; i++) {
+    const struct router_route *route = &config->routes[i];
+    const struct router_interface *egress;
+
+    if (route->gateway == 0)
+      continue;
+    egress = find_router_interface(manager, route->vr_id,
+                                   route->interface_id);
+    if (egress == NULL || egress->attachment == ROUTER_LINK ||
+        !egress->has_address)
+      continue;
+    if (router_neighbor_needs_refresh(&manager->neighbors, route->vr_id,
+                                      route->interface_id, route->gateway,
+                                      now_ns))
+      if (send_route_neighbor_probe(manager, egress, route->gateway, now_ns))
+        manager->route_proactive_probes++;
+  }
+}
+
+doca_error_t eswitch_manager_router_prepare(
+    struct eswitch_manager *manager, const struct router_config *config,
+    uint64_t now_ns) {
+  doca_error_t result;
+
+  if (manager == NULL || config == NULL || manager->pipeline == NULL ||
+      manager->sf_io == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  result = eswitch_manager_router_prearm(manager, config);
+  if (result != DOCA_SUCCESS)
+    return result;
+  probe_configured_next_hops(manager, config, now_ns);
+  return DOCA_SUCCESS;
 }
 
 static bool validate_route_neighbor(
@@ -981,11 +1181,23 @@ static void route_arm_frame(struct eswitch_manager *manager,
       decision.next_hop_ip, now_ns);
   if (neighbor == NULL) {
     manager->route_neighbor_misses++;
+    if (!router_pending_enqueue(
+            &manager->pending, decision.vr_id,
+            decision.egress_interface_id, decision.next_hop_ip,
+            ingress->interface_id, ingress_port, link_hops,
+            expected_egress_interface, frame, length, now_ns))
+      manager->route_tx_drops++;
     send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
     goto out;
   }
   if (!validate_route_neighbor(manager, egress, neighbor)) {
     manager->route_neighbor_misses++;
+    if (!router_pending_enqueue(
+            &manager->pending, decision.vr_id,
+            decision.egress_interface_id, decision.next_hop_ip,
+            ingress->interface_id, ingress_port, link_hops,
+            expected_egress_interface, frame, length, now_ns))
+      manager->route_tx_drops++;
     send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
     goto out;
   }
@@ -1106,6 +1318,47 @@ static void route_arm_frame(struct eswitch_manager *manager,
 out:
   free(output);
   free(translated);
+}
+
+/* ARP learning and replay run on the same lcore. Removing a slot before
+ * routing its frame prevents recursive re-enqueue from corrupting iteration. */
+static void replay_pending_ready(struct eswitch_manager *manager,
+                                 uint64_t now_ns) {
+  for (;;) {
+    struct router_pending_packet packet = {0};
+    bool ready = false;
+
+    for (size_t i = 0; i < ROUTER_PENDING_MAX_PACKETS; i++) {
+      const struct router_pending_packet *candidate =
+          &manager->pending.entries[i];
+
+      if (!candidate->used)
+        continue;
+      if (router_neighbor_lookup(&manager->neighbors, candidate->vr_id,
+                                 candidate->neighbor_interface_id,
+                                 candidate->next_hop_ip, now_ns) == NULL)
+        continue;
+      ready = router_pending_take(
+          &manager->pending, candidate->vr_id,
+          candidate->neighbor_interface_id, candidate->next_hop_ip, &packet);
+      break;
+    }
+    if (!ready)
+      return;
+    {
+      const struct router_interface *ingress = find_router_interface(
+          manager, packet.vr_id, packet.ingress_interface_id);
+
+      if (ingress == NULL) {
+        manager->route_tx_drops++;
+      } else {
+        route_arm_frame(manager, packet.frame, packet.length, ingress,
+                        packet.ingress_port, packet.link_hops,
+                        packet.expected_egress_interface, now_ns);
+      }
+    }
+    free(packet.frame);
+  }
 }
 
 static void route_uplink_ipv4_packet(
@@ -1253,11 +1506,15 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
       uint8_t arp_scratch[42];
       const uint8_t *arp = rte_pktmbuf_read(packet, 0, sizeof(arp_scratch),
                                             arp_scratch);
+      bool neighbor_changed = false;
 
-      if (arp != NULL && router_neighbor_learn_arp_interface(
-                             &manager->neighbors, manager->router,
-                             uplink->interface_id, port_id, arp,
-                             sizeof(arp_scratch), now_ns)) {
+      if (arp != NULL)
+        neighbor_changed = router_neighbor_learn_arp_interface(
+            &manager->neighbors, manager->router, uplink->interface_id,
+            port_id, arp, sizeof(arp_scratch), now_ns);
+      if (arp != NULL)
+        replay_pending_ready(manager, now_ns);
+      if (neighbor_changed) {
         if (manager->packet_debug)
           printf("UPLINK NEIGHBOR LEARN: vr=%u rif=%u port=%u "
                "ip=%u.%u.%u.%u mac="
@@ -1326,6 +1583,10 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
      * is already present in the Arm table, so the sync below still sees it. */
     arp_reply_result = reply_gateway_arp(manager, packet, domain_id, port_id,
                                          now_ns);
+    /* Also replay when an expired neighbor is refreshed with the same MAC.
+     * Mapping-change is intentionally false in that case. */
+    if (arp != NULL)
+      replay_pending_ready(manager, now_ns);
     /* A successful gateway reply also retries a promotion deferred by an
      * earlier resource failure, even when the neighbor tuple is unchanged. */
     if ((neighbor_changed || arp_reply_result == DOCA_SUCCESS) &&
@@ -1397,8 +1658,14 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
     return DOCA_SUCCESS;
   manager->next_aging_ns = now_ns +
       (uint64_t)SWITCH_AGING_SCAN_SECONDS * 1000000000ULL;
+  {
+    size_t expired = router_pending_expire(&manager->pending, now_ns);
+
+    manager->route_tx_drops += expired;
+  }
   router_neighbor_age(&manager->neighbors, now_ns);
   router_nat_age(manager->nat, now_ns);
+  probe_configured_next_hops(manager, manager->router, now_ns);
   {
     doca_error_t result = eswitch_manager_hw_routes_sync(manager,
                                                           manager->router);
@@ -1590,9 +1857,19 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->router_link_drops, ROUTER_LINK_MAX_HOPS);
   used = append_text(response, size, used,
       "neighbors=%zu neighbor_misses=%" PRIu64 " arp_probes=%" PRIu64
-      " route_tx_drops=%" PRIu64 "\n",
+      " proactive_probes=%" PRIu64 " route_tx_drops=%" PRIu64 "\n",
       manager->neighbors.count, manager->route_neighbor_misses,
-      manager->route_arp_probes, manager->route_tx_drops);
+      manager->route_arp_probes, manager->route_proactive_probes,
+      manager->route_tx_drops);
+  used = append_text(response, size, used,
+      "neighbor_queue=%zu enqueued=%" PRIu64 " replayed=%" PRIu64
+      " expired=%" PRIu64 " overflow=%" PRIu64
+      " alloc_failures=%" PRIu64 " limit=%u per_neighbor=%u timeout_ms=%u\n",
+      manager->pending.count, manager->pending.enqueued,
+      manager->pending.replayed, manager->pending.expired,
+      manager->pending.overflow, manager->pending.allocation_failures,
+      ROUTER_PENDING_MAX_PACKETS, ROUTER_PENDING_PER_NEIGHBOR,
+      (unsigned)(ROUTER_PENDING_TIMEOUT_NS / UINT64_C(1000000)));
   used = append_text(response, size, used,
       "sf_return_contexts=%zu directed=%zu flood=%zu "
       "source_identity=context-vlan "
@@ -1830,6 +2107,17 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     }
     result = delete_vswitch_persisted(manager, parsed.id);
   } else if (parsed.verb == ESWITCH_CLI_VS_PORT_ATTACH) {
+    if (manager->router && router_switch_reserved(manager->router, parsed.id) &&
+        eswitch_vlan_uses_tagged_domain(
+            parsed.port_mode, parsed.vlan_id, parsed.vlan_last,
+            parsed.vlan_extra_id, parsed.vlan_extra_last)) {
+      snprintf(response, response_size,
+               "ERR code=%d message=vSwitch %u is attached to a VR; "
+               "range/list trunks and VLAN-aware access require a "
+               "VLAN-aware VR RIF\n",
+               DOCA_ERROR_IN_USE, parsed.id);
+      return DOCA_ERROR_IN_USE;
+    }
     result = attach_port_persisted(manager, parsed.id, parsed.port_id,
                                    parsed.port_mode, parsed.vlan_id,
                                    parsed.vlan_last, parsed.vlan_extra_id,
@@ -1859,6 +2147,7 @@ doca_error_t eswitch_manager_destroy(struct eswitch_manager *manager) {
   if (manager == NULL)
     return DOCA_ERROR_INVALID_VALUE;
   if (!manager->initialized) {
+    router_pending_destroy(&manager->pending);
     free(manager->router);
     free(manager->port_owner);
     free(manager->nat);
@@ -1880,6 +2169,7 @@ doca_error_t eswitch_manager_destroy(struct eswitch_manager *manager) {
       first_error = result;
   }
   if (first_error == DOCA_SUCCESS) {
+    router_pending_destroy(&manager->pending);
     free(manager->router);
     free(manager->port_owner);
     free(manager->nat);
@@ -1895,6 +2185,7 @@ void eswitch_manager_release(struct eswitch_manager *manager) {
     for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++)
       manager->pipeline->ct_sessions[i].software = NULL;
   }
+  router_pending_destroy(&manager->pending);
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++) {
     struct eswitch_flood_group *group = &manager->switches[i].flood;
     if (group->pipe != NULL)

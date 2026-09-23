@@ -10,6 +10,18 @@ vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
 Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
 optional DOCA Flow CT promotion offloads established TCP/UDP NAT sessions.
 ICMP and all CT misses remain on the Arm slow path.
+The Arm slow path proactively resolves configured static/default-route next
+hops and refreshes them before their five-minute reachability lifetime
+expires. While an adjacency is unresolved, a bounded queue retains pre-NAT
+frames and replays them immediately after a validated ARP update. SF flood and
+directed return contexts for configured RIF/member pairs are pre-armed during
+restore and router configuration commit, removing Flow entry-install latency
+from the first data packet. The hold queue is capped at 128 packets globally,
+16 packets per adjacency, 10,240 bytes per frame, and a three-second lifetime;
+overflow drops the newest packet. `eswitchctl status` reports `neighbor_queue`,
+`enqueued`, `replayed`, `expired`, `overflow`, and `alloc_failures`; a healthy
+cold-start test should converge with `enqueued == replayed` and zero
+expiry/overflow.
 The default VF scope is `0-10`; explicit settings override that default.
 Existing build directories retain their Meson option: use `meson configure
 /build/eswitch-management -Dvf_scope=0-10` and rebuild. An exported

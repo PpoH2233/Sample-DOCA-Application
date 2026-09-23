@@ -96,27 +96,51 @@ static const struct router_interface *interface_by_id(
   return NULL;
 }
 
-/* Remove selectors for a changed private RIF before publishing its new MAC or
- * address. A later ARP request recreates the local and hardware-eligibility
- * entries from the committed configuration. */
-static doca_error_t invalidate_changed_private_rifs(
+static bool same_context_identity(const struct router_interface *before,
+                                  const struct router_interface *after) {
+  if (after == NULL || after->attachment != before->attachment ||
+      after->vr_id != before->vr_id ||
+      after->has_address != before->has_address ||
+      after->address != before->address ||
+      memcmp(after->mac, before->mac, 6) != 0)
+    return false;
+  if (before->attachment == ROUTER_VSWITCH)
+    return after->vswitch_id == before->vswitch_id;
+  if (before->attachment == ROUTER_PORT)
+    return memcmp(&after->port, &before->port, sizeof(before->port)) == 0;
+  return true;
+}
+
+/* Remove contexts for every changed non-link RIF before pre-arming its new
+ * identity. Keeping an old port-RIF context would otherwise make the bind
+ * fail with BAD_STATE when its MAC, address, or attachment changes. */
+static doca_error_t invalidate_changed_rifs(
     struct eswitch_manager *m,const struct router_config *candidate) {
   for(size_t i=0;i<m->router->interface_count;i++) {
     const struct router_interface *before=&m->router->interfaces[i];
     const struct router_interface *after;
-    if(before->attachment!=ROUTER_VSWITCH) continue;
+    if(before->attachment==ROUTER_LINK) continue;
     after=interface_by_id(candidate,before->interface_id);
-    if(after!=NULL && after->attachment==ROUTER_VSWITCH &&
-       after->vr_id==before->vr_id && after->vswitch_id==before->vswitch_id &&
-       after->has_address==before->has_address &&
-       after->address==before->address && after->prefix==before->prefix &&
-       memcmp(after->mac,before->mac,6)==0)
+    if(same_context_identity(before,after))
       continue;
     doca_error_t result=eswitch_pipeline_sf_unbind_rif(
         m->pipeline,before->interface_id);
     if(result!=DOCA_SUCCESS) return result;
   }
   return DOCA_SUCCESS;
+}
+
+static void rollback_prearmed_candidate(struct eswitch_manager *m,
+                                        const struct router_config *candidate) {
+  for(size_t i=0;i<candidate->interface_count;i++)
+    (void)eswitch_pipeline_sf_unbind_rif(
+        m->pipeline,candidate->interfaces[i].interface_id);
+  {
+    doca_error_t result=eswitch_manager_router_prearm(m,m->router);
+    if(result!=DOCA_SUCCESS)
+      fprintf(stderr,"Router rollback pre-arm failed: %s\n",
+              doca_error_get_descr(result));
+  }
 }
 doca_error_t router_control_restore(struct eswitch_manager *m) {
   char path[PATH_MAX],error[256];
@@ -173,6 +197,10 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
     bool hw_plan_changed=!router_hw_route_plans_equal(
         m->router,candidate,&m->neighbors,monotonic_ns());
 
+    /* Pending frames were classified under the old route/NAT graph. Never
+     * replay them after a control-plane transaction changes that graph. */
+    m->route_tx_drops += router_pending_expire(&m->pending, UINT64_MAX);
+
     /* Any router mutation can invalidate a CT zone, adjacency, or NAT
      * tuple. Remove hardware entries before changing reachable dataplane
      * objects, then remove their software owners. */
@@ -208,9 +236,17 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       } else added_attached=true;
     }
     if(ok) {
-      doca_error_t result=invalidate_changed_private_rifs(m,candidate);
+      doca_error_t result=invalidate_changed_rifs(m,candidate);
       if(result!=DOCA_SUCCESS) {
-        snprintf(out,size,"ERR private RIF invalidation failed: %s\n",
+        snprintf(out,size,"ERR RIF context invalidation failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
+      doca_error_t result=eswitch_manager_router_prearm(m,candidate);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR router SF context pre-arm failed: %s\n",
                  doca_error_get_descr(result));
         ok=false;
       }
@@ -228,13 +264,23 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
         snprintf(out,size,"ERR router state path too long\n");ok=false;
       } else ok=router_config_save(path,candidate,out,size);
     }
-    if(ok) *m->router=*candidate;
+    if(ok) {
+      *m->router=*candidate;
+      {
+        doca_error_t result=eswitch_manager_router_prepare(
+            m,m->router,monotonic_ns());
+        if(result!=DOCA_SUCCESS)
+          fprintf(stderr,"Router post-commit preparation deferred: %s\n",
+                  doca_error_get_descr(result));
+      }
+    }
     else {
       if(hw_plan_changed)
         (void)eswitch_manager_hw_routes_sync(m,m->router);
       if(added_attached) (void)eswitch_pipeline_detach_port(m->pipeline,(uint16_t)added);
       if(removed_detached) (void)eswitch_pipeline_attach_router_port(
           m->pipeline,(uint16_t)removed,removed_vr);
+      rollback_prearmed_candidate(m,candidate);
     }
   }
   free(candidate);

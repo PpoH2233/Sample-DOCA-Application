@@ -14,6 +14,7 @@
 #include "l2/eswitch_fdb.h"
 #include "router/router.h"
 #include "router/router_neighbor.h"
+#include "router/router_pending.h"
 #include "router/router_nat.h"
 #include "router/sf_packet_io.h"
 
@@ -38,12 +39,13 @@ struct eswitch_manager {
   uint64_t icmp_seen, icmp_ignored, icmp_built, icmp_replies;
   uint64_t icmp_tx_drops;
   struct router_neighbor_table neighbors;
+  struct router_pending_queue pending;
   struct router_nat_table *nat;
   bool hardware_ct_supported;
   bool packet_debug;
   uint64_t routed_seen, routed_forwarded, route_no_route;
   uint64_t route_ttl_expired, route_invalid, route_neighbor_misses;
-  uint64_t route_arp_probes, route_tx_drops;
+  uint64_t route_arp_probes, route_proactive_probes, route_tx_drops;
   uint64_t router_link_forwards, router_link_drops;
   uint64_t tx_log_ns, tx_snapshot_ns, tx_snapshot_seen;
   uint64_t next_hw_route_retry_ns, hw_route_retry_backoff_ns;
@@ -69,6 +71,13 @@ doca_error_t eswitch_manager_poll_packets(struct eswitch_manager *manager,
                                           bool *did_work);
 doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager);
 doca_error_t eswitch_manager_hw_routes_sync(
+    struct eswitch_manager *manager, const struct router_config *config);
+/* Arm all static SF return contexts, then probe configured next hops whose
+ * neighbor state is absent or nearing expiry. Safe to call repeatedly. */
+doca_error_t eswitch_manager_router_prepare(
+    struct eswitch_manager *manager, const struct router_config *config,
+    uint64_t now_ns);
+doca_error_t eswitch_manager_router_prearm(
     struct eswitch_manager *manager, const struct router_config *config);
 doca_error_t eswitch_manager_command(const char *request, char *response,
                                      size_t response_size, void *context);
