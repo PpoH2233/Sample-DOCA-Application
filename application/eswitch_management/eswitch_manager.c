@@ -213,6 +213,7 @@ static doca_error_t manager_to_state(const struct eswitch_manager *manager,
     member.vswitch_id = configured->vswitch_id;
     member.mode = configured->mode;
     member.vlan_id = configured->vlan_id;
+    member.vlan_last = configured->vlan_last;
     if (port->role == ETHERNET_PORT_ROLE_PARENT) {
       member.kind = ESWITCH_STATE_PORT_PARENT;
     } else {
@@ -298,7 +299,8 @@ static doca_error_t restore_manager(struct eswitch_manager *manager) {
     result = attach_port(
         manager, state.members[i].vswitch_id,
         manager->ports->items[port_index].ethernet->port_id,
-        state.members[i].mode, state.members[i].vlan_id);
+        state.members[i].mode, state.members[i].vlan_id,
+        state.members[i].vlan_last);
     if (result != DOCA_SUCCESS)
       goto out;
   }
@@ -328,9 +330,10 @@ static doca_error_t attach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t vswitch_id,
                                           uint16_t port_id,
                                           enum eswitch_port_mode mode,
-                                          uint16_t vlan_id) {
+                                          uint16_t vlan_id,
+                                          uint16_t vlan_last) {
   doca_error_t result = attach_port(manager, vswitch_id, port_id, mode,
-                                    vlan_id);
+                                    vlan_id, vlan_last);
 
   if (result == DOCA_SUCCESS) {
     doca_error_t save_result = persist_manager(manager);
@@ -347,6 +350,7 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
                                           uint16_t port_id) {
   enum eswitch_port_mode old_mode = ESWITCH_PORT_MODE_ACCESS;
   uint16_t old_vlan = 0;
+  uint16_t old_vlan_last = 0;
   int port_index;
   doca_error_t result;
 
@@ -365,6 +369,7 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
         member->port_id == port_id) {
       old_mode = member->mode;
       old_vlan = member->vlan_id;
+      old_vlan_last = member->vlan_last;
       break;
     }
   }
@@ -380,7 +385,7 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
     doca_error_t save_result = persist_manager(manager);
     if (save_result != DOCA_SUCCESS) {
       doca_error_t rollback = attach_port(manager, vswitch_id, port_id,
-                                          old_mode, old_vlan);
+                                          old_mode, old_vlan, old_vlan_last);
       return rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
@@ -411,7 +416,8 @@ static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
       doca_error_t rollback = create_vswitch(manager, id);
       for (uint16_t i = 0; rollback == DOCA_SUCCESS && i < member_count; i++)
         rollback = attach_port(manager, id, members[i].port_id,
-                               members[i].mode, members[i].vlan_id);
+                               members[i].mode, members[i].vlan_id,
+                               members[i].vlan_last);
       result = rollback == DOCA_SUCCESS ? save_result : rollback;
     }
   }
@@ -1675,9 +1681,14 @@ static size_t format_vswitches(const struct eswitch_manager *manager,
       if (!member->active || member->vswitch_id != vs->id)
         continue;
       if (member->mode == ESWITCH_PORT_MODE_TRUNK)
-        used = append_text(response, size, used,
-                           "%s%u:trunk/vlan=%u", first ? "" : ",",
-                           member->port_id, member->vlan_id);
+        used = eswitch_vlan_is_range(member->vlan_id, member->vlan_last)
+                   ? append_text(response, size, used,
+                                 "%s%u:trunk/vlan=%u-%u",
+                                 first ? "" : ",", member->port_id,
+                                 member->vlan_id, member->vlan_last)
+                   : append_text(response, size, used,
+                                 "%s%u:trunk/vlan=%u", first ? "" : ",",
+                                 member->port_id, member->vlan_id);
       else
         used = append_text(response, size, used, "%s%u:access",
                            first ? "" : ",", member->port_id);
@@ -1787,7 +1798,8 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     result = delete_vswitch_persisted(manager, parsed.id);
   } else if (parsed.verb == ESWITCH_CLI_VS_PORT_ATTACH) {
     result = attach_port_persisted(manager, parsed.id, parsed.port_id,
-                                   parsed.port_mode, parsed.vlan_id);
+                                   parsed.port_mode, parsed.vlan_id,
+                                   parsed.vlan_last);
   } else if (parsed.verb == ESWITCH_CLI_VS_PORT_DETACH) {
     result = detach_port_persisted(manager, parsed.id, parsed.port_id);
   } else {

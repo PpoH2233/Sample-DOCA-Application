@@ -35,9 +35,23 @@ static bool inventory_port(void *context,uint16_t port,struct router_port_identi
 }
 static bool inventory_switch(void *context,uint16_t id) {
   struct eswitch_manager *m=context;
+  bool exists=false;
   for(size_t i=0;i<ESWITCH_MAX_VSWITCHES;i++)
-    if(m->switches[i].exists && m->switches[i].id==id) return true;
-  return false;
+    if(m->switches[i].exists && m->switches[i].id==id) {
+      exists=true;
+      break;
+    }
+  if(!exists) return false;
+  /* A ranged trunk is a transparent tagged L2 transit domain. It deliberately
+   * keeps the 802.1Q header, while a router vs-link requires one untagged
+   * broadcast domain. Refuse an ambiguous RIF attachment. */
+  for(size_t i=0;i<ESWITCH_MAX_PERSISTED_MEMBERS;i++) {
+    const struct eswitch_port_membership *member=&m->memberships[i];
+    if(member->active && member->vswitch_id==id &&
+       eswitch_vlan_is_range(member->vlan_id,member->vlan_last))
+      return false;
+  }
+  return true;
 }
 static int interface_port_index(const struct eswitch_manager *m,
                                 const struct router_interface *rif) {

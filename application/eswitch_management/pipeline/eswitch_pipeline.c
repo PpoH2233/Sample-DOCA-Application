@@ -1360,15 +1360,25 @@ doca_error_t eswitch_pipeline_egress_query(
         continue;
       gate = &member->egress;
     }
-    if (gate->pipe == NULL || gate->forward.entry == NULL ||
-        gate->drop_self.entry == NULL)
+    if (gate->pipe == NULL || gate->drop_self.entry == NULL ||
+        (gate->forward.entry == NULL && gate->range_forward_count == 0))
       continue;
     found = true;
-    memset(&query, 0, sizeof(query));
-    result = doca_flow_resource_query_entry(gate->forward.entry, &query);
-    if (result != DOCA_SUCCESS)
-      return result;
-    *forward_packets += query.counter.total_pkts;
+    if (gate->forward.entry != NULL) {
+      memset(&query, 0, sizeof(query));
+      result = doca_flow_resource_query_entry(gate->forward.entry, &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *forward_packets += query.counter.total_pkts;
+    }
+    for (uint16_t j = 0; j < gate->range_forward_count; j++) {
+      memset(&query, 0, sizeof(query));
+      result = doca_flow_resource_query_entry(
+          gate->range_forwards[j].entry, &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *forward_packets += query.counter.total_pkts;
+    }
     memset(&query, 0, sizeof(query));
     result = doca_flow_resource_query_entry(gate->drop_self.entry, &query);
     if (result != DOCA_SUCCESS)
@@ -1826,11 +1836,14 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     for (uint16_t i = 0; i < pipeline->ports->count; i++) {
       if (pipeline->egress_gates[i].pipe != NULL)
         doca_flow_pipe_destroy(pipeline->egress_gates[i].pipe);
+      free(pipeline->egress_gates[i].range_forwards);
     }
   }
   for (size_t i = 0; i < ESWITCH_MAX_VLAN_MEMBERSHIPS; i++) {
     if (pipeline->memberships[i].egress.pipe != NULL)
       doca_flow_pipe_destroy(pipeline->memberships[i].egress.pipe);
+    free(pipeline->memberships[i].egress.range_forwards);
+    free(pipeline->memberships[i].range_ingress);
   }
   free(pipeline->classifier_rules);
   free(pipeline->uplink_arp_meter_rules);
@@ -1843,7 +1856,8 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index,
                                           uint16_t vswitch_id,
                                           enum eswitch_port_mode mode,
-                                          uint16_t vlan_id) {
+                                          uint16_t vlan_id,
+                                          uint16_t vlan_last) {
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
   struct doca_flow_actions actions = {0};
@@ -1852,21 +1866,31 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->arp_dispatch_pipe};
   struct eswitch_pipeline_membership *member = NULL;
-  struct eswitch_rule *rule;
+  struct eswitch_rule *rules;
+  uint16_t rule_count;
+  bool transparent_range;
   bool restore = false;
   uint16_t port_id;
+  size_t configured_rule_count = 0;
   doca_error_t result;
 
   if (pipeline == NULL || !pipeline->created ||
       port_index >= pipeline->ports->count || vswitch_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
-  if ((mode == ESWITCH_PORT_MODE_TRUNK && !eswitch_vlan_valid(vlan_id)) ||
-      (mode == ESWITCH_PORT_MODE_ACCESS && vlan_id != 0))
+  if ((mode == ESWITCH_PORT_MODE_TRUNK &&
+       !eswitch_vlan_range_valid(vlan_id, vlan_last)) ||
+      (mode == ESWITCH_PORT_MODE_ACCESS &&
+       (vlan_id != 0 || vlan_last != 0)))
     return DOCA_ERROR_INVALID_VALUE;
   if (pipeline->ports->items[port_index].ethernet->role ==
       ETHERNET_PORT_ROLE_SF_REPRESENTOR)
     return DOCA_ERROR_NOT_SUPPORTED;
   port_id = pipeline->ports->items[port_index].ethernet->port_id;
+  vlan_last = eswitch_vlan_range_last(vlan_id, vlan_last);
+  transparent_range = mode == ESWITCH_PORT_MODE_TRUNK && vlan_last > vlan_id;
+  rule_count = transparent_range
+                   ? eswitch_vlan_range_size(vlan_id, vlan_last)
+                   : 1U;
   for (size_t i = 0; i < ESWITCH_MAX_VLAN_MEMBERSHIPS; i++) {
     struct eswitch_pipeline_membership *candidate =
         &pipeline->memberships[i];
@@ -1875,21 +1899,42 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
         member = candidate;
       continue;
     }
+    configured_rule_count += candidate->mode == ESWITCH_PORT_MODE_TRUNK
+                                 ? eswitch_vlan_range_size(
+                                       candidate->vlan_id,
+                                       candidate->vlan_last)
+                                 : 1U;
+    if (candidate->vswitch_id == vswitch_id &&
+        (eswitch_vlan_is_range(candidate->vlan_id, candidate->vlan_last) ||
+         transparent_range)) {
+      if (!eswitch_vlan_is_range(candidate->vlan_id, candidate->vlan_last) ||
+          !transparent_range)
+        return DOCA_ERROR_IN_USE;
+    }
     if (candidate->port_index != port_index)
       continue;
     if (candidate->vswitch_id == vswitch_id) {
       if (candidate->mode != mode || candidate->vlan_id != vlan_id ||
+          candidate->vlan_last != vlan_last ||
           candidate->ingress.entry != NULL)
         return DOCA_ERROR_ALREADY_EXIST;
+      for (uint16_t j = 0; j < candidate->range_ingress_count; j++)
+        if (candidate->range_ingress[j].entry != NULL)
+          return DOCA_ERROR_ALREADY_EXIST;
       member = candidate;
       restore = true;
       break;
     }
     if (candidate->mode == ESWITCH_PORT_MODE_ACCESS ||
-        mode == ESWITCH_PORT_MODE_ACCESS || candidate->vlan_id == vlan_id)
+        mode == ESWITCH_PORT_MODE_ACCESS ||
+        eswitch_vlan_ranges_overlap(candidate->vlan_id,
+                                    candidate->vlan_last, vlan_id,
+                                    vlan_last))
       return DOCA_ERROR_IN_USE;
   }
-  if (member == NULL)
+  if (member == NULL ||
+      (!restore && configured_rule_count + rule_count >
+                       ESWITCH_MAX_VLAN_MEMBERSHIPS))
     return DOCA_ERROR_NO_MEMORY;
   if (!restore)
     *member = (struct eswitch_pipeline_membership){
@@ -1897,41 +1942,75 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
         .port_index = port_index,
         .port_id = port_id,
         .vlan_id = vlan_id,
+        .vlan_last = vlan_last,
         .mode = mode,
     };
-  rule = &member->ingress;
-  match.parser_meta.port_id = port_id;
-  mask.parser_meta.port_id = UINT16_MAX;
-  match.outer.l2_valid_headers = mode == ESWITCH_PORT_MODE_TRUNK
-                                     ? DOCA_FLOW_L2_VALID_HEADER_VLAN_0
+  if (transparent_range && member->range_ingress == NULL) {
+    member->range_ingress = calloc(rule_count, sizeof(*member->range_ingress));
+    if (member->range_ingress == NULL)
+      return DOCA_ERROR_NO_MEMORY;
+    member->range_ingress_count = rule_count;
+  }
+  rules = transparent_range ? member->range_ingress : &member->ingress;
+  actions.meta.pkt_meta =
+      DOCA_HTOBE32(eswitch_metadata_encode(vswitch_id, port_id));
+  actions.pop_vlan = mode == ESWITCH_PORT_MODE_TRUNK && !transparent_range;
+  for (uint16_t i = 0; i < rule_count; i++) {
+    struct eswitch_rule *rule = &rules[i];
+    uint16_t match_vlan = (uint16_t)(vlan_id + i);
+
+    memset(&match, 0, sizeof(match));
+    memset(&mask, 0, sizeof(mask));
+    match.parser_meta.port_id = port_id;
+    mask.parser_meta.port_id = UINT16_MAX;
+    match.outer.l2_valid_headers = mode == ESWITCH_PORT_MODE_TRUNK
+                                       ? DOCA_FLOW_L2_VALID_HEADER_VLAN_0
+                                       : 0;
+    match.outer.eth_vlan[0].tci = mode == ESWITCH_PORT_MODE_TRUNK
+                                      ? DOCA_HTOBE16(match_vlan)
+                                      : 0;
+    mask.outer.l2_valid_headers = UINT16_MAX;
+    mask.outer.eth_vlan[0].tci = mode == ESWITCH_PORT_MODE_TRUNK
+                                     ? DOCA_HTOBE16(0x0fffU)
                                      : 0;
-  match.outer.eth_vlan[0].tci = mode == ESWITCH_PORT_MODE_TRUNK
-                                    ? DOCA_HTOBE16(vlan_id)
-                                    : 0;
-  mask.outer.l2_valid_headers = UINT16_MAX;
-  mask.outer.eth_vlan[0].tci = mode == ESWITCH_PORT_MODE_TRUNK
-                                   ? DOCA_HTOBE16(0x0fffU)
-                                   : 0;
-  actions.pop_vlan = mode == ESWITCH_PORT_MODE_TRUNK;
-  actions.meta.pkt_meta = DOCA_HTOBE32(
-      eswitch_metadata_encode(vswitch_id, port_id));
-  flow_entry_cookie_prepare(&rule->cookie, "attach ingress port",
-                            DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_control_add_entry(
-      pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe, &match,
-      &mask, NULL, &actions, NULL, NULL, &monitor, 0, &fwd, &rule->cookie,
-      &rule->entry);
-  if (result != DOCA_SUCCESS)
-    return result;
-  result = process_rules(pipeline, rule, 1);
+    flow_entry_cookie_prepare(&rule->cookie,
+                              transparent_range ? "attach trunk range ingress"
+                                                : "attach ingress port",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, pipeline->ingress_classifier_pipe,
+        &match, &mask, NULL, &actions, NULL, NULL,
+        transparent_range ? NULL : &monitor, 0, &fwd,
+        &rule->cookie, &rule->entry);
+    if (result != DOCA_SUCCESS)
+      goto rollback;
+  }
+  result = process_rules(pipeline, rules, rule_count);
   if (result != DOCA_SUCCESS) {
-    doca_error_t original_error = result;
-    doca_error_t cleanup = remove_rule(pipeline, rule,
-                                       "rollback ingress attach");
-    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+    goto rollback;
   }
   member->active = true;
   return DOCA_SUCCESS;
+
+rollback:
+  {
+    doca_error_t original_error = result;
+    doca_error_t cleanup = DOCA_SUCCESS;
+    for (uint16_t i = 0; i < rule_count; i++) {
+      doca_error_t one = remove_rule(pipeline, &rules[i],
+                                     "rollback ingress attach");
+      if (cleanup == DOCA_SUCCESS && one != DOCA_SUCCESS)
+        cleanup = one;
+    }
+    if (transparent_range && cleanup == DOCA_SUCCESS) {
+      free(member->range_ingress);
+      member->range_ingress = NULL;
+      member->range_ingress_count = 0;
+    }
+    if (!restore && cleanup == DOCA_SUCCESS)
+      *member = (struct eswitch_pipeline_membership){0};
+    return cleanup == DOCA_SUCCESS ? original_error : cleanup;
+  }
 }
 
 static doca_error_t attach_uplink_arp_meter(
@@ -2110,6 +2189,15 @@ doca_error_t eswitch_pipeline_detach_vswitch_port(
   member = find_membership(pipeline, vswitch_id, port_id);
   if (member == NULL)
     return DOCA_ERROR_NOT_FOUND;
+  if (member->range_ingress != NULL) {
+    for (uint16_t i = 0; i < member->range_ingress_count; i++) {
+      result = remove_rule(pipeline, &member->range_ingress[i],
+                           "detach vSwitch trunk range ingress");
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
+    return DOCA_SUCCESS;
+  }
   result = remove_rule(pipeline, &member->ingress,
                        "detach vSwitch ingress membership");
   return result;
@@ -2128,10 +2216,15 @@ doca_error_t eswitch_pipeline_release_vswitch_port(
   member = find_membership(pipeline, vswitch_id, port_id);
   if (member == NULL || member->ingress.entry != NULL)
     return DOCA_ERROR_BAD_STATE;
+  for (uint16_t i = 0; i < member->range_ingress_count; i++)
+    if (member->range_ingress[i].entry != NULL)
+      return DOCA_ERROR_BAD_STATE;
   if (member->egress.pipe != NULL) {
     doca_flow_pipe_destroy(member->egress.pipe);
+    free(member->egress.range_forwards);
     member->egress = (struct eswitch_egress_gate){0};
   }
+  free(member->range_ingress);
   *member = (struct eswitch_pipeline_membership){0};
   return DOCA_SUCCESS;
 }
@@ -2387,7 +2480,7 @@ doca_error_t eswitch_pipeline_hw_route_stats(
 static doca_error_t create_egress_gate_for(
     struct eswitch_pipeline *pipeline, struct eswitch_egress_gate *gate,
     uint16_t port_index, uint16_t vswitch_id,
-    enum eswitch_port_mode mode, uint16_t vlan_id) {
+    enum eswitch_port_mode mode, uint16_t vlan_id, uint16_t vlan_last) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
@@ -2397,6 +2490,8 @@ static doca_error_t create_egress_gate_for(
       .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
   char name[64];
   uint16_t port_id = pipeline->ports->items[port_index].ethernet->port_id;
+  bool transparent_range = eswitch_vlan_is_range(vlan_id, vlan_last);
+  uint16_t range_count = eswitch_vlan_range_size(vlan_id, vlan_last);
   doca_error_t result;
 
   if (gate->pipe != NULL)
@@ -2406,7 +2501,9 @@ static doca_error_t create_egress_gate_for(
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_CONTROL, false, 2);
+  result = set_pipe_identity(cfg, name, DOCA_FLOW_PIPE_CONTROL, false,
+                             transparent_range ? (uint32_t)range_count + 1U
+                                               : 2U);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL, &gate->pipe);
   doca_flow_pipe_cfg_destroy(cfg);
@@ -2431,15 +2528,45 @@ static doca_error_t create_egress_gate_for(
     goto fail;
 
   memset(&match, 0, sizeof(match));
+  memset(&mask, 0, sizeof(mask));
   memset(&fwd, 0, sizeof(fwd));
+  fwd.type = DOCA_FLOW_FWD_PORT;
+  fwd.port_id = port_id;
+  if (transparent_range) {
+    gate->range_forwards = calloc(range_count,
+                                  sizeof(*gate->range_forwards));
+    if (gate->range_forwards == NULL) {
+      result = DOCA_ERROR_NO_MEMORY;
+      goto fail;
+    }
+    gate->range_forward_count = range_count;
+    match.outer.l2_valid_headers = DOCA_FLOW_L2_VALID_HEADER_VLAN_0;
+    mask.outer.l2_valid_headers = UINT16_MAX;
+    mask.outer.eth_vlan[0].tci = DOCA_HTOBE16(0x0fffU);
+    for (uint16_t i = 0; i < range_count; i++) {
+      struct eswitch_rule *rule = &gate->range_forwards[i];
+      match.outer.eth_vlan[0].tci = DOCA_HTOBE16((uint16_t)(vlan_id + i));
+      flow_entry_cookie_prepare(&rule->cookie, "egress trunk range forward",
+                                DOCA_FLOW_ENTRY_OP_ADD);
+      result = doca_flow_pipe_control_add_entry(
+          pipeline->runtime->queue_id, gate->pipe, &match, &mask, NULL, NULL,
+          NULL, NULL, &monitor, 1, &fwd, &rule->cookie, &rule->entry);
+      if (result != DOCA_SUCCESS)
+        goto fail;
+    }
+    result = process_rules(pipeline, gate->range_forwards, range_count);
+    if (result != DOCA_SUCCESS)
+      goto fail;
+    printf("EGRESS GATE CREATE: vs=%u port=%u mode=trunk vlan=%u-%u "
+           "path=transparent\n", vswitch_id, port_id, vlan_id, vlan_last);
+    return DOCA_SUCCESS;
+  }
   if (mode == ESWITCH_PORT_MODE_TRUNK) {
     actions.has_push = true;
     actions.push.type = DOCA_FLOW_PUSH_ACTION_VLAN;
     actions.push.vlan.eth_type = DOCA_HTOBE16(RTE_ETHER_TYPE_VLAN);
     actions.push.vlan.vlan_hdr.tci = DOCA_HTOBE16(vlan_id);
   }
-  fwd.type = DOCA_FLOW_FWD_PORT;
-  fwd.port_id = port_id;
   flow_entry_cookie_prepare(&gate->forward.cookie, "egress forward",
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
@@ -2460,6 +2587,7 @@ static doca_error_t create_egress_gate_for(
 
 fail:
   doca_flow_pipe_destroy(gate->pipe);
+  free(gate->range_forwards);
   *gate = (struct eswitch_egress_gate){0};
   return result;
 }
@@ -2467,7 +2595,8 @@ fail:
 static doca_error_t create_legacy_egress_gate(
     struct eswitch_pipeline *pipeline, uint16_t port_index) {
   return create_egress_gate_for(pipeline, &pipeline->egress_gates[port_index],
-                                port_index, 0, ESWITCH_PORT_MODE_ACCESS, 0);
+                                port_index, 0, ESWITCH_PORT_MODE_ACCESS, 0,
+                                0);
 }
 
 static doca_error_t get_egress_gate(struct eswitch_pipeline *pipeline,
@@ -2488,7 +2617,8 @@ static doca_error_t get_egress_gate(struct eswitch_pipeline *pipeline,
   if (member != NULL) {
     result = create_egress_gate_for(pipeline, &member->egress,
                                     (uint16_t)port_index, vswitch_id,
-                                    member->mode, member->vlan_id);
+                                    member->mode, member->vlan_id,
+                                    member->vlan_last);
     if (result == DOCA_SUCCESS)
       *gate_pipe = member->egress.pipe;
     return result;

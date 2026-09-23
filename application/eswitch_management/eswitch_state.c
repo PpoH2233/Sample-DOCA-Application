@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define ESWITCH_STATE_VERSION 2U
+#define ESWITCH_STATE_VERSION 3U
 #define ESWITCH_STATE_LINE_SIZE 512U
 
 static bool switch_exists(const struct eswitch_state *state,
@@ -64,25 +64,47 @@ doca_error_t eswitch_state_add_switch(struct eswitch_state *state,
 
 doca_error_t eswitch_state_add_member(
     struct eswitch_state *state, const struct eswitch_state_member *member) {
+  size_t vlan_rule_count;
   if (state == NULL || member == NULL || member->vswitch_id == 0 ||
       !switch_exists(state, member->vswitch_id))
     return DOCA_ERROR_INVALID_VALUE;
   if ((member->mode == ESWITCH_PORT_MODE_TRUNK &&
-       !eswitch_vlan_valid(member->vlan_id)) ||
-      (member->mode == ESWITCH_PORT_MODE_ACCESS && member->vlan_id != 0))
+       !eswitch_vlan_range_valid(member->vlan_id, member->vlan_last)) ||
+      (member->mode == ESWITCH_PORT_MODE_ACCESS &&
+       (member->vlan_id != 0 || member->vlan_last != 0)))
     return DOCA_ERROR_INVALID_VALUE;
   if (state->member_count >= state->member_capacity)
     return DOCA_ERROR_NO_MEMORY;
+  vlan_rule_count = member->mode == ESWITCH_PORT_MODE_TRUNK
+                        ? eswitch_vlan_range_size(member->vlan_id,
+                                                  member->vlan_last)
+                        : 1U;
   for (size_t i = 0; i < state->member_count; i++) {
     const struct eswitch_state_member *configured = &state->members[i];
+    vlan_rule_count += configured->mode == ESWITCH_PORT_MODE_TRUNK
+                           ? eswitch_vlan_range_size(configured->vlan_id,
+                                                     configured->vlan_last)
+                           : 1U;
+    if (configured->vswitch_id == member->vswitch_id &&
+        (eswitch_vlan_is_range(configured->vlan_id,
+                               configured->vlan_last) ||
+         eswitch_vlan_is_range(member->vlan_id, member->vlan_last)) &&
+        (!eswitch_vlan_is_range(configured->vlan_id,
+                                configured->vlan_last) ||
+         !eswitch_vlan_is_range(member->vlan_id, member->vlan_last)))
+      return DOCA_ERROR_ALREADY_EXIST;
     if (!same_physical_port(configured, member))
       continue;
     if (configured->vswitch_id == member->vswitch_id ||
         configured->mode == ESWITCH_PORT_MODE_ACCESS ||
         member->mode == ESWITCH_PORT_MODE_ACCESS ||
-        configured->vlan_id == member->vlan_id)
+        eswitch_vlan_ranges_overlap(configured->vlan_id,
+                                    configured->vlan_last, member->vlan_id,
+                                    member->vlan_last))
       return DOCA_ERROR_ALREADY_EXIST;
   }
+  if (vlan_rule_count > ESWITCH_MAX_VLAN_MEMBERSHIPS)
+    return DOCA_ERROR_NO_MEMORY;
   state->members[state->member_count++] = *member;
   return DOCA_SUCCESS;
 }
@@ -130,7 +152,8 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
     return DOCA_SUCCESS;
   if (count == 2 && strcmp(tokens[0], "version") == 0) {
     if (*version_seen || !parse_u32(tokens[1], &values[0]) ||
-        (values[0] != 1U && values[0] != ESWITCH_STATE_VERSION))
+        (values[0] != 1U && values[0] != 2U &&
+         values[0] != ESWITCH_STATE_VERSION))
       goto invalid;
     *version_seen = true;
     *version = values[0];
@@ -153,12 +176,14 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
       goto invalid;
     member.vswitch_id = (uint16_t)values[0];
     if ((*version == 1U && count == 3) ||
-        (*version == ESWITCH_STATE_VERSION && count == 5)) {
+        (*version == 2U && count == 5) ||
+        (*version == ESWITCH_STATE_VERSION && count == 6)) {
       if (strcmp(tokens[2], "parent") != 0)
         goto invalid;
       member.kind = ESWITCH_STATE_PORT_PARENT;
     } else if ((*version == 1U && count == 6) ||
-               (*version == ESWITCH_STATE_VERSION && count == 8)) {
+               (*version == 2U && count == 8) ||
+               (*version == ESWITCH_STATE_VERSION && count == 9)) {
       if (strcmp(tokens[2], "representor") != 0)
         goto invalid;
       for (size_t i = 0; i < 3; i++) {
@@ -174,7 +199,8 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
     }
     member.mode = ESWITCH_PORT_MODE_ACCESS;
     member.vlan_id = 0;
-    if (*version == ESWITCH_STATE_VERSION) {
+    member.vlan_last = 0;
+    if (*version >= 2U) {
       size_t mode_index = member.kind == ESWITCH_STATE_PORT_PARENT ? 3 : 6;
       if (strcmp(tokens[mode_index], "trunk") == 0) {
         member.mode = ESWITCH_PORT_MODE_TRUNK;
@@ -183,9 +209,21 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
             !eswitch_vlan_valid((uint16_t)values[0]))
           goto invalid;
         member.vlan_id = (uint16_t)values[0];
+        member.vlan_last = member.vlan_id;
+        if (*version == ESWITCH_STATE_VERSION) {
+          if (!parse_u32(tokens[mode_index + 2], &values[0]) ||
+              values[0] > UINT16_MAX ||
+              !eswitch_vlan_range_valid(member.vlan_id,
+                                        (uint16_t)values[0]))
+            goto invalid;
+          member.vlan_last = (uint16_t)values[0];
+        }
       } else if (strcmp(tokens[mode_index], "access") != 0 ||
                  !parse_u32(tokens[mode_index + 1], &values[0]) ||
-                 values[0] != 0) {
+                 values[0] != 0 ||
+                 (*version == ESWITCH_STATE_VERSION &&
+                  (!parse_u32(tokens[mode_index + 2], &values[0]) ||
+                   values[0] != 0))) {
         goto invalid;
       }
     }
@@ -310,17 +348,19 @@ doca_error_t eswitch_state_save(const char *path,
     int written;
 
     if (member->kind == ESWITCH_STATE_PORT_PARENT) {
-      written = fprintf(file, "member %u parent %s %u\n", member->vswitch_id,
+      written = fprintf(file, "member %u parent %s %u %u\n",
+                        member->vswitch_id,
                         member->mode == ESWITCH_PORT_MODE_TRUNK ? "trunk" :
                                                                  "access",
-                        member->vlan_id);
+                        member->vlan_id, member->vlan_last);
     } else {
-      written = fprintf(file, "member %u representor %u %u %u %s %u\n",
+      written = fprintf(file,
+                        "member %u representor %u %u %u %s %u %u\n",
                         member->vswitch_id, member->host_index,
                         member->pf_index, member->vf_index,
                         member->mode == ESWITCH_PORT_MODE_TRUNK ? "trunk" :
                                                                  "access",
-                        member->vlan_id);
+                        member->vlan_id, member->vlan_last);
     }
     if (written < 0)
       goto fail;

@@ -25,6 +25,8 @@ struct eswitch_egress_gate {
   struct doca_flow_pipe *pipe;
   struct eswitch_rule drop_self;
   struct eswitch_rule forward;
+  struct eswitch_rule *range_forwards;
+  uint16_t range_forward_count;
 };
 
 struct eswitch_pipeline_membership {
@@ -32,8 +34,11 @@ struct eswitch_pipeline_membership {
   uint16_t port_index;
   uint16_t port_id;
   uint16_t vlan_id;
+  uint16_t vlan_last;
   enum eswitch_port_mode mode;
   struct eswitch_rule ingress;
+  struct eswitch_rule *range_ingress;
+  uint16_t range_ingress_count;
   struct eswitch_egress_gate egress;
   bool active;
 };
@@ -238,7 +243,8 @@ doca_error_t eswitch_pipeline_attach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index,
                                           uint16_t vswitch_id,
                                           enum eswitch_port_mode mode,
-                                          uint16_t vlan_id);
+                                          uint16_t vlan_id,
+                                          uint16_t vlan_last);
 /* Router-owned uplinks bypass L2 learning and go directly to the Arm RSS
  * slow path. The high metadata half carries the VR id for ingress isolation. */
 doca_error_t eswitch_pipeline_attach_router_port(

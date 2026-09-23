@@ -1,14 +1,19 @@
 # eSwitch Management persistent state
-version 1
+version 3
 
 # Empty vSwitches are valid.
 vswitch 100
 vswitch 200
+vswitch 300
 
 # DPDK port IDs are intentionally not persisted because they may change after
 # a reboot. The parent and representor identity are resolved after probing.
-member 100 parent
-member 100 representor 1 0 0
-member 100 representor 1 0 1
-member 200 representor 1 0 2
-member 200 representor 1 0 3
+member 100 parent trunk 6 6
+member 100 representor 1 0 0 access 0 0
+member 100 representor 1 0 1 access 0 0
+member 200 representor 1 0 2 access 0 0
+member 200 representor 1 0 3 access 0 0
+
+# Transparent trunk range: tags 800-899 remain in the frame on both ports.
+member 300 parent trunk 800 899
+member 300 representor 1 0 10 trunk 800 899

@@ -66,7 +66,14 @@ int main(void) {
         "vs port attach --id 100 --port 0 --mode trunk --vlan 6\n", true);
     assert(trunk.verb == ESWITCH_CLI_VS_PORT_ATTACH);
     assert(trunk.port_mode == ESWITCH_PORT_MODE_TRUNK);
-    assert(trunk.has_vlan && trunk.vlan_id == 6);
+    assert(trunk.has_vlan && trunk.vlan_id == 6 && trunk.vlan_last == 6);
+  }
+  {
+    struct eswitch_cli_command range = line(
+        "vs port attach --id 300 --port 0 --mode trunk --vlan 800-899\n",
+        true);
+    assert(range.port_mode == ESWITCH_PORT_MODE_TRUNK);
+    assert(range.vlan_id == 800 && range.vlan_last == 899);
   }
   accept_port("vs port detach --id 100 --port 1\n",
               ESWITCH_CLI_VS_PORT_DETACH, 100, 1, false);
@@ -143,6 +150,12 @@ int main(void) {
   reject("vs port attach --id 100 --port 0 --mode access --vlan 6\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 0\n");
   reject("vs port attach --id 100 --port 0 --mode trunk --vlan 4095\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 900-800\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 0-10\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 1-4095\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 800-\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan -899\n");
+  reject("vs port attach --id 100 --port 0 --mode trunk --vlan 800-850-899\n");
   reject("vs port detach --id 100 --port 0 --mode trunk --vlan 6\n");
   reject("vs-port-detach --id 100 --port 0 --vlan 6\n");
   reject("vs port attach --id 0 --port 1\n");

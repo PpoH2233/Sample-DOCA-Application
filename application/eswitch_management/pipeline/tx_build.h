@@ -1,6 +1,6 @@
 #ifndef ESWITCH_TX_BUILD_H
 #define ESWITCH_TX_BUILD_H
 /* Bump when changing the TX implementation. Visible in binary/startup/status. */
-#define ESWITCH_TX_REVISION "doca34-shared-vs-multivr-v28"
+#define ESWITCH_TX_REVISION "doca34-transparent-trunk-range-v29"
 #define ESWITCH_TX_FLOW_MODE "switch,hws,hairpinq_num=4,expert"
 #endif

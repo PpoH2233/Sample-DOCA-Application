@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-shared-vs-multivr-v28`. This revision includes
+Contract revision: `doca34-transparent-trunk-range-v29`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions.
@@ -30,7 +30,7 @@ The complete canonical command set:
 | 3 | `vs create --id <id>` | mutation |
 | 4 | `vs delete --id <id>` | mutation |
 | 5 | `vs show [--id <id>]` | query |
-| 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <1-4094>]` | mutation |
+| 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <vid\|first-last>]` | mutation |
 | 7 | `vs port detach --id <id> --port <port-id>` | mutation |
 | 8 | `port show` | query |
 | 9 | `fdb show [--id <id>]` | query |
@@ -334,27 +334,67 @@ ERR vSwitch is attached to a VR; detach it first with: vr switch detach --id <vr
 ```bash
 eswitchctl vs port attach --id 100 --port 1
 eswitchctl vs port attach --id 32774 --port 0 --mode trunk --vlan 6
+eswitchctl vs port attach --id 300 --port 0 --mode trunk --vlan 800-899
 eswitchctl vs port detach --id 100 --port 1
 ```
 
-The default is an untagged access membership. A trunk membership requires one
-VLAN ID in the range 1-4094. A physical port may have multiple trunk
-memberships, but a given `(port,VLAN)` belongs to exactly one vSwitch. Access
-and trunk memberships cannot coexist on one port. A port reserved directly by
-a VR cannot be attached.
+The default is an untagged access membership. A trunk membership accepts one
+VLAN ID or one inclusive range; every endpoint must be in 1-4094 and the first
+must not exceed the last. A physical port may have multiple trunk memberships,
+but a given `(port,VLAN)` belongs to exactly one vSwitch. Access and trunk
+memberships cannot coexist on one port. A port reserved directly by a VR cannot
+be attached.
+
+An exact VLAN remains a routed/translated broadcast domain: ingress pops its
+802.1Q tag and its egress gate pushes that VLAN again. A range is deliberately
+a **transparent L2 trunk domain**. The tag stays in the packet, ingress and
+egress hardware rules enforce the configured inclusive allow-list, and an
+egress VLAN outside that port's range drops. All members of a ranged VS must
+also be ranged trunks; an access member, exact-VLAN member, or VR vs-link is
+rejected. This prevents VLANs 800-899 from being collapsed into one untagged
+broadcast domain. Use an exact-VLAN VS when a VR/NAT interface must terminate a
+VLAN.
+
+A range expands to one exact ingress rule and one exact egress rule per VLAN.
+The aggregate expanded ingress count is limited to
+`ESWITCH_MAX_VLAN_MEMBERSHIPS` (512), so `800-899` consumes 100 classifier
+slots. Attach and persistence are transactional; an overlapping `(port,VLAN)`
+or insufficient capacity leaves the previous configuration unchanged.
+
+Example: transparently carry VLANs 800-899 between p0 and a host-facing VF.
+Use `port show` for the actual DPDK IDs; `0` and `4` are examples only:
+
+```bash
+eswitchctl vs create --id 300
+eswitchctl vs port attach --id 300 --port 0 \
+  --mode trunk --vlan 800-899
+eswitchctl vs port attach --id 300 --port 4 \
+  --mode trunk --vlan 800-899
+eswitchctl vs show --id 300
+```
+
+The tagged frame stays in hardware. The current Arm FDB learner intentionally
+ignores retained tagged frames, so ranged VS traffic uses the hardware flood
+group rather than learned unicast. With two trunk members, split horizon drops
+the ingress copy and the other member receives one copy. VLAN-aware FDB
+learning is a separate future optimization; it is not required for correct
+two-port trunk transit.
 
 `attach` performs, in order:
 
-1. Add a root classifier entry. Access ingress must be untagged; trunk ingress
-   matches VLAN ID and pops the 802.1Q header.
+1. Add root classifier entries. Access ingress must be untagged; an exact trunk
+   matches VLAN ID and pops the 802.1Q header; a range creates exact allow-list
+   entries and preserves the tag.
 2. Write
    `(vswitch_id << 16) | ingress_port_id` into packet metadata.
-3. Add a flood member through a per-membership egress gate. A trunk gate pushes
-   the configured VLAN before forwarding to the physical port.
+3. Add a flood member through a per-membership egress gate. An exact trunk gate
+   pushes its configured VLAN. A ranged gate forwards only frames whose
+   retained tag is within that port's range.
 
 `detach` performs, in order:
 
-1. Remove the port's root classifier entry, stopping new ingress.
+1. Remove the port's root classifier entry or range entries, stopping new
+   ingress.
 2. Remove only that port's member entry from the flooding HASH pipe.
 3. Remove only FDB entries whose learned egress is the detached port.
 4. Mark the port available.
@@ -426,6 +466,7 @@ eswitchctl vs show --id 100
 OK
 vs=100 ports=[1:access,2:access]
 vs=32774 ports=[0:trunk/vlan=6]
+vs=300 ports=[0:trunk/vlan=800-899,10:trunk/vlan=800-899]
 ```
 
 Without `--id` this is a collection read: `OK` plus one line per vSwitch, or
@@ -782,7 +823,7 @@ resource path becomes the URL path, and `--id` becomes a path segment.
 | vSwitch | `POST /vswitches` `{"id":N}` | `vs create --id N` |
 | vSwitch | `DELETE /vswitches/{id}` | `vs delete --id {id}` |
 | vSwitch member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"access"}` | `vs port attach --id {id} --port {port}` |
-| vSwitch trunk member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"trunk","vlan":6}` | `vs port attach --id {id} --port {port} --mode trunk --vlan 6` |
+| vSwitch trunk member | `PUT /vswitches/{id}/ports/{port}` `{"mode":"trunk","vlan":6}` or `{"mode":"trunk","vlan_first":800,"vlan_last":899}` | `vs port attach --id {id} --port {port} --mode trunk --vlan 6` or `--vlan 800-899` |
 | vSwitch member | `DELETE /vswitches/{id}/ports/{port}` | `vs port detach --id {id} --port {port}` |
 | Port | `GET /ports?assigned=false` | `port show` |
 | FDB | `GET /fdb` | `fdb show` |

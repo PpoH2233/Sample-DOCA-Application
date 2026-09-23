@@ -16,6 +16,7 @@ int main(void) {
       .kind = ESWITCH_STATE_PORT_PARENT,
       .mode = ESWITCH_PORT_MODE_TRUNK,
       .vlan_id = 6,
+      .vlan_last = 6,
   };
   struct eswitch_state_member representor = {
       .vswitch_id = 100,
@@ -29,6 +30,24 @@ int main(void) {
       .kind = ESWITCH_STATE_PORT_PARENT,
       .mode = ESWITCH_PORT_MODE_TRUNK,
       .vlan_id = 6,
+      .vlan_last = 6,
+  };
+  struct eswitch_state_member range_parent = {
+      .vswitch_id = 300,
+      .kind = ESWITCH_STATE_PORT_PARENT,
+      .mode = ESWITCH_PORT_MODE_TRUNK,
+      .vlan_id = 800,
+      .vlan_last = 899,
+  };
+  struct eswitch_state_member range_representor = {
+      .vswitch_id = 300,
+      .kind = ESWITCH_STATE_PORT_REPRESENTOR,
+      .host_index = 1,
+      .pf_index = 0,
+      .vf_index = 4,
+      .mode = ESWITCH_PORT_MODE_TRUNK,
+      .vlan_id = 800,
+      .vlan_last = 899,
   };
   bool exists = false;
 
@@ -38,30 +57,58 @@ int main(void) {
   assert(eswitch_state_init(8, &written) == DOCA_SUCCESS);
   assert(eswitch_state_add_switch(&written, 100) == DOCA_SUCCESS);
   assert(eswitch_state_add_switch(&written, 200) == DOCA_SUCCESS);
+  assert(eswitch_state_add_switch(&written, 300) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &parent) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &representor) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &conflicting_parent) !=
+         DOCA_SUCCESS);
+  assert(eswitch_state_add_member(&written, &range_parent) == DOCA_SUCCESS);
+  assert(eswitch_state_add_member(&written, &range_representor) ==
          DOCA_SUCCESS);
   assert(eswitch_state_save(path, &written) == DOCA_SUCCESS);
 
   assert(eswitch_state_init(8, &loaded) == DOCA_SUCCESS);
   assert(eswitch_state_load(path, &loaded, &exists) == DOCA_SUCCESS);
   assert(exists);
-  assert(loaded.switch_count == 2);
+  assert(loaded.switch_count == 3);
   assert(loaded.switch_ids[0] == 100 && loaded.switch_ids[1] == 200);
-  assert(loaded.member_count == 2);
+  assert(loaded.member_count == 4);
   assert(loaded.members[0].kind == ESWITCH_STATE_PORT_PARENT);
   assert(loaded.members[0].mode == ESWITCH_PORT_MODE_TRUNK);
   assert(loaded.members[0].vlan_id == 6);
+  assert(loaded.members[0].vlan_last == 6);
   assert(loaded.members[1].kind == ESWITCH_STATE_PORT_REPRESENTOR);
   assert(loaded.members[1].mode == ESWITCH_PORT_MODE_ACCESS);
   assert(loaded.members[1].vlan_id == 0);
+  assert(loaded.members[1].vlan_last == 0);
   assert(loaded.members[1].host_index == 1);
   assert(loaded.members[1].pf_index == 0);
   assert(loaded.members[1].vf_index == 3);
+  assert(loaded.members[2].vlan_id == 800);
+  assert(loaded.members[2].vlan_last == 899);
+  assert(loaded.members[3].vlan_id == 800);
+  assert(loaded.members[3].vlan_last == 899);
 
   eswitch_state_destroy(&loaded);
   eswitch_state_destroy(&written);
+
+  /* Version 2 stored one VLAN value. Loading normalizes it to an exact
+   * first==last interval before the next version-3 save. */
+  {
+    FILE *legacy = fopen(path, "w");
+    assert(legacy != NULL);
+    assert(fputs("version 2\nvswitch 10\nmember 10 parent trunk 6\n",
+                 legacy) >= 0);
+    assert(fclose(legacy) == 0);
+  }
+  exists = false;
+  assert(eswitch_state_init(8, &loaded) == DOCA_SUCCESS);
+  assert(eswitch_state_load(path, &loaded, &exists) == DOCA_SUCCESS);
+  assert(exists && loaded.member_count == 1);
+  assert(loaded.members[0].vlan_id == 6);
+  assert(loaded.members[0].vlan_last == 6);
+  eswitch_state_destroy(&loaded);
+
   assert(unlink(path) == 0);
   assert(rmdir(directory) == 0);
   puts("eswitch_state_test: PASS");

@@ -27,6 +27,36 @@ static bool parse_u16(const char *text, uint16_t *value) {
   return true;
 }
 
+static bool parse_vlan_spec(const char *text, uint16_t *first,
+                            uint16_t *last) {
+  const char *separator;
+  char first_text[16];
+  char last_text[16];
+  size_t first_length;
+
+  if (text == NULL || first == NULL || last == NULL)
+    return false;
+  separator = strchr(text, '-');
+  if (separator == NULL) {
+    if (!parse_u16(text, first) || !eswitch_vlan_valid(*first))
+      return false;
+    *last = *first;
+    return true;
+  }
+  if (separator == text || separator[1] == '\0' ||
+      strchr(separator + 1, '-') != NULL)
+    return false;
+  first_length = (size_t)(separator - text);
+  if (first_length >= sizeof(first_text) ||
+      strlen(separator + 1) >= sizeof(last_text))
+    return false;
+  memcpy(first_text, text, first_length);
+  first_text[first_length] = '\0';
+  strcpy(last_text, separator + 1);
+  return parse_u16(first_text, first) && parse_u16(last_text, last) &&
+         eswitch_vlan_range_valid(*first, *last);
+}
+
 /* Canonical option scanning: named options only, each at most once, in any
  * order. A missing required option or an unknown option is a grammar error. */
 static bool parse_options(size_t start, size_t count,
@@ -62,8 +92,7 @@ static bool parse_options(size_t start, size_t count,
       out->has_mode = true;
     } else if (strcmp(key, "--vlan") == 0) {
       bit = OPTION_VLAN;
-      if (!parse_u16(value, &out->vlan_id) ||
-          !eswitch_vlan_valid(out->vlan_id))
+      if (!parse_vlan_spec(value, &out->vlan_id, &out->vlan_last))
         return false;
       out->has_vlan = true;
     } else {
@@ -106,7 +135,8 @@ static bool valid_port_membership_options(struct eswitch_cli_command *out) {
   if (!out->has_mode)
     out->port_mode = ESWITCH_PORT_MODE_ACCESS;
   if (out->port_mode == ESWITCH_PORT_MODE_TRUNK)
-    return out->has_vlan && eswitch_vlan_valid(out->vlan_id);
+    return out->has_vlan &&
+           eswitch_vlan_range_valid(out->vlan_id, out->vlan_last);
   return !out->has_vlan;
 }
 
@@ -305,7 +335,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
     return "Usage: vs show [--id <id>]\n";
   if (strcmp(resource, "vs-port-attach") == 0)
     return "Usage: vs port attach --id <id> --port <port-id> "
-           "[--mode access|trunk] [--vlan <1-4094>]\n";
+           "[--mode access|trunk] [--vlan <vid|first-last>]\n";
   if (strcmp(resource, "vs-port-detach") == 0)
     return "Usage: vs port detach --id <id> --port <port-id>\n";
   if (strcmp(resource, "show-fdb") == 0)
@@ -331,7 +361,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
   if (token_count >= 2 && strcmp(tokens[1], "port") == 0) {
     if (token_count >= 3 && strcmp(tokens[2], "attach") == 0)
       return "Usage: vs port attach --id <id> --port <port-id> "
-             "[--mode access|trunk] [--vlan <1-4094>]\n";
+             "[--mode access|trunk] [--vlan <vid|first-last>]\n";
     if (token_count >= 3 && strcmp(tokens[2], "detach") == 0)
       return "Usage: vs port detach --id <id> --port <port-id>\n";
     return "Usage: vs port attach|detach --id <id> --port <port-id>\n";
@@ -369,9 +399,9 @@ void eswitch_cli_help(FILE *output, const char *program,
           "  vs show [--id <id>]                      Show all or one "
           "virtual switch\n"
           "  vs port attach --id <id> --port <port> [--mode access|trunk] "
-          "[--vlan <1-4094>]\n"
+          "[--vlan <vid|first-last>]\n"
           "                                             Attach an access "
-          "port (default), or one VLAN on a trunk\n"
+          "port (default), an exact VLAN, or a transparent VLAN range\n"
           "  vs port detach --id <id> --port <port>   Detach a member port\n\n"
           "Ports and forwarding tables:\n"
           "  port show                                Show assignable DPDK "
