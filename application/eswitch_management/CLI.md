@@ -8,10 +8,11 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-shared-vs-rif-v33`. This revision includes
+Contract revision: `doca34-arm-port-forward-v34`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
-aware control transactions.
+aware control transactions, plus Arm TCP/UDP port forwarding on an addressed
+public RIF. CloudStack integration is not included.
 
 ## 1. Grammar
 
@@ -55,6 +56,9 @@ The complete canonical command set:
 | 28 | `link show --id <link-id>` | query |
 | 29 | `vr link attach --id <vr-id> --link-id <link-id> --name <name>` | mutation |
 | 30 | `vr link detach --id <vr-id> --interface <name>` | mutation |
+| 31 | `vr port-forward add --id <vr-id> --rule-id <rule-id> --interface <name> --protocol tcp\|udp --public-port <port> --private-ip <ip> --private-port <port>` | mutation |
+| 32 | `vr port-forward show --id <vr-id> [--rule-id <rule-id>]` | query |
+| 33 | `vr port-forward delete --id <vr-id> --rule-id <rule-id>` | mutation |
 
 Grammar rules:
 
@@ -83,6 +87,8 @@ Grammar rules:
 | `<interval[,interval]>` | One VLAN VID, one inclusive VLAN range, or two comma-separated intervals; VIDs are `1..4094` and intervals must not overlap. Access mode permits only one VID. |
 | `<first-last>` | NAT port range. `first >= 1024` and `first <= last`. Applies to TCP and UDP ports and to ICMP Echo identifiers. |
 | `--address interface` | For `vr nat enable` only: use the uplink RIF's own address. |
+| `<rule-id>` | Local port-forward rule ID, decimal `1..65535`, unique within one VR. |
+| `<port>` for port forwarding | Single TCP/UDP port, `1..65535`. Port ranges are not supported yet. |
 
 The `--name` option names a **new** interface, so it is used only by
 `vr port attach`, `vr switch attach` and `vr link attach`. Every command that refers to an
@@ -564,14 +570,23 @@ Contract-level notes:
   IPv4 addresses on the same shared vSwitch are rejected.
 - `vr show` lists the VR's named RIFs with their type, identity, MAC, address
   and readiness. `vr route show` lists connected and static routes.
-  `vr nat show` reports the SNAT/PAT policy.
-- Detach requires no dependencies: remove the NAT policy, the static routes and
-  the IP address first. `vr delete` requires that the VR has no interfaces.
+  `vr nat show` reports the SNAT/PAT policy. `vr port-forward show` reports
+  inbound mappings on a VR.
+- Detach requires no dependencies: remove port-forward rules, the NAT policy,
+  static routes and the IP address first. `vr delete` requires that the VR has
+  no interfaces.
 - One IPv4 address per interface, and overlapping subnets inside one VR are
   rejected.
 - `vr nat enable` requires an addressed public port-link or vs-link that owns
   the VR's default route, and the public address must equal that interface's
   address. A VLAN WAN uses a vs-link whose vSwitch has p0 as a trunk member.
+- `vr port-forward add` uses the selected RIF's configured IPv4 address as its
+  public IP; a second public-IP alias is not supported in this phase. If SNAT
+  is enabled, the PF interface must be the same as its public interface. The
+  daemon validates IP syntax but does **not** establish ownership of the
+  private IP by any VM/NIC. TCP/UDP packets are accepted from any source;
+  source-CIDR ACLs are not yet supported. The target must be reachable by the
+  VR's routing and neighbor tables at runtime.
 
 Implemented today: private-vSwitch gateway ARP, local ICMP echo, connected and
 static route LPM, neighbor discovery, IPv4 forwarding, and Arm-side TCP/UDP/ICMP
@@ -584,6 +599,29 @@ slow path. Hardware CT aging/counters and ICMP routing error generation are not
 implemented. Status strings
 in `status`, `vr show` and `vr nat show` report the active/fallback stage, so a
 client should surface them rather than assume full offload.
+
+#### Arm port forwarding (BlueField CLI only)
+
+```sh
+# RIF uplink-vlan6 already has 161.246.6.38/16; the private VS and route exist.
+eswitchctl vr port-forward add --id 1 --rule-id 10 \
+  --interface uplink-vlan6 --protocol tcp --public-port 2222 \
+  --private-ip 192.168.100.10 --private-port 22
+eswitchctl vr port-forward show --id 1
+eswitchctl vr port-forward delete --id 1 --rule-id 10
+```
+
+The rule key is VR + public RIF IP + protocol + public port. Reverse-session
+lookup runs first; on a miss, a PF rule creates a connection-specific DNAT
+mapping. VM replies restore the rule's public IP and port. SNAT/PAT never
+allocates a TCP/UDP public port reserved by a PF rule. Rule changes flush
+existing NAT/CT sessions, and rules survive restart in the router state file.
+`status` reports `port_forward_rules`, `pf_sessions_created`, `pf_in`, `pf_out`
+and `pf_full`.
+
+This phase does not implement public-IP aliases, port ranges, source filtering,
+hairpin NAT, ICMP forwarding or PF hardware CT promotion. It does not change
+the CloudStack extension; do not advertise `PortForwarding` there yet.
 
 #### 5.8.1 VR and interface lifecycle
 

@@ -22,6 +22,7 @@ enum router_nat_result {
 };
 
 struct router_nat_inside {
+  uint16_t vr_id;
   uint16_t vswitch_id;
   uint16_t interface_id;
   uint16_t port_id;
@@ -32,7 +33,10 @@ struct router_nat_session {
   /* Intrusive indices are slot + 1; zero terminates a bucket chain. */
   uint16_t index_next[3];
   bool used;
+  bool port_forward;
   uint16_t vr_id;
+  uint16_t public_interface_id;
+  uint16_t port_forward_rule_id;
   uint8_t protocol;
   uint32_t inside_ip;
   uint16_t inside_port;
@@ -59,6 +63,10 @@ struct router_nat_stats {
   uint64_t reverse_misses;
   uint64_t unsupported_packets;
   uint64_t invalid_packets;
+  uint64_t port_forward_inbound_packets;
+  uint64_t port_forward_outbound_packets;
+  uint64_t port_forward_sessions_created;
+  uint64_t port_forward_full;
 };
 
 struct router_nat_table {
@@ -67,10 +75,16 @@ struct router_nat_table {
   uint16_t buckets[3][ROUTER_NAT_BUCKETS];
   size_t count;
   uint16_t next_port;
+  struct router_port_forward port_forwards[ROUTER_MAX_PORT_FORWARDS];
+  size_t port_forward_count;
   struct router_nat_stats stats;
 };
 
 void router_nat_init(struct router_nat_table *table);
+/* Install the committed rules for PAT-port reservation. Flush sessions before
+ * changing rules; callers perform this as part of the router transaction. */
+void router_nat_set_port_forwards(struct router_nat_table *table,
+                                  const struct router_config *config);
 
 /* Translate one untagged IPv4 TCP, UDP, or ICMP Echo packet. ICMP sessions
  * store the original/translated Echo Identifier in inside_port/public_port;
@@ -89,6 +103,19 @@ enum router_nat_result router_nat_inbound(
     const uint8_t *frame, size_t length, uint64_t now_ns,
     uint8_t *output, size_t capacity,
     const struct router_nat_session **session);
+
+/* Called only after reverse-session lookup misses on the addressed public RIF. */
+enum router_nat_result router_nat_port_forward_inbound(
+    struct router_nat_table *table, const struct router_config *config,
+    uint16_t vr_id, uint16_t public_interface_id,
+    const uint8_t *frame, size_t length, uint64_t now_ns,
+    uint8_t *output, size_t capacity,
+    const struct router_nat_session **session);
+
+/* Reject a PF session after the translated target fails route validation.
+ * PF sessions are Arm-owned; they are never promoted to hardware CT. */
+void router_nat_port_forward_reject(struct router_nat_table *table,
+                                    const struct router_nat_session *session);
 
 void router_nat_age(struct router_nat_table *table, uint64_t now_ns);
 /* Flush one VR, or every VR when vr_id is zero. Hardware-owned sessions must

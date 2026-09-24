@@ -110,6 +110,8 @@ int main(void) {
   accept_verb("vr create --id 5\n", ESWITCH_CLI_ROUTER, false);
   accept_verb("vr port attach --id 5 --port 7 --name up0\n",
               ESWITCH_CLI_ROUTER, false);
+  accept_verb("vr port-forward add --id 5 --rule-id 7 --interface uplink --protocol tcp --public-port 2222 --private-ip 192.168.0.50 --private-port 22\n",
+              ESWITCH_CLI_ROUTER, false);
   accept_verb("vr\n", ESWITCH_CLI_ROUTER, false);
   accept_verb("vr nonsense --whatever\n", ESWITCH_CLI_ROUTER, false);
   assert(eswitch_cli_is_router_line("vr show --id 5\n"));

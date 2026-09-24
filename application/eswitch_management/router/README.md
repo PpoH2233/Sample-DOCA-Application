@@ -255,8 +255,17 @@ that session. ICMP Echo Request (`type 8/code 0`) maps the original Identifier
 to an Identifier from the configured port range; the corresponding Echo Reply
 (`type 0/code 0`) restores it. IPv4 fragments, other ICMP message types, and
 protocols other than TCP/UDP/ICMP fail closed. Hairpin NAT, static
-DNAT/port-forwarding, ICMP error-message translation and hardware CT are not
-implemented yet.
+NAT, ICMP error-message translation and PF-specific hardware CT are not
+implemented yet. TCP/UDP single-port forwarding is available on Arm through
+`vr port-forward add|show|delete`; the public IP is the addressed RIF's IP.
+Reverse-session lookup has priority over PF-rule lookup. A matching inbound
+packet is DNATed to the configured private IP/port, then follows normal LPM
+and neighbor resolution. Replies use that session to restore the public
+source IP/port. The public port is excluded from SNAT/PAT allocation for the
+same VR, public IP and protocol. A rule does not verify VM/NIC ownership of
+its private target; an unreachable target fails at routing/neighbor delivery.
+Rules persist in `router-state 3`, while older state versions still load.
+PF sessions remain on Arm even if DOCA Flow CT is enabled for ordinary SNAT.
 
 Example acceptance test, using a reachable target and TCP service beyond the
 uplink:

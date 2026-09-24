@@ -1274,9 +1274,13 @@ static void route_arm_frame(struct eswitch_manager *manager,
   forward_frame = frame;
   nat_policy = router_nat_policy_find(manager->router, decision.vr_id);
   if (egress->attachment == ROUTER_PORT ||
+      router_port_forward_uses_interface(manager->router,
+                                         egress->interface_id) ||
       (nat_policy != NULL &&
        nat_policy->interface_id == egress->interface_id)) {
-    if (nat_policy == NULL || nat_policy->interface_id != egress->interface_id) {
+    if ((nat_policy == NULL || nat_policy->interface_id != egress->interface_id) &&
+        !router_port_forward_uses_interface(manager->router,
+                                            egress->interface_id)) {
       manager->route_tx_drops++;
       fprintf(stderr,
               "NAT OUT DROP: vr=%u egress-rif=%u reason=no-active-policy\n",
@@ -1290,12 +1294,17 @@ static void route_arm_frame(struct eswitch_manager *manager,
     }
     inside.vswitch_id = ingress->attachment==ROUTER_VSWITCH ?
                         ingress->vswitch_id : 0;
+    inside.vr_id = decision.vr_id;
     inside.interface_id = decision.ingress_interface_id;
     inside.port_id = ingress->attachment==ROUTER_VSWITCH ? ingress_port : 0;
     memcpy(inside.mac, frame + 6, sizeof(inside.mac));
     nat_result = router_nat_outbound(
-        manager->nat, nat_policy,
-        router_nat_policy_address(manager->router, nat_policy), &inside,
+        manager->nat,
+        nat_policy != NULL && nat_policy->interface_id == egress->interface_id
+            ? nat_policy : NULL,
+        nat_policy != NULL && nat_policy->interface_id == egress->interface_id
+            ? router_nat_policy_address(manager->router, nat_policy) : 0,
+        &inside,
         frame, length, now_ns, translated, capacity, &nat_session);
     if (nat_result != ROUTER_NAT_TRANSLATED) {
       if (nat_result == ROUTER_NAT_INVALID)
@@ -1305,6 +1314,11 @@ static void route_arm_frame(struct eswitch_manager *manager,
               "NAT OUT DROP: vr=%u egress-rif=%u result=%u\n",
               decision.vr_id, decision.egress_interface_id,
               (unsigned)nat_result);
+      goto out;
+    }
+    if (nat_session == NULL ||
+        nat_session->public_interface_id != egress->interface_id) {
+      manager->route_tx_drops++;
       goto out;
     }
     forward_frame = translated;
@@ -1385,7 +1399,8 @@ static void route_arm_frame(struct eswitch_manager *manager,
            (nat_session->remote_ip >> 8) & 0xffU,
            nat_session->remote_ip & 0xffU, nat_session->remote_port);
   }
-  if (nat_session != NULL && ingress->attachment==ROUTER_VSWITCH &&
+  if (nat_session != NULL && !nat_session->port_forward &&
+      ingress->attachment==ROUTER_VSWITCH &&
       manager->pipeline->hardware_ct_enabled &&
       manager->pipeline->hardware_routing_enabled &&
       (nat_session->protocol == IPPROTO_TCP ||
@@ -1495,9 +1510,12 @@ static void route_nat_ingress_frame(
   size_t capacity = length < 60 ? 60 : length;
   uint8_t *translated = NULL;
   enum router_nat_result nat_result;
+  bool port_forwarded = false;
 
   policy = router_nat_policy_find(manager->router, ingress->vr_id);
-  if (policy == NULL || policy->interface_id != ingress->interface_id)
+  if ((policy == NULL || policy->interface_id != ingress->interface_id) &&
+      !router_port_forward_uses_interface(manager->router,
+                                          ingress->interface_id))
     return;
   translated = malloc(capacity);
   if (translated == NULL) {
@@ -1506,6 +1524,22 @@ static void route_nat_ingress_frame(
   }
   nat_result = router_nat_inbound(manager->nat, ingress->vr_id, frame, length,
                                   now_ns, translated, capacity, &session);
+  if (nat_result == ROUTER_NAT_NOT_APPLICABLE &&
+      router_port_forward_uses_interface(manager->router,
+                                         ingress->interface_id)) {
+    nat_result = router_nat_port_forward_inbound(
+        manager->nat, manager->router, ingress->vr_id,
+        ingress->interface_id, frame, length, now_ns,
+        translated, capacity, &session);
+    port_forwarded = nat_result == ROUTER_NAT_TRANSLATED;
+  }
+  if (nat_result == ROUTER_NAT_TRANSLATED && session != NULL)
+    port_forwarded = session->port_forward;
+  if (nat_result == ROUTER_NAT_TRANSLATED && session != NULL &&
+      session->public_interface_id != ingress->interface_id) {
+    manager->nat_fail_closed_drops++;
+    goto out;
+  }
   if (nat_result != ROUTER_NAT_TRANSLATED) {
     struct router_ipv4_decision decision;
     enum router_ipv4_disposition disposition = ROUTER_IPV4_INVALID;
@@ -1542,8 +1576,22 @@ static void route_nat_ingress_frame(
   }
 
   if(session==NULL) goto out;
+  if (port_forwarded) {
+    struct router_ipv4_decision decision;
+    enum router_ipv4_disposition disposition = router_ipv4_lookup_interface(
+        manager->router, ingress->interface_id, translated, length, &decision);
+    /* A misconfigured target must never turn an inbound rule into a WAN
+     * transit route through the VR's default route. */
+    if (disposition != ROUTER_IPV4_FORWARD ||
+        decision.egress_interface_id == ingress->interface_id) {
+      manager->nat_fail_closed_drops++;
+      router_nat_port_forward_reject(manager->nat, session);
+      goto out;
+    }
+  }
   route_arm_frame(manager, translated, length, ingress, ingress_port,
-                  link_hops, session->inside.interface_id, now_ns);
+                  link_hops,
+                  port_forwarded ? 0 : session->inside.interface_id, now_ns);
   if (manager->packet_debug)
     printf("NAT IN: vr=%u ingress-port=%u public=%u.%u.%u.%u:%u "
          "inside=%u.%u.%u.%u:%u return-rif=%u\n",
@@ -1572,7 +1620,9 @@ static void route_router_ingress_frame(
   const struct router_nat_policy *policy =
       router_nat_policy_find(manager->router, ingress->vr_id);
 
-  if (policy != NULL && policy->interface_id == ingress->interface_id) {
+  if ((policy != NULL && policy->interface_id == ingress->interface_id) ||
+      router_port_forward_uses_interface(manager->router,
+                                         ingress->interface_id)) {
     route_nat_ingress_frame(manager, frame, length, ingress, ingress_port,
                             link_hops, now_ns);
     return;
@@ -1980,6 +2030,14 @@ static size_t format_status(const struct eswitch_manager *manager,
       "nat_icmp_echo_out=%" PRIu64 " nat_icmp_echo_in=%" PRIu64 "\n",
       manager->nat ? manager->nat->stats.icmp_echo_outbound_packets : 0,
       manager->nat ? manager->nat->stats.icmp_echo_inbound_packets : 0);
+  used = append_text(response, size, used,
+      "port_forward_rules=%zu pf_sessions_created=%" PRIu64
+      " pf_in=%" PRIu64 " pf_out=%" PRIu64 " pf_full=%" PRIu64 "\n",
+      manager->router ? manager->router->port_forward_count : 0,
+      manager->nat ? manager->nat->stats.port_forward_sessions_created : 0,
+      manager->nat ? manager->nat->stats.port_forward_inbound_packets : 0,
+      manager->nat ? manager->nat->stats.port_forward_outbound_packets : 0,
+      manager->nat ? manager->nat->stats.port_forward_full : 0);
   used = append_text(response, size, used,
       "private_gateway_arp=enabled arp_sf_tx_sent=%" PRIu64
       " arp_tx_drops=%" PRIu64 " arp_rate_drops=%" PRIu64 "\n",

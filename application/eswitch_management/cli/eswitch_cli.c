@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ESWITCH_CLI_MAX_TOKENS 16U
+#define ESWITCH_CLI_MAX_TOKENS 24U
 
 enum option_bit {
   OPTION_ID = 1u,
@@ -465,6 +465,11 @@ void eswitch_cli_help(FILE *output, const char *program,
           "      --port-range <first-last>            TCP/UDP ports and ICMP "
           "Echo IDs\n"
           "  vr nat disable|show --id <id>\n\n"
+          "  vr port-forward add --id <id> --rule-id <id> --interface <name>\n"
+          "      --protocol tcp|udp --public-port <port>\n"
+          "      --private-ip <ip> --private-port <port>\n"
+          "  vr port-forward show --id <id> [--rule-id <id>]\n"
+          "  vr port-forward delete --id <id> --rule-id <id>\n\n"
           "  Private VS gateway ARP and ICMP echo are active. Eligible "
           "private routes\n"
           "  use hardware LPM; unsupported cases fail open to the Arm slow "

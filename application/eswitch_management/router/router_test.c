@@ -80,6 +80,9 @@ int main(void) {
   command("vr port-detach --id 300 --interface up0",false);
   command("vr nat disable --id 300",true);
   command("vr route del --id 300 --prefix 0.0.0.0/0",true);
+  command("vr port-forward add --id 300 --rule-id 1 --interface up0 --protocol tcp --public-port 2222 --private-ip 10.10.0.50 --private-port 22",true);
+  command("vr ip del --id 300 --interface up0 --address 203.0.113.2/24",false);
+  command("vr port-forward delete --id 300 --rule-id 1",true);
   command("vr ip del --id 300 --interface up0 --address 203.0.113.2/24",true);
   command("vr port detach --id 300 --interface up0",true);
   command("vr ip del --id 300 --interface lan0 --address 10.10.0.1/24",true);
@@ -129,6 +132,15 @@ int main(void) {
   command("vr nat enable --id 100 --interface p1 --address interface --port-range 1-65535",false);
   command("vr nat enable --id 100 --interface p1 --address interface --port-range 20000-60999",true);
   command("vr nat enable --id 100 --interface p1 --address interface --port-range 20000-60999",false);
+  command("vr port-forward add --id 100 --rule-id 7 --interface p1 --protocol tcp --public-port 2222 --private-ip 192.168.0.50 --private-port 22",true);
+  command("vr port-forward add --id 100 --rule-id 7 --interface p1 --protocol udp --public-port 2222 --private-ip 192.168.0.50 --private-port 22",false);
+  command("vr port-forward add --id 100 --rule-id 8 --interface p1 --protocol tcp --public-port 2222 --private-ip 192.168.0.51 --private-port 22",false);
+  command("vr port-forward add --id 100 --rule-id 8 --interface p1 --protocol udp --public-port 2222 --private-ip 192.168.0.50 --private-port 53",true);
+  command("vr port-forward show --id 100 --rule-id 7",true);
+  assert(strstr(response,"public=200.20.0.4:2222") &&
+         strstr(response,"private=192.168.0.50:22"));
+  command("vr port-forward show --id 100 --rule-id 9",false);
+  command("vr port-forward add --id 100 --rule-id 9 --interface p2 --protocol tcp --public-port 80 --private-ip 192.168.0.50 --private-port 80",false);
   command("vr nat show --id 100",true);
   assert(strstr(response,"nat=enabled") && strstr(response,"address=200.20.0.4") &&
          strstr(response,"ports=20000-60999"));
@@ -151,6 +163,7 @@ int main(void) {
   assert(router_config_load(path,&loaded,response,sizeof(response)));
   assert(loaded.vr_count==config.vr_count && loaded.route_count==config.route_count);
   assert(loaded.nat_policy_count==config.nat_policy_count);
+  assert(loaded.port_forward_count==config.port_forward_count);
   assert(loaded.interface_count==config.interface_count && loaded.next_interface_id==config.next_interface_id);
   for(size_t i=0;i<config.interface_count;i++)
     assert(!memcmp(&loaded.interfaces[i],&config.interfaces[i],sizeof(config.interfaces[i])));
@@ -158,6 +171,14 @@ int main(void) {
     assert(!memcmp(&loaded.routes[i],&config.routes[i],sizeof(config.routes[i])));
   for(size_t i=0;i<config.nat_policy_count;i++)
     assert(!memcmp(&loaded.nat_policies[i],&config.nat_policies[i],sizeof(config.nat_policies[i])));
+  for(size_t i=0;i<config.port_forward_count;i++) {
+    const struct router_port_forward *a=&loaded.port_forwards[i];
+    const struct router_port_forward *b=&config.port_forwards[i];
+    assert(a->vr_id==b->vr_id && a->rule_id==b->rule_id &&
+           a->interface_id==b->interface_id && a->protocol==b->protocol &&
+           a->public_port==b->public_port && a->private_port==b->private_port &&
+           a->public_ip==b->public_ip && a->private_ip==b->private_ip);
+  }
   /* Malformed restore must not publish partial configuration. */
   FILE *file=fopen(path,"a");assert(file);assert(fputs("vr delete --id 101\n",file)>=0);assert(fclose(file)==0);
   struct router_config before=loaded;
@@ -259,6 +280,8 @@ int main(void) {
   assert(unlink(path)==0);assert(rmdir(dir)==0);
 
   command("vr nat disable --id 100",true);
+  command("vr port-forward delete --id 100 --rule-id 7",true);
+  command("vr port-forward delete --id 100 --rule-id 8",true);
   command("vr nat show --id 100",true);
   assert(strstr(response,"nat=disabled"));
   command("vr route del --id 100 --prefix 0.0.0.0/0",true);

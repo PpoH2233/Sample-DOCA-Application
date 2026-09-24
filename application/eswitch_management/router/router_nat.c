@@ -275,6 +275,12 @@ static struct router_nat_session *find_inbound(
 static bool port_in_use(const struct router_nat_table *table, uint16_t vr_id,
                         uint8_t protocol, uint32_t public_ip,
                         uint16_t public_port) {
+  for (size_t i = 0; i < table->port_forward_count; i++) {
+    const struct router_port_forward *r = &table->port_forwards[i];
+    if (r->vr_id == vr_id && r->protocol == protocol &&
+        r->public_ip == public_ip && r->public_port == public_port)
+      return true;
+  }
   size_t bucket = tuple_bucket(vr_id, protocol, public_ip, public_port, 0, 0);
   for (uint16_t slot = table->buckets[2][bucket]; slot;
        slot = table->entries[slot - 1].index_next[2]) {
@@ -309,6 +315,7 @@ static struct router_nat_session *allocate_session(
       continue;
     *free_session = (struct router_nat_session){
       .used=true,.vr_id=policy->vr_id,.protocol=view->protocol,
+      .public_interface_id=policy->interface_id,
       .inside_ip=view->source_ip,.inside_port=view->source_port,
       .remote_ip=view->destination_ip,.remote_port=view->destination_port,
       .public_ip=public_ip,.public_port=candidate,.inside=*inside,
@@ -328,6 +335,14 @@ void router_nat_init(struct router_nat_table *table) {
     memset(table, 0, sizeof(*table));
 }
 
+void router_nat_set_port_forwards(struct router_nat_table *table,
+                                  const struct router_config *config) {
+  if (!table || !config) return;
+  table->port_forward_count = config->port_forward_count;
+  memcpy(table->port_forwards, config->port_forwards,
+         config->port_forward_count * sizeof(config->port_forwards[0]));
+}
+
 enum router_nat_result router_nat_outbound(
     struct router_nat_table *table, const struct router_nat_policy *policy,
     uint32_t public_ip, const struct router_nat_inside *inside,
@@ -339,8 +354,9 @@ enum router_nat_result router_nat_outbound(
   enum router_nat_result result;
 
   if (session) *session = NULL;
-  if (!table || !policy || !inside || !public_ip || !policy->vr_id ||
-      policy->port_first < 1024 || policy->port_first > policy->port_last)
+  if (!table || !inside || (!policy && !inside->vr_id) ||
+      (policy && (!public_ip || !policy->vr_id ||
+       policy->port_first < 1024 || policy->port_first > policy->port_last)))
     return ROUTER_NAT_INVALID;
   result = packet_copy_and_parse(frame, length, output, capacity,
                                  PACKET_OUTBOUND, &view);
@@ -349,10 +365,13 @@ enum router_nat_result router_nat_outbound(
     else table->stats.invalid_packets++;
     return result;
   }
-  s = find_outbound(table, policy->vr_id, &view);
-  if (!s)
+  s = find_outbound(table, policy ? policy->vr_id : inside->vr_id, &view);
+  if (!s && policy)
     s = allocate_session(table, policy, public_ip, &view, inside, now_ns);
+  if (s && !policy && !s->port_forward)
+    return ROUTER_NAT_NOT_APPLICABLE;
   if (!s) {
+    if (!policy) return ROUTER_NAT_NOT_APPLICABLE;
     table->stats.port_allocation_failures++;
     return ROUTER_NAT_FULL;
   }
@@ -371,6 +390,8 @@ enum router_nat_result router_nat_outbound(
   s->last_seen_ns = now_ns;
   s->original_packets++;
   table->stats.outbound_packets++;
+  if (s->port_forward)
+    table->stats.port_forward_outbound_packets++;
   if (view.protocol == IPPROTO_ICMP_VALUE)
     table->stats.icmp_echo_outbound_packets++;
   if (session) *session = s;
@@ -416,6 +437,106 @@ enum router_nat_result router_nat_inbound(
     table->stats.icmp_echo_inbound_packets++;
   if (session) *session = s;
   return ROUTER_NAT_TRANSLATED;
+}
+
+enum router_nat_result router_nat_port_forward_inbound(
+    struct router_nat_table *table, const struct router_config *config,
+    uint16_t vr_id, uint16_t public_interface_id,
+    const uint8_t *frame, size_t length, uint64_t now_ns,
+    uint8_t *output, size_t capacity,
+    const struct router_nat_session **session) {
+  struct packet_view view;
+  const struct router_port_forward *rule = NULL;
+  struct router_nat_session *s;
+  enum router_nat_result result;
+
+  if (session) *session = NULL;
+  if (!table || !config || !vr_id || !public_interface_id)
+    return ROUTER_NAT_INVALID;
+  result = packet_copy_and_parse(frame, length, output, capacity,
+                                 PACKET_INBOUND, &view);
+  if (result != ROUTER_NAT_TRANSLATED)
+    return result;
+  if (view.protocol != IPPROTO_TCP_VALUE &&
+      view.protocol != IPPROTO_UDP_VALUE)
+    return ROUTER_NAT_NOT_APPLICABLE;
+  for (size_t i = 0; i < config->port_forward_count; i++) {
+    const struct router_port_forward *candidate = &config->port_forwards[i];
+    if (candidate->vr_id == vr_id &&
+        candidate->interface_id == public_interface_id &&
+        candidate->public_ip == view.destination_ip &&
+        candidate->protocol == view.protocol &&
+        candidate->public_port == view.destination_port) {
+      rule = candidate;
+      break;
+    }
+  }
+  if (!rule) return ROUTER_NAT_NOT_APPLICABLE;
+
+  s = find_inbound(table, vr_id, &view);
+  if (s && !s->port_forward) return ROUTER_NAT_NOT_APPLICABLE;
+  if (!s) {
+    struct packet_view return_view = {
+      .protocol = view.protocol,
+      .source_ip = rule->private_ip,
+      .source_port = rule->private_port,
+      .destination_ip = view.source_ip,
+      .destination_port = view.source_port};
+    /* Two public mappings cannot safely share the same return 5-tuple.
+     * Fail closed rather than guessing which public port to restore. */
+    if (find_outbound(table, vr_id, &return_view) != NULL) {
+      table->stats.port_forward_full++;
+      return ROUTER_NAT_FULL;
+    }
+    for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++)
+      if (!table->entries[i].used) { s = &table->entries[i]; break; }
+    if (!s) {
+      table->stats.port_forward_full++;
+      return ROUTER_NAT_FULL;
+    }
+    *s = (struct router_nat_session){
+      .used = true, .port_forward = true, .vr_id = vr_id,
+      .public_interface_id = public_interface_id,
+      .port_forward_rule_id = rule->rule_id,
+      .protocol = view.protocol,
+      .inside_ip = rule->private_ip, .inside_port = rule->private_port,
+      .remote_ip = view.source_ip, .remote_port = view.source_port,
+      .public_ip = rule->public_ip, .public_port = rule->public_port,
+      .created_ns = now_ns, .last_seen_ns = now_ns};
+    index_insert(table, s);
+    table->count++;
+    table->stats.sessions_created++;
+    table->stats.port_forward_sessions_created++;
+  }
+  write32(view.ip + 16, s->inside_ip);
+  write16(view.l4 + 2, s->inside_port);
+  view.destination_ip = s->inside_ip;
+  view.destination_port = s->inside_port;
+  update_checksums(&view);
+  s->last_seen_ns = now_ns;
+  s->reply_packets++;
+  table->stats.inbound_packets++;
+  table->stats.port_forward_inbound_packets++;
+  if (session) *session = s;
+  return ROUTER_NAT_TRANSLATED;
+}
+
+void router_nat_port_forward_reject(struct router_nat_table *table,
+                                    const struct router_nat_session *session) {
+  if (!table || !session)
+    return;
+  uintptr_t base = (uintptr_t)table->entries;
+  uintptr_t address = (uintptr_t)session;
+  if (address < base || address - base >= sizeof(table->entries) ||
+      (address - base) % sizeof(table->entries[0]) != 0)
+    return;
+  struct router_nat_session *s = &table->entries[
+      (address - base) / sizeof(table->entries[0])];
+  if (!s->used || !s->port_forward || s->hardware_active)
+    return;
+  index_remove(table, s);
+  memset(s, 0, sizeof(*s));
+  table->count--;
 }
 
 void router_nat_age(struct router_nat_table *table, uint64_t now_ns) {

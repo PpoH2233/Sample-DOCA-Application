@@ -151,6 +151,7 @@ doca_error_t router_control_restore(struct eswitch_manager *m) {
   if(!router_config_load(path,m->router,error,sizeof(error))) {
     fprintf(stderr,"%s",error); return DOCA_ERROR_INVALID_VALUE;
   }
+  router_nat_set_port_forwards(m->nat,m->router);
   for(size_t r=0;r<m->router->interface_count;r++) {
     const struct router_interface *rif=&m->router->interfaces[r];
     bool found=false;
@@ -266,6 +267,7 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
     }
     if(ok) {
       *m->router=*candidate;
+      router_nat_set_port_forwards(m->nat,m->router);
       {
         doca_error_t result=eswitch_manager_router_prepare(
             m,m->router,monotonic_ns());

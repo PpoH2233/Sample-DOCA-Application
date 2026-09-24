@@ -10,7 +10,7 @@
 enum operation { CREATE, DELETE, SHOW, LINK_CREATE, LINK_DELETE, LINK_SHOW,
   ATTACH_PORT, ATTACH_SWITCH, ATTACH_LINK, DETACH_PORT, DETACH_SWITCH,
   DETACH_LINK, IP_ADD, IP_DEL, ROUTE_ADD, ROUTE_DEL, ROUTE_SHOW, MAC_SET,
-  NAT_ENABLE, NAT_DISABLE, NAT_SHOW };
+  NAT_ENABLE, NAT_DISABLE, NAT_SHOW, PF_ADD, PF_DELETE, PF_SHOW };
 struct command {
   enum operation op;
   uint16_t id, port, vswitch, link;
@@ -19,6 +19,9 @@ struct command {
   uint8_t prefix, mac[6];
   bool address_from_interface;
   uint16_t port_first, port_last;
+  uint16_t rule_id, public_port, private_port;
+  uint32_t private_ip;
+  uint8_t protocol;
 };
 
 static bool error(char *out, size_t size, const char *message) {
@@ -98,7 +101,9 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
   size_t count = 0, start = 2;
   unsigned allowed = 0, required = 0, found = 0;
   enum { ID=1, NAME=2, PORT=4, SWITCH=8, ADDRESS=16, PREFIX=32,
-         VIA=64, MAC=128, PORT_RANGE=256, LINK=512 };
+         VIA=64, MAC=128, PORT_RANGE=256, LINK=512, RULE_ID=1024,
+         PROTOCOL=2048, PUBLIC_PORT=4096, PRIVATE_IP=8192,
+         PRIVATE_PORT=16384 };
   if (!request || strlen(request) >= sizeof(text))
     return error(out, size, "command too long");
   strcpy(text, request);
@@ -174,11 +179,22 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
     } else if (!strcmp(tokens[2],"show")) {
       c->op=NAT_SHOW; required=ID;
     } else return error(out,size,"expected nat enable|disable|show");
+  } else if (count > 2 && !strcmp(verb,"port-forward")) {
+    start=3;
+    if (!strcmp(tokens[2],"add")) {
+      c->op=PF_ADD;
+      required=ID|RULE_ID|NAME|PROTOCOL|PUBLIC_PORT|PRIVATE_IP|PRIVATE_PORT;
+    } else if (!strcmp(tokens[2],"delete")) {
+      c->op=PF_DELETE; required=ID|RULE_ID;
+    } else if (!strcmp(tokens[2],"show")) {
+      c->op=PF_SHOW; required=ID;
+      allowed=RULE_ID;
+    } else return error(out,size,"expected port-forward add|delete|show");
   } else return error(out,size,
     "unsupported vr operation; expected create|delete|show|port|switch|link|"
-    "interface|ip|route|nat (see router/README.md)");
+    "interface|ip|route|nat|port-forward (see router/README.md)");
 options:
-  allowed=required;
+  allowed|=required;
   if ((count-start)%2) return error(out,size,"options require values");
   for (size_t i=start; i<count; i+=2) {
     const char *k=tokens[i], *v=tokens[i+1];
@@ -204,11 +220,28 @@ options:
     else if (!strcmp(k,"--port-range")) {
       bit=PORT_RANGE; valid=port_range(v,&c->port_first,&c->port_last);
     }
+    else if (!strcmp(k,"--rule-id")) {
+      bit=RULE_ID; valid=number(v,&c->rule_id) && c->rule_id;
+    }
+    else if (!strcmp(k,"--protocol")) {
+      bit=PROTOCOL;
+      if (!strcmp(v,"tcp")) { c->protocol=6; valid=true; }
+      else if (!strcmp(v,"udp")) { c->protocol=17; valid=true; }
+    }
+    else if (!strcmp(k,"--public-port")) {
+      bit=PUBLIC_PORT; valid=number(v,&c->public_port) && c->public_port;
+    }
+    else if (!strcmp(k,"--private-ip")) {
+      bit=PRIVATE_IP; valid=address(v,&c->private_ip);
+    }
+    else if (!strcmp(k,"--private-port")) {
+      bit=PRIVATE_PORT; valid=number(v,&c->private_port) && c->private_port;
+    }
     if (!bit || !(allowed&bit) || (found&bit) || !valid)
       return error(out,size,"unknown, duplicate or invalid option");
     found|=bit;
   }
-  if (found!=required) return error(out,size,"missing required option");
+  if ((found&required)!=required) return error(out,size,"missing required option");
   if ((c->op==ROUTE_ADD || c->op==ROUTE_DEL) && (c->address & mask(c->prefix))!=c->address)
     return error(out,size,"route prefix must have zero host bits");
   return true;
@@ -257,6 +290,13 @@ uint32_t router_nat_policy_address(const struct router_config *c,
        c->interfaces[i].interface_id==p->interface_id &&
        c->interfaces[i].has_address) return c->interfaces[i].address;
   return 0;
+}
+bool router_port_forward_uses_interface(const struct router_config *c,
+                                        uint16_t interface_id) {
+  if (!c) return false;
+  for (size_t i=0;i<c->port_forward_count;i++)
+    if (c->port_forwards[i].interface_id==interface_id) return true;
+  return false;
 }
 static bool same_port(const struct router_port_identity *a,const struct router_port_identity *b) {
   return a->host==b->host && a->pf==b->pf && a->vf==b->vf;
@@ -358,7 +398,7 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
   } else {
     if(!exists) return error(out,size,"VR not found");
     struct router_interface *rif=interface(c,q.id,q.name);
-    if(q.op==SHOW || q.op==ROUTE_SHOW || q.op==NAT_SHOW) {
+    if(q.op==SHOW || q.op==ROUTE_SHOW || q.op==NAT_SHOW || q.op==PF_SHOW) {
       size_t used=append(out,size,0,
                          "OK vr=%u dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP\n",q.id);
       if(q.op==NAT_SHOW) {
@@ -374,6 +414,29 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
             "hw-ct=PENDING\n",name,
             iptext(router_nat_policy_address(c,p),ip),p->port_first,p->port_last);
         }
+        if(used>=size) return error(out,size,"response too large");
+        return true;
+      }
+      if(q.op==PF_SHOW) {
+        size_t shown=0;
+        for(size_t i=0;i<c->port_forward_count;i++) {
+          const struct router_port_forward *r=&c->port_forwards[i];
+          const char *name="?";
+          char pub[INET_ADDRSTRLEN],priv[INET_ADDRSTRLEN];
+          if(r->vr_id!=q.id || (q.rule_id && r->rule_id!=q.rule_id)) continue;
+          for(size_t j=0;j<c->interface_count;j++)
+            if(c->interfaces[j].interface_id==r->interface_id)
+              name=c->interfaces[j].name;
+          used=append(out,size,used,
+              "rule=%u interface=%s public=%s:%u protocol=%s "
+              "private=%s:%u dataplane=ARM\n",
+              r->rule_id,name,iptext(r->public_ip,pub),r->public_port,
+              r->protocol==6?"tcp":"udp",iptext(r->private_ip,priv),
+              r->private_port);
+          shown++;
+        }
+        if(q.rule_id && shown==0) return error(out,size,"port-forward rule not found");
+        if(shown==0) used=append(out,size,used,"port-forward rules=0\n");
         if(used>=size) return error(out,size,"response too large");
         return true;
       }
@@ -426,6 +489,15 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
       if(i==c->nat_policy_count) return error(out,size,"NAT is not enabled");
       memmove(&c->nat_policies[i],&c->nat_policies[i+1],
               (--c->nat_policy_count-i)*sizeof(c->nat_policies[0]));
+    } else if(q.op==PF_DELETE) {
+      size_t i;
+      for(i=0;i<c->port_forward_count;i++)
+        if(c->port_forwards[i].vr_id==q.id &&
+           c->port_forwards[i].rule_id==q.rule_id) break;
+      if(i==c->port_forward_count)
+        return error(out,size,"port-forward rule not found");
+      memmove(&c->port_forwards[i],&c->port_forwards[i+1],
+              (--c->port_forward_count-i)*sizeof(c->port_forwards[0]));
     } else if(q.op==ATTACH_PORT || q.op==ATTACH_SWITCH || q.op==ATTACH_LINK) {
       if(rif) return error(out,size,"interface name already exists in VR");
       if(c->interface_count==ROUTER_MAX_INTERFACES || c->next_interface_id>UINT16_MAX)
@@ -476,8 +548,9 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
            (q.op==DETACH_LINK && rif->attachment!=ROUTER_LINK))
           return error(out,size,"attachment type mismatch");
         if(rif->has_address || routes_reference(c,rif->interface_id) ||
-           nat_references(c,rif->interface_id))
-          return error(out,size,"remove NAT, IP and route dependencies before detach");
+           nat_references(c,rif->interface_id) ||
+           router_port_forward_uses_interface(c,rif->interface_id))
+          return error(out,size,"remove NAT, port-forward, IP and route dependencies before detach");
         size_t i=(size_t)(rif-c->interfaces);
         memmove(rif,rif+1,(--c->interface_count-i)*sizeof(*rif));
       } else if(q.op==IP_ADD) {
@@ -505,8 +578,9 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         rif->has_address=true; rif->address=q.address; rif->prefix=q.prefix;
       } else if(q.op==IP_DEL) {
         if(!rif->has_address || rif->address!=q.address || rif->prefix!=q.prefix) return error(out,size,"address not found");
-        if(routes_reference(c,rif->interface_id) || nat_references(c,rif->interface_id))
-          return error(out,size,"remove dependent NAT policy and static routes first");
+        if(routes_reference(c,rif->interface_id) || nat_references(c,rif->interface_id) ||
+           router_port_forward_uses_interface(c,rif->interface_id))
+          return error(out,size,"remove dependent NAT, port-forward and static routes first");
         if(peer_routes_reference(c,rif))
           return error(out,size,"remove peer VR routes that use this router-link address first");
         rif->has_address=false; rif->address=0; rif->prefix=0;
@@ -544,6 +618,32 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           .vr_id=q.id,.interface_id=rif->interface_id,
           .public_address=q.address_from_interface?0:q.address,
           .port_first=q.port_first,.port_last=q.port_last};
+      } else if(q.op==PF_ADD) {
+        const struct router_nat_policy *active_nat=router_nat_policy_find(c,q.id);
+        if((rif->attachment!=ROUTER_PORT && rif->attachment!=ROUTER_VSWITCH) ||
+           !rif->has_address)
+          return error(out,size,"port-forward interface must be an addressed public port-link or vs-link");
+        if(active_nat!=NULL && active_nat->interface_id!=rif->interface_id)
+          return error(out,size,"port-forward interface must match the active NAT uplink");
+        if(!q.private_ip || (q.private_ip>>28)>=14 ||
+           (q.private_ip>>24)==0 || (q.private_ip>>24)==127)
+          return error(out,size,"private IP must be unicast IPv4");
+        for(size_t i=0;i<c->port_forward_count;i++) {
+          const struct router_port_forward *r=&c->port_forwards[i];
+          if(r->vr_id!=q.id) continue;
+          if(r->rule_id==q.rule_id)
+            return error(out,size,"port-forward rule ID already exists");
+          if(r->public_ip==rif->address && r->protocol==q.protocol &&
+             r->public_port==q.public_port)
+            return error(out,size,"public IP, protocol and port already forwarded");
+        }
+        if(c->port_forward_count==ROUTER_MAX_PORT_FORWARDS)
+          return error(out,size,"port-forward capacity reached");
+        c->port_forwards[c->port_forward_count++]=(struct router_port_forward){
+          .vr_id=q.id,.rule_id=q.rule_id,.interface_id=rif->interface_id,
+          .protocol=q.protocol,.public_port=q.public_port,
+          .private_ip=q.private_ip,.private_port=q.private_port,
+          .public_ip=rif->address};
       }
     }
   }

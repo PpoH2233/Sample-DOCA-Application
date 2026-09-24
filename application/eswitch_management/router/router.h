@@ -10,6 +10,7 @@
 #define ROUTER_MAX_ROUTES 512
 #define ROUTER_MAX_LINKS 128
 #define ROUTER_MAX_NAT_POLICIES ROUTER_MAX_VRS
+#define ROUTER_MAX_PORT_FORWARDS 128
 #define ROUTER_NAME_SIZE 32
 #define ROUTER_COMMAND_SIZE 512
 
@@ -39,14 +40,22 @@ struct router_nat_policy {
   uint32_t public_address; /* host byte order; 0 means use RIF address */
   uint16_t port_first, port_last;
 };
+struct router_port_forward {
+  uint16_t vr_id, rule_id, interface_id;
+  uint8_t protocol; /* TCP=6 or UDP=17 */
+  uint16_t public_port, private_port;
+  uint32_t public_ip, private_ip; /* host byte order */
+};
 struct router_config {
   uint16_t vr_ids[ROUTER_MAX_VRS];
   uint16_t link_ids[ROUTER_MAX_LINKS];
   size_t vr_count, link_count, interface_count, route_count, nat_policy_count;
+  size_t port_forward_count;
   uint32_t next_interface_id;
   struct router_interface interfaces[ROUTER_MAX_INTERFACES];
   struct router_route routes[ROUTER_MAX_ROUTES];
   struct router_nat_policy nat_policies[ROUTER_MAX_NAT_POLICIES];
+  struct router_port_forward port_forwards[ROUTER_MAX_PORT_FORWARDS];
 };
 /* Callbacks validate attachments against the manager's current inventory.
  * Public ports must be representors and not owned by an L2 switch. */
@@ -69,6 +78,8 @@ const struct router_nat_policy *router_nat_policy_find(
     const struct router_config *, uint16_t vr_id);
 uint32_t router_nat_policy_address(const struct router_config *,
                                    const struct router_nat_policy *);
+bool router_port_forward_uses_interface(const struct router_config *,
+                                        uint16_t interface_id);
 bool router_ipv4_prefix(const char *, uint32_t *, uint8_t *);
 /* Strict parser shared by eswitchctl and daemon. No mutations on failure. */
 bool router_command_valid(const char *, char *, size_t);

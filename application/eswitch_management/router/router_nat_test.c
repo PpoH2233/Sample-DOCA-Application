@@ -115,9 +115,9 @@ int main(void) {
   struct router_nat_table *table=calloc(1,sizeof(*table));
   struct router_nat_policy policy={.vr_id=101,.interface_id=3,
     .port_first=20000,.port_last=20002};
-  struct router_nat_inside vm1={.vswitch_id=100,.interface_id=1,.port_id=4,
+  struct router_nat_inside vm1={.vr_id=101,.vswitch_id=100,.interface_id=1,.port_id=4,
     .mac={0xa6,0x94,0x27,0xfb,0x6c,0x38}};
-  struct router_nat_inside vm2={.vswitch_id=200,.interface_id=2,.port_id=3,
+  struct router_nat_inside vm2={.vr_id=101,.vswitch_id=200,.interface_id=2,.port_id=3,
     .mac={0x52,0x54,0,0x12,0x34,0x56}};
   const struct router_nat_session *s1,*s2,*reply;
   const struct router_nat_session *icmp_session;
@@ -302,7 +302,77 @@ int main(void) {
       for (unsigned bucket=0;bucket<ROUTER_NAT_BUCKETS;bucket++)
         assert(table->buckets[index][bucket]==0);
   }
+  /* A forwarding rule reserves its public tuple even before the first
+   * inbound flow, and the reply must use the fixed public port, not PAT. */
+  {
+    struct router_config config={0};
+    const uint32_t private_ip=0xc0a80032;
+    policy.port_first=20000;
+    policy.port_last=20001;
+    config.port_forward_count=2;
+    config.port_forwards[0]=(struct router_port_forward){
+      .vr_id=101,.rule_id=7,.interface_id=3,.protocol=6,
+      .public_ip=public_ip,.public_port=20000,
+      .private_ip=private_ip,.private_port=22};
+    config.port_forwards[1]=(struct router_port_forward){
+      .vr_id=101,.rule_id=8,.interface_id=3,.protocol=17,
+      .public_ip=public_ip,.public_port=20000,
+      .private_ip=private_ip,.private_port=53};
+    router_nat_init(table);
+    router_nat_set_port_forwards(table,&config);
+    length=make_packet(original,6,private_ip,52000,remote_ip,443);
+    assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,1,
+                               translated,sizeof(translated),&s1)==ROUTER_NAT_TRANSLATED);
+    assert(s1->public_port==20001);
+    length=make_packet(original,6,remote_ip,51000,public_ip,20000);
+    assert(router_nat_port_forward_inbound(table,&config,102,3,original,length,2,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    assert(router_nat_port_forward_inbound(table,&config,101,9,original,length,2,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    assert(router_nat_inbound(table,101,original,length,2,reverse,
+                              sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,2,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(reply && reply->port_forward && reply->port_forward_rule_id==7);
+    assert(read32(reverse+30)==private_ip && read16(reverse+36)==22);
+    assert(checksum(reverse+14,20)==0 && l4_checksum(reverse+14)==0);
+    length=make_packet(original,6,private_ip,22,remote_ip,51000);
+    assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,3,
+                translated,sizeof(translated),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(reply->port_forward && read32(translated+26)==public_ip &&
+           read16(translated+34)==20000);
+    assert(checksum(translated+14,20)==0 && l4_checksum(translated+14)==0);
+    assert(table->stats.port_forward_sessions_created==1 &&
+           table->stats.port_forward_inbound_packets==1 &&
+           table->stats.port_forward_outbound_packets==1);
+    router_nat_flush(table,0);
+    assert(table->count==0);
+    /* PF reply can also be translated when no SNAT policy is enabled. */
+    length=make_packet(original,6,remote_ip,51000,public_ip,20000);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,4,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+    length=make_packet(original,6,private_ip,22,remote_ip,51000);
+    assert(router_nat_outbound(table,NULL,0,&vm1,original,length,5,
+                translated,sizeof(translated),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(read16(translated+34)==20000);
+    router_nat_flush(table,0);
+    length=make_packet(original,17,remote_ip,54000,public_ip,20000);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,6,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(reply->port_forward_rule_id==8 && read16(reverse+36)==53 &&
+           l4_checksum(reverse+14)==0);
+    length=make_packet(original,17,private_ip,53,remote_ip,54000);
+    assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,7,
+                translated,sizeof(translated),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(read16(translated+34)==20000 && l4_checksum(translated+14)==0);
+    router_nat_port_forward_reject(table,reply);
+    assert(table->count==0);
+    length=make_packet(original,17,remote_ip,54000,public_ip,20000);
+    assert(router_nat_inbound(table,101,original,length,8,reverse,
+                              sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    router_nat_flush(table,0);
+  }
   free(table);
-  puts("PASS: TCP/UDP/ICMP Echo NAT, reverse lookup, checksums, isolation and aging");
+  puts("PASS: TCP/UDP/ICMP Echo NAT, port forwarding, reverse lookup, checksums, isolation and aging");
   return 0;
 }
