@@ -312,12 +312,12 @@ int main(void) {
     config.port_forward_count=2;
     config.port_forwards[0]=(struct router_port_forward){
       .vr_id=101,.rule_id=7,.interface_id=3,.protocol=6,
-      .public_ip=public_ip,.public_port=20000,
-      .private_ip=private_ip,.private_port=22};
+      .public_ip=public_ip,.public_port=20000,.public_port_last=20000,
+      .private_ip=private_ip,.private_port=22,.private_port_last=22};
     config.port_forwards[1]=(struct router_port_forward){
       .vr_id=101,.rule_id=8,.interface_id=3,.protocol=17,
-      .public_ip=public_ip,.public_port=20000,
-      .private_ip=private_ip,.private_port=53};
+      .public_ip=public_ip,.public_port=20000,.public_port_last=20000,
+      .private_ip=private_ip,.private_port=53,.private_port_last=53};
     router_nat_init(table);
     router_nat_set_port_forwards(table,&config);
     length=make_packet(original,6,private_ip,52000,remote_ip,443);
@@ -370,6 +370,50 @@ int main(void) {
     length=make_packet(original,17,remote_ip,54000,public_ip,20000);
     assert(router_nat_inbound(table,101,original,length,8,reverse,
                               sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    router_nat_flush(table,0);
+    config.port_forward_count=4;
+    config.port_forwards[2]=(struct router_port_forward){
+      .vr_id=101,.rule_id=9,.interface_id=3,.protocol=6,
+      .public_ip=public_ip,.public_port=21000,.public_port_last=21003,
+      .private_ip=private_ip,.private_port=8100,.private_port_last=8103};
+    config.port_forwards[3]=(struct router_port_forward){
+      .vr_id=101,.rule_id=10,.interface_id=3,.protocol=17,
+      .public_ip=public_ip,.public_port=22000,.public_port_last=22001,
+      .private_ip=private_ip,.private_port=5300,.private_port_last=5301};
+    router_nat_set_port_forwards(table,&config);
+    policy.port_first=21000;
+    policy.port_last=21004;
+    length=make_packet(original,6,private_ip,52000,remote_ip,443);
+    assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,9,
+                translated,sizeof(translated),&s1)==ROUTER_NAT_TRANSLATED);
+    assert(s1->public_port==21004);
+    for (uint16_t offset=0;offset<4;offset++) {
+      uint16_t public_port=(uint16_t)(21000+offset);
+      uint16_t private_port=(uint16_t)(8100+offset);
+      length=make_packet(original,6,remote_ip,(uint16_t)(51000+offset),
+                         public_ip,public_port);
+      assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,
+                  10+offset,reverse,sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+      assert(reply->public_port==public_port && reply->inside_port==private_port);
+      assert(read16(reverse+36)==private_port &&
+             checksum(reverse+14,20)==0 && l4_checksum(reverse+14)==0);
+      length=make_packet(original,6,private_ip,private_port,remote_ip,
+                         (uint16_t)(51000+offset));
+      assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,
+                  20+offset,translated,sizeof(translated),&reply)==ROUTER_NAT_TRANSLATED);
+      assert(read16(translated+34)==public_port && l4_checksum(translated+14)==0);
+    }
+    length=make_packet(original,6,remote_ip,52000,public_ip,20999);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,30,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    length=make_packet(original,6,remote_ip,52000,public_ip,21005);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,31,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_NOT_APPLICABLE);
+    length=make_packet(original,17,remote_ip,54000,public_ip,22001);
+    assert(router_nat_port_forward_inbound(table,&config,101,3,original,length,32,
+                reverse,sizeof(reverse),&reply)==ROUTER_NAT_TRANSLATED);
+    assert(reply->inside_port==5301 && read16(reverse+36)==5301 &&
+           l4_checksum(reverse+14)==0);
     router_nat_flush(table,0);
   }
   free(table);

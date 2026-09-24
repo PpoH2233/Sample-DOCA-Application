@@ -43,7 +43,8 @@ struct router_nat_policy {
 struct router_port_forward {
   uint16_t vr_id, rule_id, interface_id;
   uint8_t protocol; /* TCP=6 or UDP=17 */
-  uint16_t public_port, private_port;
+  uint16_t public_port, public_port_last;
+  uint16_t private_port, private_port_last;
   uint32_t public_ip, private_ip; /* host byte order */
 };
 struct router_config {

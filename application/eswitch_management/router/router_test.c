@@ -136,11 +136,28 @@ int main(void) {
   command("vr port-forward add --id 100 --rule-id 7 --interface p1 --protocol udp --public-port 2222 --private-ip 192.168.0.50 --private-port 22",false);
   command("vr port-forward add --id 100 --rule-id 8 --interface p1 --protocol tcp --public-port 2222 --private-ip 192.168.0.51 --private-port 22",false);
   command("vr port-forward add --id 100 --rule-id 8 --interface p1 --protocol udp --public-port 2222 --private-ip 192.168.0.50 --private-port 53",true);
+  command("vr port-forward add --id 100 --rule-id 9 --interface p1 --protocol tcp --public-port 18080-18089 --private-ip 192.168.0.50 --private-port 8080-8089",true);
+  command("vr port-forward add --id 100 --rule-id 10 --interface p1 --protocol udp --public-port 18080-18089 --private-ip 192.168.0.50 --private-port 10080-10089",true);
+  command("vr port-forward add --id 100 --rule-id 11 --interface p1 --protocol tcp --public-port 18085-18090 --private-ip 192.168.0.51 --private-port 9000-9005",false);
+  command("vr port-forward add --id 100 --rule-id 11 --interface p1 --protocol tcp --public-port 18090-18091 --private-ip 192.168.0.50 --private-port 8085-8086",false);
+  command("vr port-forward add --id 100 --rule-id 11 --interface p1 --protocol tcp --public-port 18090-18091 --private-ip 192.168.0.50 --private-port 8090-8091",true);
+  command("vr port-forward add --id 100 --rule-id 12 --interface p1 --protocol tcp --public-port 23000-23000 --private-ip 192.168.0.50 --private-port 13000-13000",true);
+  command("vr port-forward add --id 100 --rule-id 14 --interface p1 --protocol tcp --public-port 24000 --private-ip 192.168.0.50 --private-port 22",true);
+  command("vr port-forward add --id 100 --rule-id 13 --interface p1 --protocol tcp --public-port 23001-23003 --private-ip 192.168.0.50 --private-port 13001-13002",false);
+  command("vr port-forward add --id 100 --rule-id 13 --interface p1 --protocol tcp --public-port 23003-23001 --private-ip 192.168.0.50 --private-port 13001-13003",false);
+  command("vr port-forward add --id 100 --rule-id 13 --interface p1 --protocol tcp --public-port 0-2 --private-ip 192.168.0.50 --private-port 13001-13003",false);
   command("vr port-forward show --id 100 --rule-id 7",true);
   assert(strstr(response,"public=200.20.0.4:2222") &&
          strstr(response,"private=192.168.0.50:22"));
-  command("vr port-forward show --id 100 --rule-id 9",false);
-  command("vr port-forward add --id 100 --rule-id 9 --interface p2 --protocol tcp --public-port 80 --private-ip 192.168.0.50 --private-port 80",false);
+  command("vr port-forward show --id 100 --rule-id 9",true);
+  assert(strstr(response,"public=200.20.0.4:18080-18089") &&
+         strstr(response,"private=192.168.0.50:8080-8089"));
+  command("vr port-forward show --id 100 --rule-id 12",true);
+  assert(strstr(response,"public=200.20.0.4:23000") &&
+         strstr(response,"private=192.168.0.50:13000") &&
+         !strstr(response,"23000-23000"));
+  command("vr port-forward show --id 100 --rule-id 13",false);
+  command("vr port-forward add --id 100 --rule-id 13 --interface p2 --protocol tcp --public-port 80 --private-ip 192.168.0.50 --private-port 80",false);
   command("vr nat show --id 100",true);
   assert(strstr(response,"nat=enabled") && strstr(response,"address=200.20.0.4") &&
          strstr(response,"ports=20000-60999"));
@@ -176,9 +193,28 @@ int main(void) {
     const struct router_port_forward *b=&config.port_forwards[i];
     assert(a->vr_id==b->vr_id && a->rule_id==b->rule_id &&
            a->interface_id==b->interface_id && a->protocol==b->protocol &&
-           a->public_port==b->public_port && a->private_port==b->private_port &&
+           a->public_port==b->public_port &&
+           a->public_port_last==b->public_port_last &&
+           a->private_port==b->private_port &&
+           a->private_port_last==b->private_port_last &&
            a->public_ip==b->public_ip && a->private_ip==b->private_ip);
   }
+  /* Legacy single-port rules still serialize as schema 3 and reload with
+   * first == last, even after the range-capable parser is installed. */
+  struct router_config singles=config;
+  singles.port_forward_count=2;
+  char singles_path[256],version_line[32];
+  snprintf(singles_path,sizeof(singles_path),"%s/router-singles.conf",dir);
+  assert(router_config_save(singles_path,&singles,response,sizeof(response)));
+  FILE *singles_file=fopen(singles_path,"r");assert(singles_file);
+  assert(fgets(version_line,sizeof(version_line),singles_file));
+  assert(!strcmp(version_line,"router-state 3\n"));
+  assert(fclose(singles_file)==0);
+  assert(router_config_load(singles_path,&singles,response,sizeof(response)));
+  assert(singles.port_forward_count==2 &&
+         singles.port_forwards[0].public_port==singles.port_forwards[0].public_port_last &&
+         singles.port_forwards[0].private_port==singles.port_forwards[0].private_port_last);
+  assert(unlink(singles_path)==0);
   /* Malformed restore must not publish partial configuration. */
   FILE *file=fopen(path,"a");assert(file);assert(fputs("vr delete --id 101\n",file)>=0);assert(fclose(file)==0);
   struct router_config before=loaded;
@@ -192,6 +228,9 @@ int main(void) {
   char saved[8192]={0};
   size_t saved_length=fread(saved,1,sizeof(saved)-1,file);
   assert(saved_length>0 && feof(file));assert(fclose(file)==0);
+  assert(!strncmp(saved,"router-state 4\n",15));
+  assert(strstr(saved,"--public-port 18080-18089") &&
+         strstr(saved,"--private-port 8080-8089"));
   assert(strstr(saved,"vr port-attach --id ") && strstr(saved,"vr switch-attach --id "));
 
   /* Legacy state written by a version-1 daemon still reloads. */
@@ -282,6 +321,11 @@ int main(void) {
   command("vr nat disable --id 100",true);
   command("vr port-forward delete --id 100 --rule-id 7",true);
   command("vr port-forward delete --id 100 --rule-id 8",true);
+  command("vr port-forward delete --id 100 --rule-id 9",true);
+  command("vr port-forward delete --id 100 --rule-id 10",true);
+  command("vr port-forward delete --id 100 --rule-id 11",true);
+  command("vr port-forward delete --id 100 --rule-id 12",true);
+  command("vr port-forward delete --id 100 --rule-id 14",true);
   command("vr nat show --id 100",true);
   assert(strstr(response,"nat=disabled"));
   command("vr route del --id 100 --prefix 0.0.0.0/0",true);

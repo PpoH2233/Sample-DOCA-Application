@@ -24,8 +24,11 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
   if(fd<0) return fail(out,size,strerror(errno));
   FILE *f=fdopen(fd,"w");
   if(!f) {close(fd); unlink(tmp); return fail(out,size,strerror(errno));}
-  fprintf(f,"router-state %u\nnext %u\n",
-          c->port_forward_count ? 3U : 2U,c->next_interface_id);
+  unsigned state_version=c->port_forward_count ? 3U : 2U;
+  for(size_t i=0;i<c->port_forward_count;i++)
+    if(c->port_forwards[i].public_port!=c->port_forwards[i].public_port_last)
+      state_version=4U;
+  fprintf(f,"router-state %u\nnext %u\n",state_version,c->next_interface_id);
   for(size_t i=0;i<c->vr_count;i++) fprintf(f,"vr create --id %u\n",c->vr_ids[i]);
   for(size_t i=0;i<c->link_count;i++) fprintf(f,"link create --id %u\n",c->link_ids[i]);
   for(size_t i=0;i<c->interface_count;i++) {
@@ -64,14 +67,22 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
   for(size_t i=0;i<c->port_forward_count;i++) {
     const struct router_port_forward *r=&c->port_forwards[i];
     const char *name=NULL;
-    char private_ip[INET_ADDRSTRLEN];
+    char private_ip[INET_ADDRSTRLEN],public_ports[16],private_ports[16];
     for(size_t j=0;j<c->interface_count;j++)
       if(c->interfaces[j].interface_id==r->interface_id) name=c->interfaces[j].name;
     if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling port-forward interface reference");}
+    if(r->public_port==r->public_port_last)
+      snprintf(public_ports,sizeof(public_ports),"%u",r->public_port);
+    else
+      snprintf(public_ports,sizeof(public_ports),"%u-%u",r->public_port,r->public_port_last);
+    if(r->private_port==r->private_port_last)
+      snprintf(private_ports,sizeof(private_ports),"%u",r->private_port);
+    else
+      snprintf(private_ports,sizeof(private_ports),"%u-%u",r->private_port,r->private_port_last);
     fprintf(f,"vr port-forward add --id %u --rule-id %u --interface %s "
-              "--protocol %s --public-port %u --private-ip %s --private-port %u\n",
+              "--protocol %s --public-port %s --private-ip %s --private-port %s\n",
             r->vr_id,r->rule_id,name,r->protocol==6?"tcp":"udp",
-            r->public_port,ipstr(r->private_ip,private_ip),r->private_port);
+            public_ports,ipstr(r->private_ip,private_ip),private_ports);
   }
   bool ok=!ferror(f) && fflush(f)==0 && fsync(fd)==0;
   if(fclose(f)!=0) ok=false;
@@ -116,7 +127,7 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
   struct router_inventory inv={.context=&port,.port=replay_port,.switch_exists=replay_switch};
   bool ok=fgets(line,sizeof(line),f) &&
           (!strcmp(line,"router-state 1\n") || !strcmp(line,"router-state 2\n") ||
-           !strcmp(line,"router-state 3\n"));
+           !strcmp(line,"router-state 3\n") || !strcmp(line,"router-state 4\n"));
   if(ok) ok=fgets(line,sizeof(line),f) && uints(line,"next",&next,1) && next>0 && next<=65536;
   while(ok && fgets(line,sizeof(line),f)) {
     if(!strchr(line,'\n')) {ok=false;break;}

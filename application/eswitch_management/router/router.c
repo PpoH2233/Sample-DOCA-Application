@@ -19,7 +19,8 @@ struct command {
   uint8_t prefix, mac[6];
   bool address_from_interface;
   uint16_t port_first, port_last;
-  uint16_t rule_id, public_port, private_port;
+  uint16_t rule_id, public_port, public_port_last;
+  uint16_t private_port, private_port_last;
   uint32_t private_ip;
   uint8_t protocol;
 };
@@ -67,6 +68,28 @@ static bool port_range(const char *s, uint16_t *first, uint16_t *last) {
     return false;
   *first = a; *last = b;
   return true;
+}
+static bool forwarding_ports(const char *s, uint16_t *first, uint16_t *last) {
+  char copy[32], *dash;
+  uint16_t a, b;
+  if (!s || strlen(s) >= sizeof(copy)) return false;
+  strcpy(copy, s);
+  dash = strchr(copy, '-');
+  if (dash) {
+    if (strchr(dash + 1, '-')) return false;
+    *dash++ = 0;
+    if (!number(copy, &a) || !number(dash, &b)) return false;
+  } else {
+    if (!number(copy, &a)) return false;
+    b = a;
+  }
+  if (!a || !b || a > b) return false;
+  *first = a; *last = b;
+  return true;
+}
+static bool ports_overlap(uint16_t a_first, uint16_t a_last,
+                          uint16_t b_first, uint16_t b_last) {
+  return a_first <= b_last && b_first <= a_last;
 }
 bool router_ipv4_prefix(const char *s, uint32_t *ip, uint8_t *prefix) {
   char copy[64];
@@ -229,19 +252,25 @@ options:
       else if (!strcmp(v,"udp")) { c->protocol=17; valid=true; }
     }
     else if (!strcmp(k,"--public-port")) {
-      bit=PUBLIC_PORT; valid=number(v,&c->public_port) && c->public_port;
+      bit=PUBLIC_PORT;
+      valid=forwarding_ports(v,&c->public_port,&c->public_port_last);
     }
     else if (!strcmp(k,"--private-ip")) {
       bit=PRIVATE_IP; valid=address(v,&c->private_ip);
     }
     else if (!strcmp(k,"--private-port")) {
-      bit=PRIVATE_PORT; valid=number(v,&c->private_port) && c->private_port;
+      bit=PRIVATE_PORT;
+      valid=forwarding_ports(v,&c->private_port,&c->private_port_last);
     }
     if (!bit || !(allowed&bit) || (found&bit) || !valid)
       return error(out,size,"unknown, duplicate or invalid option");
     found|=bit;
   }
   if ((found&required)!=required) return error(out,size,"missing required option");
+  if (c->op==PF_ADD &&
+      c->public_port_last-c->public_port !=
+          c->private_port_last-c->private_port)
+    return error(out,size,"public and private port ranges must have equal length");
   if ((c->op==ROUTE_ADD || c->op==ROUTE_DEL) && (c->address & mask(c->prefix))!=c->address)
     return error(out,size,"route prefix must have zero host bits");
   return true;
@@ -428,11 +457,16 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
             if(c->interfaces[j].interface_id==r->interface_id)
               name=c->interfaces[j].name;
           used=append(out,size,used,
-              "rule=%u interface=%s public=%s:%u protocol=%s "
-              "private=%s:%u dataplane=ARM\n",
-              r->rule_id,name,iptext(r->public_ip,pub),r->public_port,
+              "rule=%u interface=%s public=%s:%u",
+              r->rule_id,name,iptext(r->public_ip,pub),r->public_port);
+          if(r->public_port_last!=r->public_port)
+            used=append(out,size,used,"-%u",r->public_port_last);
+          used=append(out,size,used," protocol=%s private=%s:%u",
               r->protocol==6?"tcp":"udp",iptext(r->private_ip,priv),
               r->private_port);
+          if(r->private_port_last!=r->private_port)
+            used=append(out,size,used,"-%u",r->private_port_last);
+          used=append(out,size,used," dataplane=ARM\n");
           shown++;
         }
         if(q.rule_id && shown==0) return error(out,size,"port-forward rule not found");
@@ -633,16 +667,26 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           if(r->vr_id!=q.id) continue;
           if(r->rule_id==q.rule_id)
             return error(out,size,"port-forward rule ID already exists");
-          if(r->public_ip==rif->address && r->protocol==q.protocol &&
-             r->public_port==q.public_port)
-            return error(out,size,"public IP, protocol and port already forwarded");
+          if(r->protocol==q.protocol && r->public_ip==rif->address &&
+             ports_overlap(r->public_port,r->public_port_last,
+                           q.public_port,q.public_port_last))
+            return error(out,size,"public IP, protocol and port range already forwarded");
+          /* Preserve previously valid single-port rules on restore. Their
+           * rare return-tuple collision remains fail-closed at session setup. */
+          if((r->private_port!=r->private_port_last ||
+              q.private_port!=q.private_port_last) &&
+             r->protocol==q.protocol && r->private_ip==q.private_ip &&
+             ports_overlap(r->private_port,r->private_port_last,
+                           q.private_port,q.private_port_last))
+            return error(out,size,"private IP, protocol and port range already forwarded");
         }
         if(c->port_forward_count==ROUTER_MAX_PORT_FORWARDS)
           return error(out,size,"port-forward capacity reached");
         c->port_forwards[c->port_forward_count++]=(struct router_port_forward){
           .vr_id=q.id,.rule_id=q.rule_id,.interface_id=rif->interface_id,
           .protocol=q.protocol,.public_port=q.public_port,
-          .private_ip=q.private_ip,.private_port=q.private_port,
+          .public_port_last=q.public_port_last,.private_ip=q.private_ip,
+          .private_port=q.private_port,.private_port_last=q.private_port_last,
           .public_ip=rif->address};
       }
     }

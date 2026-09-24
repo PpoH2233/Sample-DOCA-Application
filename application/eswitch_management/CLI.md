@@ -8,11 +8,11 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-arm-port-forward-v34`. This revision includes
+Contract revision: `doca34-arm-port-forward-range-v35`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
-aware control transactions, plus Arm TCP/UDP port forwarding on an addressed
-public RIF. CloudStack integration is not included.
+aware control transactions, plus Arm TCP/UDP single-port and 1:1 range port
+forwarding on an addressed public RIF. CloudStack integration is not included.
 
 ## 1. Grammar
 
@@ -56,7 +56,7 @@ The complete canonical command set:
 | 28 | `link show --id <link-id>` | query |
 | 29 | `vr link attach --id <vr-id> --link-id <link-id> --name <name>` | mutation |
 | 30 | `vr link detach --id <vr-id> --interface <name>` | mutation |
-| 31 | `vr port-forward add --id <vr-id> --rule-id <rule-id> --interface <name> --protocol tcp\|udp --public-port <port> --private-ip <ip> --private-port <port>` | mutation |
+| 31 | `vr port-forward add --id <vr-id> --rule-id <rule-id> --interface <name> --protocol tcp\|udp --public-port <port\|first-last> --private-ip <ip> --private-port <port\|first-last>` | mutation |
 | 32 | `vr port-forward show --id <vr-id> [--rule-id <rule-id>]` | query |
 | 33 | `vr port-forward delete --id <vr-id> --rule-id <rule-id>` | mutation |
 
@@ -88,7 +88,7 @@ Grammar rules:
 | `<first-last>` | NAT port range. `first >= 1024` and `first <= last`. Applies to TCP and UDP ports and to ICMP Echo identifiers. |
 | `--address interface` | For `vr nat enable` only: use the uplink RIF's own address. |
 | `<rule-id>` | Local port-forward rule ID, decimal `1..65535`, unique within one VR. |
-| `<port>` for port forwarding | Single TCP/UDP port, `1..65535`. Port ranges are not supported yet. |
+| `<port\|first-last>` for port forwarding | TCP/UDP port `1..65535`, or inclusive range. Public and private spans must contain the same number of ports; `first-last` with `first=last` is a single port. |
 
 The `--name` option names a **new** interface, so it is used only by
 `vr port attach`, `vr switch attach` and `vr link attach`. Every command that refers to an
@@ -607,19 +607,30 @@ client should surface them rather than assume full offload.
 eswitchctl vr port-forward add --id 1 --rule-id 10 \
   --interface uplink-vlan6 --protocol tcp --public-port 2222 \
   --private-ip 192.168.100.10 --private-port 22
+eswitchctl vr port-forward add --id 1 --rule-id 11 \
+  --interface uplink-vlan6 --protocol tcp --public-port 18080-18089 \
+  --private-ip 192.168.100.10 --private-port 8080-8089
 eswitchctl vr port-forward show --id 1
 eswitchctl vr port-forward delete --id 1 --rule-id 10
 ```
 
-The rule key is VR + public RIF IP + protocol + public port. Reverse-session
+The rule key is VR + public RIF IP + protocol + public port interval. Within
+a range, `private_port = private_first + (public_port - public_first)`; a
+single port and `first-first` both have a one-port interval. Overlapping
+public intervals are rejected for the same VR, IP and protocol. Overlapping
+private intervals are rejected for the same VR, private IP and protocol when
+either rule is a range, because their return tuples could be ambiguous.
+Existing single-port rules retain their prior overlap behavior; a runtime
+return-tuple collision still fails closed. Reverse-session
 lookup runs first; on a miss, a PF rule creates a connection-specific DNAT
 mapping. VM replies restore the rule's public IP and port. SNAT/PAT never
-allocates a TCP/UDP public port reserved by a PF rule. Rule changes flush
-existing NAT/CT sessions, and rules survive restart in the router state file.
+allocates a TCP/UDP public port reserved by a PF rule, including any member of
+a range. Rule changes flush existing NAT/CT sessions, and rules survive restart
+in the router state file. A range uses `router-state 4`; older state files load.
 `status` reports `port_forward_rules`, `pf_sessions_created`, `pf_in`, `pf_out`
 and `pf_full`.
 
-This phase does not implement public-IP aliases, port ranges, source filtering,
+This phase does not implement public-IP aliases, source filtering,
 hairpin NAT, ICMP forwarding or PF hardware CT promotion. It does not change
 the CloudStack extension; do not advertise `PortForwarding` there yet.
 
@@ -816,9 +827,10 @@ version 1 rejected any argument to `vs-list`. It exists so a client can migrate
 the verb and the filter independently.
 
 The public CLI uses canonical `vr port attach` and `vr switch attach` commands.
-The internal `router-state 1` file deliberately keeps the version-1 hyphenated
-spelling so a rollback to an older daemon remains possible. Loading accepts
-both spellings, including files emitted by CLI-v2 development builds.
+The router state file keeps the version-1 hyphenated attach spelling for
+compatibility. It uses schema 4 when a port-forward range is present, schema 3
+for single-port forwarding, and schema 2 otherwise. Loading still accepts
+older versions and both attach spellings. Older binaries cannot load schema 4.
 
 ## 8. Atomicity and rollback
 

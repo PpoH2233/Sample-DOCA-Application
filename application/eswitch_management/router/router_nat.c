@@ -278,7 +278,8 @@ static bool port_in_use(const struct router_nat_table *table, uint16_t vr_id,
   for (size_t i = 0; i < table->port_forward_count; i++) {
     const struct router_port_forward *r = &table->port_forwards[i];
     if (r->vr_id == vr_id && r->protocol == protocol &&
-        r->public_ip == public_ip && r->public_port == public_port)
+        r->public_ip == public_ip && r->public_port <= public_port &&
+        public_port <= r->public_port_last)
       return true;
   }
   size_t bucket = tuple_bucket(vr_id, protocol, public_ip, public_port, 0, 0);
@@ -466,12 +467,15 @@ enum router_nat_result router_nat_port_forward_inbound(
         candidate->interface_id == public_interface_id &&
         candidate->public_ip == view.destination_ip &&
         candidate->protocol == view.protocol &&
-        candidate->public_port == view.destination_port) {
+        candidate->public_port <= view.destination_port &&
+        view.destination_port <= candidate->public_port_last) {
       rule = candidate;
       break;
     }
   }
   if (!rule) return ROUTER_NAT_NOT_APPLICABLE;
+  uint16_t private_port = (uint16_t)(rule->private_port +
+      (view.destination_port - rule->public_port));
 
   s = find_inbound(table, vr_id, &view);
   if (s && !s->port_forward) return ROUTER_NAT_NOT_APPLICABLE;
@@ -479,7 +483,7 @@ enum router_nat_result router_nat_port_forward_inbound(
     struct packet_view return_view = {
       .protocol = view.protocol,
       .source_ip = rule->private_ip,
-      .source_port = rule->private_port,
+      .source_port = private_port,
       .destination_ip = view.source_ip,
       .destination_port = view.source_port};
     /* Two public mappings cannot safely share the same return 5-tuple.
@@ -499,9 +503,9 @@ enum router_nat_result router_nat_port_forward_inbound(
       .public_interface_id = public_interface_id,
       .port_forward_rule_id = rule->rule_id,
       .protocol = view.protocol,
-      .inside_ip = rule->private_ip, .inside_port = rule->private_port,
+      .inside_ip = rule->private_ip, .inside_port = private_port,
       .remote_ip = view.source_ip, .remote_port = view.source_port,
-      .public_ip = rule->public_ip, .public_port = rule->public_port,
+      .public_ip = rule->public_ip, .public_port = view.destination_port,
       .created_ns = now_ns, .last_seen_ns = now_ns};
     index_insert(table, s);
     table->count++;

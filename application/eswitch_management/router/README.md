@@ -256,15 +256,21 @@ to an Identifier from the configured port range; the corresponding Echo Reply
 (`type 0/code 0`) restores it. IPv4 fragments, other ICMP message types, and
 protocols other than TCP/UDP/ICMP fail closed. Hairpin NAT, static
 NAT, ICMP error-message translation and PF-specific hardware CT are not
-implemented yet. TCP/UDP single-port forwarding is available on Arm through
+implemented yet. TCP/UDP single-port and 1:1 range forwarding is available on Arm through
 `vr port-forward add|show|delete`; the public IP is the addressed RIF's IP.
 Reverse-session lookup has priority over PF-rule lookup. A matching inbound
-packet is DNATed to the configured private IP/port, then follows normal LPM
+packet is DNATed to the configured private IP/port (matching offset within a
+range), then follows normal LPM
 and neighbor resolution. Replies use that session to restore the public
-source IP/port. The public port is excluded from SNAT/PAT allocation for the
+source IP/port. Every public port in the rule's interval is excluded from SNAT/PAT allocation for the
 same VR, public IP and protocol. A rule does not verify VM/NIC ownership of
 its private target; an unreachable target fails at routing/neighbor delivery.
-Rules persist in `router-state 3`, while older state versions still load.
+Single-port rules persist in `router-state 3`, and ranges in `router-state 4`;
+older state versions still load. Public intervals must not overlap for the
+same VR, IP and protocol; private intervals must not overlap for the same VR,
+private IP and protocol when either rule spans multiple ports. Two legacy
+single-port rules retain their prior behavior, with ambiguous return tuples
+rejected when a session is created.
 PF sessions remain on Arm even if DOCA Flow CT is enabled for ordinary SNAT.
 
 Example acceptance test, using a reachable target and TCP service beyond the
