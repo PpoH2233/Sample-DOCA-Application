@@ -99,6 +99,28 @@ static const struct router_interface *find_router_vswitch_interface(
   return NULL;
 }
 
+/* A shared WAN vSwitch can carry RIFs from multiple VRs even though those
+ * RIFs are Arm objects rather than physical eSwitch ports. Resolve such a
+ * next hop locally so an ARP request is not flooded to the wire while the
+ * intended peer RIF can never receive the SF-generated broadcast. */
+static const struct router_interface *find_router_vswitch_peer(
+    const struct eswitch_manager *manager,
+    const struct router_interface *egress, uint32_t next_hop_ip) {
+  if (manager == NULL || manager->router == NULL || egress == NULL ||
+      egress->attachment != ROUTER_VSWITCH || next_hop_ip == 0)
+    return NULL;
+  for (size_t i = 0; i < manager->router->interface_count; i++) {
+    const struct router_interface *candidate = &manager->router->interfaces[i];
+
+    if (candidate->attachment == ROUTER_VSWITCH && candidate->has_address &&
+        candidate->vswitch_id == egress->vswitch_id &&
+        candidate->vr_id != egress->vr_id &&
+        candidate->address == next_hop_ip)
+      return candidate;
+  }
+  return NULL;
+}
+
 static const struct router_interface *find_router_port_interface(
     const struct eswitch_manager *manager, uint16_t port_id, uint16_t vr_id) {
   int index = find_port_index(manager, port_id);
@@ -1024,6 +1046,11 @@ static void route_arm_frame(struct eswitch_manager *manager,
                             uint16_t expected_egress_interface,
                             uint64_t now_ns);
 
+static void route_router_ingress_frame(
+    struct eswitch_manager *manager, const uint8_t *frame, size_t length,
+    const struct router_interface *ingress, uint16_t ingress_port,
+    uint8_t link_hops, uint64_t now_ns);
+
 static bool route_across_link(struct eswitch_manager *manager,
                               const uint8_t *frame, size_t length,
                               const struct router_interface *egress,
@@ -1099,6 +1126,26 @@ static void route_arm_local_reply(struct eswitch_manager *manager,
     return;
   }
   if (ingress->attachment == ROUTER_VSWITCH) {
+    const struct router_interface *peer = find_router_vswitch_interface(
+        manager, ingress->vswitch_id, response);
+
+    /* An internally delivered shared-WAN packet has no physical ingress
+     * port. Deliver its L2 reply to the destination RIF in-process; that RIF
+     * still executes reverse NAT before any local-IP handling. */
+    if (ingress_port == UINT16_MAX) {
+      if (peer == NULL || peer->interface_id == ingress->interface_id ||
+          link_hops >= ROUTER_LINK_MAX_HOPS) {
+        manager->icmp_tx_drops++;
+        manager->shared_vswitch_drops++;
+      } else {
+        route_router_ingress_frame(manager, response, response_length, peer,
+                                   UINT16_MAX, link_hops + 1, now_ns);
+        manager->icmp_replies++;
+        manager->shared_vswitch_forwards++;
+      }
+      free(response);
+      return;
+    }
     int ingress_index=find_port_index(manager,ingress_port);
 
     if(ingress_index<0 ||
@@ -1140,7 +1187,8 @@ static void route_arm_frame(struct eswitch_manager *manager,
                             uint64_t now_ns) {
   struct router_ipv4_decision decision;
   const struct router_interface *egress;
-  const struct router_neighbor *neighbor;
+  const struct router_interface *shared_peer = NULL;
+  const struct router_neighbor *neighbor = NULL;
   const struct router_nat_policy *nat_policy = NULL;
   const struct router_nat_session *nat_session = NULL;
   struct router_nat_inside inside = {0};
@@ -1193,30 +1241,34 @@ static void route_arm_frame(struct eswitch_manager *manager,
                             link_hops,now_ns);
     goto out;
   }
-  neighbor = router_neighbor_lookup(
-      &manager->neighbors, decision.vr_id, decision.egress_interface_id,
-      decision.next_hop_ip, now_ns);
-  if (neighbor == NULL) {
-    manager->route_neighbor_misses++;
-    if (!router_pending_enqueue(
-            &manager->pending, decision.vr_id,
-            decision.egress_interface_id, decision.next_hop_ip,
-            ingress->interface_id, ingress_port, link_hops,
-            expected_egress_interface, frame, length, now_ns))
-      manager->route_tx_drops++;
-    send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
-    goto out;
-  }
-  if (!validate_route_neighbor(manager, egress, neighbor)) {
-    manager->route_neighbor_misses++;
-    if (!router_pending_enqueue(
-            &manager->pending, decision.vr_id,
-            decision.egress_interface_id, decision.next_hop_ip,
-            ingress->interface_id, ingress_port, link_hops,
-            expected_egress_interface, frame, length, now_ns))
-      manager->route_tx_drops++;
-    send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
-    goto out;
+  shared_peer = find_router_vswitch_peer(manager, egress,
+                                         decision.next_hop_ip);
+  if (shared_peer == NULL) {
+    neighbor = router_neighbor_lookup(
+        &manager->neighbors, decision.vr_id, decision.egress_interface_id,
+        decision.next_hop_ip, now_ns);
+    if (neighbor == NULL) {
+      manager->route_neighbor_misses++;
+      if (!router_pending_enqueue(
+              &manager->pending, decision.vr_id,
+              decision.egress_interface_id, decision.next_hop_ip,
+              ingress->interface_id, ingress_port, link_hops,
+              expected_egress_interface, frame, length, now_ns))
+        manager->route_tx_drops++;
+      send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
+      goto out;
+    }
+    if (!validate_route_neighbor(manager, egress, neighbor)) {
+      manager->route_neighbor_misses++;
+      if (!router_pending_enqueue(
+              &manager->pending, decision.vr_id,
+              decision.egress_interface_id, decision.next_hop_ip,
+              ingress->interface_id, ingress_port, link_hops,
+              expected_egress_interface, frame, length, now_ns))
+        manager->route_tx_drops++;
+      send_route_neighbor_probe(manager, egress, decision.next_hop_ip, now_ns);
+      goto out;
+    }
   }
 
   forward_frame = frame;
@@ -1264,9 +1316,32 @@ static void route_arm_frame(struct eswitch_manager *manager,
     goto out;
   }
   output_length = router_ipv4_rewrite(forward_frame, length, egress->mac,
-                                      neighbor->mac, output, capacity);
+                                      shared_peer != NULL ? shared_peer->mac
+                                                          : neighbor->mac,
+                                      output, capacity);
   if (output_length == 0) {
     manager->route_invalid++;
+    goto out;
+  }
+  if (shared_peer != NULL) {
+    if (link_hops >= ROUTER_LINK_MAX_HOPS) {
+      manager->route_ttl_expired++;
+      manager->shared_vswitch_drops++;
+      goto out;
+    }
+    manager->routed_forwarded++;
+    manager->shared_vswitch_forwards++;
+    if (manager->packet_debug)
+      printf("SHARED VS RIF TX: vs=%u from-vr=%u rif=%u to-vr=%u rif=%u "
+             "next-hop=%u.%u.%u.%u len=%zu\n",
+             egress->vswitch_id, egress->vr_id, egress->interface_id,
+             shared_peer->vr_id, shared_peer->interface_id,
+             (decision.next_hop_ip >> 24) & 0xffU,
+             (decision.next_hop_ip >> 16) & 0xffU,
+             (decision.next_hop_ip >> 8) & 0xffU,
+             decision.next_hop_ip & 0xffU, output_length);
+    route_router_ingress_frame(manager, output, output_length, shared_peer,
+                               UINT16_MAX, link_hops + 1, now_ns);
     goto out;
   }
   result = bind_route_egress(manager, egress, neighbor->port_id, &context_tag);
@@ -1383,6 +1458,11 @@ static void route_uplink_ipv4_packet(
     const struct router_interface *ingress, uint16_t ingress_port,
     uint64_t now_ns);
 
+static void route_nat_ingress_frame(
+    struct eswitch_manager *manager, const uint8_t *frame, size_t length,
+    const struct router_interface *ingress, uint16_t ingress_port,
+    uint8_t link_hops, uint64_t now_ns);
+
 static void route_ipv4_packet(struct eswitch_manager *manager,
                               struct rte_mbuf *packet, uint16_t ingress_vs,
                               uint16_t ingress_port, uint64_t now_ns) {
@@ -1400,47 +1480,28 @@ static void route_ipv4_packet(struct eswitch_manager *manager,
        !memcmp(frame,candidate->mac,6)) {ingress=candidate;break;}
   }
   if(ingress!=NULL) {
-    const struct router_nat_policy *policy =
-        router_nat_policy_find(manager->router, ingress->vr_id);
-    if (policy != NULL && policy->interface_id == ingress->interface_id) {
-      /* Reverse NAT remains the first stage. Its miss path may continue only
-       * to the local-RIF classifier inside route_uplink_ipv4_packet(); it may
-       * never fall through into transit routing. */
-      route_uplink_ipv4_packet(manager, packet, ingress, ingress_port,
-                               now_ns);
-      free(scratch);
-      return;
-    }
-    route_arm_frame(manager,frame,length,ingress,ingress_port,0,0,now_ns);
+    route_router_ingress_frame(manager, frame, length, ingress, ingress_port,
+                               0, now_ns);
   }
   free(scratch);
 }
 
-static void route_uplink_ipv4_packet(
-    struct eswitch_manager *manager, struct rte_mbuf *packet,
+static void route_nat_ingress_frame(
+    struct eswitch_manager *manager, const uint8_t *frame, size_t length,
     const struct router_interface *ingress, uint16_t ingress_port,
-    uint64_t now_ns) {
+    uint8_t link_hops, uint64_t now_ns) {
   const struct router_nat_policy *policy;
   const struct router_nat_session *session = NULL;
-  size_t length = rte_pktmbuf_pkt_len(packet);
   size_t capacity = length < 60 ? 60 : length;
-  uint8_t *scratch = NULL;
   uint8_t *translated = NULL;
-  const uint8_t *frame;
   enum router_nat_result nat_result;
 
   policy = router_nat_policy_find(manager->router, ingress->vr_id);
   if (policy == NULL || policy->interface_id != ingress->interface_id)
     return;
-  scratch = malloc(length);
   translated = malloc(capacity);
-  if (scratch == NULL || translated == NULL) {
+  if (translated == NULL) {
     manager->route_tx_drops++;
-    goto out;
-  }
-  frame = rte_pktmbuf_read(packet, 0, length, scratch);
-  if (frame == NULL) {
-    manager->route_invalid++;
     goto out;
   }
   nat_result = router_nat_inbound(manager->nat, ingress->vr_id, frame, length,
@@ -1467,8 +1528,8 @@ static void route_uplink_ipv4_packet(
                (decision.destination_ip >> 16) & 0xffU,
                (decision.destination_ip >> 8) & 0xffU,
                decision.destination_ip & 0xffU, (unsigned)nat_result);
-      route_arm_frame(manager, frame, length, ingress, ingress_port, 0, 0,
-                      now_ns);
+      route_arm_frame(manager, frame, length, ingress, ingress_port,
+                      link_hops, 0, now_ns);
     } else {
       manager->nat_fail_closed_drops++;
       if (manager->packet_debug)
@@ -1481,8 +1542,8 @@ static void route_uplink_ipv4_packet(
   }
 
   if(session==NULL) goto out;
-  route_arm_frame(manager,translated,length,ingress,ingress_port,0,
-                  session->inside.interface_id,now_ns);
+  route_arm_frame(manager, translated, length, ingress, ingress_port,
+                  link_hops, session->inside.interface_id, now_ns);
   if (manager->packet_debug)
     printf("NAT IN: vr=%u ingress-port=%u public=%u.%u.%u.%u:%u "
          "inside=%u.%u.%u.%u:%u return-rif=%u\n",
@@ -1495,10 +1556,51 @@ static void route_uplink_ipv4_packet(
          (session->inside_ip >> 8) & 0xffU, session->inside_ip & 0xffU,
          session->inside_port,session->inside.interface_id);
   free(translated);
-  free(scratch);
   return;
 out:
   free(translated);
+}
+
+/* Every packet entering a logical RIF uses the same policy order, regardless
+ * of whether it arrived from a physical port or another RIF on a shared
+ * vSwitch: reverse NAT first, local interface second, and no transit fallback
+ * after a reverse-NAT miss. */
+static void route_router_ingress_frame(
+    struct eswitch_manager *manager, const uint8_t *frame, size_t length,
+    const struct router_interface *ingress, uint16_t ingress_port,
+    uint8_t link_hops, uint64_t now_ns) {
+  const struct router_nat_policy *policy =
+      router_nat_policy_find(manager->router, ingress->vr_id);
+
+  if (policy != NULL && policy->interface_id == ingress->interface_id) {
+    route_nat_ingress_frame(manager, frame, length, ingress, ingress_port,
+                            link_hops, now_ns);
+    return;
+  }
+  route_arm_frame(manager, frame, length, ingress, ingress_port, link_hops,
+                  0, now_ns);
+}
+
+static void route_uplink_ipv4_packet(
+    struct eswitch_manager *manager, struct rte_mbuf *packet,
+    const struct router_interface *ingress, uint16_t ingress_port,
+    uint64_t now_ns) {
+  size_t length = rte_pktmbuf_pkt_len(packet);
+  uint8_t *scratch = malloc(length);
+  const uint8_t *frame;
+
+  if (scratch == NULL) {
+    manager->route_tx_drops++;
+    return;
+  }
+  frame = rte_pktmbuf_read(packet, 0, length, scratch);
+  if (frame == NULL) {
+    manager->route_invalid++;
+    free(scratch);
+    return;
+  }
+  route_router_ingress_frame(manager, frame, length, ingress, ingress_port,
+                             0, now_ns);
   free(scratch);
 }
 
@@ -1904,6 +2006,11 @@ static size_t format_status(const struct eswitch_manager *manager,
       "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
       " max_hops=%u\n", manager->router_link_forwards,
       manager->router_link_drops, ROUTER_LINK_MAX_HOPS);
+  used = append_text(response, size, used,
+      "shared_vswitch_rif_dataplane=arm forwards=%" PRIu64
+      " drops=%" PRIu64 " max_hops=%u\n",
+      manager->shared_vswitch_forwards, manager->shared_vswitch_drops,
+      ROUTER_LINK_MAX_HOPS);
   used = append_text(response, size, used,
       "neighbors=%zu neighbor_misses=%" PRIu64 " arp_probes=%" PRIu64
       " proactive_probes=%" PRIu64 " route_tx_drops=%" PRIu64 "\n",

@@ -48,6 +48,7 @@ struct eswitch_manager {
   uint64_t route_ttl_expired, route_invalid, route_neighbor_misses;
   uint64_t route_arp_probes, route_proactive_probes, route_tx_drops;
   uint64_t router_link_forwards, router_link_drops;
+  uint64_t shared_vswitch_forwards, shared_vswitch_drops;
   uint64_t tx_log_ns, tx_snapshot_ns, tx_snapshot_seen;
   uint64_t next_hw_route_retry_ns, hw_route_retry_backoff_ns;
   struct managed_vswitch switches[ESWITCH_MAX_VSWITCHES];

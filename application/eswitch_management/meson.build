@@ -146,6 +146,21 @@ nat_test = executable(
 )
 test('eswitch-router-nat', nat_test)
 
+shared_wan_test = executable(
+  'eswitch-router-shared-wan-test',
+  [
+    'router/router_shared_wan_test.c',
+    'router/router_nat.c',
+    'router/router_icmp.c',
+    'router/router_forward.c',
+    'router/router_neighbor.c',
+    'router/router.c',
+  ],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-shared-wan', shared_wan_test)
+
 hw_plan_test = executable(
   'eswitch-router-hw-test',
   [

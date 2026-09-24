@@ -15,6 +15,14 @@ may continue only when the IPv4 destination is a local address owned by that
 VR; it then reaches the local interface/ICMP handler. Every non-local miss is
 still dropped fail-closed. Status exposes `nat_local_fallbacks` and
 `nat_fail_closed_drops` for this decision point.
+Multiple VR WAN RIFs may share one vSwitch/VLAN. Because a logical RIF is not
+an eSwitch port, an SF-generated broadcast ARP cannot discover another local
+RIF by leaving and re-entering the wire. The Arm slow path recognizes a
+next-hop IP owned by a different VR RIF on the same vSwitch and performs an
+in-process L2 handoff. Outbound SNAT still runs before the handoff, and the
+receiving RIF still runs reverse NAT before local-IP classification. Status
+reports this path as `shared_vswitch_rif_dataplane=arm` with forward/drop
+counters.
 The Arm slow path proactively resolves configured static/default-route next
 hops and refreshes them before their five-minute reachability lifetime
 expires. While an adjacency is unresolved, a bounded queue retains pre-NAT
