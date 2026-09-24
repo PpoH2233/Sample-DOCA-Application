@@ -11,6 +11,8 @@
 #define ROUTER_MAX_LINKS 128
 #define ROUTER_MAX_NAT_POLICIES ROUTER_MAX_VRS
 #define ROUTER_MAX_PORT_FORWARDS 128
+#define ROUTER_MAX_EGRESS_POLICIES ROUTER_MAX_INTERFACES
+#define ROUTER_MAX_EGRESS_RULES 512
 #define ROUTER_NAME_SIZE 32
 #define ROUTER_COMMAND_SIZE 512
 
@@ -47,16 +49,32 @@ struct router_port_forward {
   uint16_t private_port, private_port_last;
   uint32_t public_ip, private_ip; /* host byte order */
 };
+struct router_egress_policy {
+  uint16_t vr_id, interface_id;
+  bool default_allow;
+};
+struct router_egress_rule {
+  uint16_t vr_id, interface_id, rule_id;
+  uint32_t source, destination; /* network byte sequence in host-order integer */
+  uint8_t source_prefix, destination_prefix;
+  uint8_t protocol; /* 0=all, 1=ICMP, 6=TCP, 17=UDP */
+  uint16_t port_first, port_last; /* TCP/UDP destination; zero means any */
+  int16_t icmp_type, icmp_code; /* -1 means any */
+  bool allow;
+};
 struct router_config {
   uint16_t vr_ids[ROUTER_MAX_VRS];
   uint16_t link_ids[ROUTER_MAX_LINKS];
   size_t vr_count, link_count, interface_count, route_count, nat_policy_count;
   size_t port_forward_count;
+  size_t egress_policy_count, egress_rule_count;
   uint32_t next_interface_id;
   struct router_interface interfaces[ROUTER_MAX_INTERFACES];
   struct router_route routes[ROUTER_MAX_ROUTES];
   struct router_nat_policy nat_policies[ROUTER_MAX_NAT_POLICIES];
   struct router_port_forward port_forwards[ROUTER_MAX_PORT_FORWARDS];
+  struct router_egress_policy egress_policies[ROUTER_MAX_EGRESS_POLICIES];
+  struct router_egress_rule egress_rules[ROUTER_MAX_EGRESS_RULES];
 };
 /* Callbacks validate attachments against the manager's current inventory.
  * Public ports must be representors and not owned by an L2 switch. */
@@ -81,6 +99,9 @@ uint32_t router_nat_policy_address(const struct router_config *,
                                    const struct router_nat_policy *);
 bool router_port_forward_uses_interface(const struct router_config *,
                                         uint16_t interface_id);
+const struct router_egress_policy *router_egress_policy_find(
+    const struct router_config *, uint16_t vr_id, uint16_t interface_id);
+bool router_egress_vr_has_policy(const struct router_config *, uint16_t vr_id);
 bool router_ipv4_prefix(const char *, uint32_t *, uint8_t *);
 /* Strict parser shared by eswitchctl and daemon. No mutations on failure. */
 bool router_command_valid(const char *, char *, size_t);

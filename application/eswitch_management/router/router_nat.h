@@ -124,4 +124,11 @@ void router_nat_flush(struct router_nat_table *table, uint16_t vr_id);
 void router_nat_session_set_hardware_active(
     const struct router_nat_session *session, bool active);
 
+/* Existing inbound port-forward session replies are established traffic, not
+ * new guest egress connections. Used before the guest egress ACL. */
+bool router_nat_is_port_forward_reply(
+    const struct router_nat_table *table,
+    const struct router_interface *ingress,
+    const uint8_t *frame, size_t length);
+
 #endif /* ESW_ROUTER_NAT_H */

@@ -273,6 +273,29 @@ single-port rules retain their prior behavior, with ambiguous return tuples
 rejected when a session is created.
 PF sessions remain on Arm even if DOCA Flow CT is enabled for ordinary SNAT.
 
+### Guest-network egress rules
+
+Attach one policy to a private VS-backed RIF, not to the public uplink:
+
+```sh
+eswitchctl vr egress policy set --id 1 --interface SW100 --default deny
+eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 100 \
+  --action allow --protocol tcp --source 192.168.100.0/24 \
+  --destination 0.0.0.0/0 --port-range 443
+eswitchctl vr egress rule show --id 1 --interface SW100
+```
+
+The original guest packet is filtered before route lookup, neighbor queueing,
+and NAT. No policy means the pre-existing behavior (allow). Rules use ascending
+`rule-id` as priority; an unmatched packet uses the explicit default action.
+ARP and packets to a local VR interface IP are outside this egress scope.
+Fragments fail closed while a policy is present. A reply belonging to an
+existing port-forward session is allowed as established traffic. Because the
+current hardware LPM key identifies the VR but not the guest ingress RIF, a VR
+with any such policy remains on Arm for routing/CT rather than bypassing the
+policy. Configurations persist in `router-state 5`; older state files load.
+For the CLI/REST contract and teardown order, see [CLI.md](../CLI.md).
+
 Example acceptance test, using a reachable target and TCP service beyond the
 uplink:
 

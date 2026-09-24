@@ -85,6 +85,10 @@ size_t router_hw_routes_build(const struct router_config *config,
     if (!neighbor->used || !neighbor->resolved ||
         now_ns - neighbor->last_seen_ns > ROUTER_NEIGHBOR_REACHABLE_NS)
       continue;
+    /* Route entries key on VR, not ingress guest RIF. Until hardware ACLs
+     * enforce the policy first, any VR with an egress ACL stays on Arm. */
+    if (router_egress_vr_has_policy(config, neighbor->vr_id))
+      continue;
     egress = interface_by_id(config, neighbor->vr_id,
                              neighbor->interface_id);
     if (egress == NULL || egress->attachment != ROUTER_VSWITCH ||
@@ -103,6 +107,9 @@ size_t router_hw_routes_build(const struct router_config *config,
     const struct router_interface *egress = interface_by_id(
         config, configured->vr_id, configured->interface_id);
     const struct router_neighbor *neighbor;
+
+    if (router_egress_vr_has_policy(config, configured->vr_id))
+      continue;
 
     if (egress == NULL || egress->attachment != ROUTER_VSWITCH ||
         !egress->has_address || interface_is_nat_egress(config, egress))

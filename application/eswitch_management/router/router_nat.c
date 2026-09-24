@@ -253,6 +253,59 @@ static struct router_nat_session *find_outbound(
   return NULL;
 }
 
+bool router_nat_is_port_forward_reply(
+    const struct router_nat_table *table,
+    const struct router_interface *ingress,
+    const uint8_t *frame, size_t length) {
+  const uint8_t *ip, *l4;
+  uint32_t source, destination, mask;
+  uint16_t fragment, source_port, destination_port, total;
+  size_t header_length, bucket;
+  uint8_t protocol;
+
+  if (!table || !ingress || !ingress->has_address || !frame ||
+      length < ETH_HEADER_LEN + IPV4_MIN_HEADER_LEN ||
+      frame[12] != 0x08 || frame[13] != 0x00)
+    return false;
+  ip = frame + ETH_HEADER_LEN;
+  if ((ip[0] >> 4) != 4 || (ip[0] & 0x0fU) < 5)
+    return false;
+  header_length = (size_t)(ip[0] & 0x0fU) * 4U;
+  if (length < ETH_HEADER_LEN + header_length)
+    return false;
+  total = read16(ip + 2);
+  fragment = read16(ip + 6);
+  if (total < header_length + UDP_HEADER_LEN ||
+      total > length - ETH_HEADER_LEN || (fragment & 0x3fffU) != 0)
+    return false;
+  protocol = ip[9];
+  if (protocol != IPPROTO_TCP_VALUE && protocol != IPPROTO_UDP_VALUE)
+    return false;
+  if (protocol == IPPROTO_TCP_VALUE &&
+      total < header_length + TCP_MIN_HEADER_LEN)
+    return false;
+  source = read32(ip + 12);
+  destination = read32(ip + 16);
+  mask = ingress->prefix == 0 ? 0 : UINT32_MAX << (32 - ingress->prefix);
+  if ((source & mask) != (ingress->address & mask))
+    return false;
+  l4 = ip + header_length;
+  source_port = read16(l4);
+  destination_port = read16(l4 + 2);
+  bucket = tuple_bucket(ingress->vr_id, protocol, source, source_port,
+                        destination, destination_port);
+  for (uint16_t slot = table->buckets[0][bucket]; slot;
+       slot = table->entries[slot - 1].index_next[0]) {
+    const struct router_nat_session *s = &table->entries[slot - 1];
+    if (s->used && s->port_forward && s->vr_id == ingress->vr_id &&
+        s->protocol == protocol && s->inside_ip == source &&
+        s->inside_port == source_port && s->remote_ip == destination &&
+        s->remote_port == destination_port)
+      return true;
+  }
+  return false;
+}
+
 static struct router_nat_session *find_inbound(
     struct router_nat_table *table, uint16_t vr_id,
     const struct packet_view *view) {

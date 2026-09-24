@@ -23,6 +23,7 @@
 #include "router/router_hw.h"
 #include "router/router_arp.h"
 #include "router/router_forward.h"
+#include "router/router_egress.h"
 #include "router/router_icmp.h"
 #include "l2/l2_switch.h"
 #include "pipeline/tx_build.h"
@@ -1201,6 +1202,25 @@ static void route_arm_frame(struct eswitch_manager *manager,
   doca_error_t result;
   enum router_ipv4_disposition disposition;
   enum router_nat_result nat_result;
+  enum router_egress_verdict egress_verdict;
+
+  egress_verdict=router_egress_check(manager->router,ingress,frame,length);
+  if(egress_verdict!=ROUTER_EGRESS_NOT_APPLICABLE) {
+    manager->egress_checked++;
+    if(egress_verdict==ROUTER_EGRESS_DENY &&
+       router_nat_is_port_forward_reply(manager->nat,ingress,frame,length)) {
+      manager->egress_established_replies++;
+      egress_verdict=ROUTER_EGRESS_ALLOW;
+    }
+    if(egress_verdict==ROUTER_EGRESS_DENY) {
+      manager->egress_denied++;
+      if(manager->packet_debug)
+        printf("GUEST EGRESS DROP: vr=%u rif=%u vs=%u\n",
+               ingress->vr_id,ingress->interface_id,ingress->vswitch_id);
+      goto out;
+    }
+    manager->egress_allowed++;
+  }
 
   disposition = router_ipv4_lookup_interface(manager->router,
       ingress->interface_id,frame,length,&decision);
@@ -1401,6 +1421,7 @@ static void route_arm_frame(struct eswitch_manager *manager,
   }
   if (nat_session != NULL && !nat_session->port_forward &&
       ingress->attachment==ROUTER_VSWITCH &&
+      !router_egress_vr_has_policy(manager->router, decision.vr_id) &&
       manager->pipeline->hardware_ct_enabled &&
       manager->pipeline->hardware_routing_enabled &&
       (nat_session->protocol == IPPROTO_TCP ||
@@ -2060,6 +2081,15 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->routed_seen, manager->routed_forwarded,
       manager->route_no_route, manager->route_ttl_expired,
       manager->route_invalid);
+  used = append_text(response, size, used,
+      "guest_egress=%s policies=%zu rules=%zu checked=%" PRIu64
+      " allowed=%" PRIu64 " denied=%" PRIu64
+      " established_pf_replies=%" PRIu64 "\n",
+      manager->router->egress_policy_count ? "arm-pre-route" : "disabled",
+      manager->router->egress_policy_count,
+      manager->router->egress_rule_count,manager->egress_checked,
+      manager->egress_allowed,manager->egress_denied,
+      manager->egress_established_replies);
   used = append_text(response, size, used,
       "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
       " max_hops=%u\n", manager->router_link_forwards,

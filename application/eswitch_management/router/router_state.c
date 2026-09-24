@@ -28,6 +28,8 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
   for(size_t i=0;i<c->port_forward_count;i++)
     if(c->port_forwards[i].public_port!=c->port_forwards[i].public_port_last)
       state_version=4U;
+  if(c->egress_policy_count || c->egress_rule_count)
+    state_version=5U;
   fprintf(f,"router-state %u\nnext %u\n",state_version,c->next_interface_id);
   for(size_t i=0;i<c->vr_count;i++) fprintf(f,"vr create --id %u\n",c->vr_ids[i]);
   for(size_t i=0;i<c->link_count;i++) fprintf(f,"link create --id %u\n",c->link_ids[i]);
@@ -84,6 +86,37 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
             r->vr_id,r->rule_id,name,r->protocol==6?"tcp":"udp",
             public_ports,ipstr(r->private_ip,private_ip),private_ports);
   }
+  for(size_t i=0;i<c->egress_policy_count;i++) {
+    const struct router_egress_policy *p=&c->egress_policies[i];
+    const char *name=NULL;
+    for(size_t j=0;j<c->interface_count;j++)
+      if(c->interfaces[j].interface_id==p->interface_id &&
+         c->interfaces[j].vr_id==p->vr_id) name=c->interfaces[j].name;
+    if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling egress policy interface");}
+    fprintf(f,"vr egress policy set --id %u --interface %s --default %s\n",
+            p->vr_id,name,p->default_allow?"allow":"deny");
+  }
+  for(size_t i=0;i<c->egress_rule_count;i++) {
+    const struct router_egress_rule *r=&c->egress_rules[i];
+    const char *name=NULL;
+    char source[INET_ADDRSTRLEN],destination[INET_ADDRSTRLEN];
+    for(size_t j=0;j<c->interface_count;j++)
+      if(c->interfaces[j].interface_id==r->interface_id &&
+         c->interfaces[j].vr_id==r->vr_id) name=c->interfaces[j].name;
+    if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling egress rule interface");}
+    fprintf(f,"vr egress rule add --id %u --interface %s --rule-id %u "
+              "--action %s --protocol %s --source %s/%u --destination %s/%u",
+            r->vr_id,name,r->rule_id,r->allow?"allow":"deny",
+            r->protocol==6?"tcp":r->protocol==17?"udp":
+            r->protocol==1?"icmp":"all",
+            ipstr(r->source,source),r->source_prefix,
+            ipstr(r->destination,destination),r->destination_prefix);
+    if(r->port_first)
+      fprintf(f," --port-range %u-%u",r->port_first,r->port_last);
+    if(r->icmp_type>=0) fprintf(f," --icmp-type %d",r->icmp_type);
+    if(r->icmp_code>=0) fprintf(f," --icmp-code %d",r->icmp_code);
+    fputc('\n',f);
+  }
   bool ok=!ferror(f) && fflush(f)==0 && fsync(fd)==0;
   if(fclose(f)!=0) ok=false;
   if(!ok || rename(tmp,path)!=0) {unlink(tmp);return fail(out,size,strerror(errno));}
@@ -127,7 +160,8 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
   struct router_inventory inv={.context=&port,.port=replay_port,.switch_exists=replay_switch};
   bool ok=fgets(line,sizeof(line),f) &&
           (!strcmp(line,"router-state 1\n") || !strcmp(line,"router-state 2\n") ||
-           !strcmp(line,"router-state 3\n") || !strcmp(line,"router-state 4\n"));
+           !strcmp(line,"router-state 3\n") || !strcmp(line,"router-state 4\n") ||
+           !strcmp(line,"router-state 5\n"));
   if(ok) ok=fgets(line,sizeof(line),f) && uints(line,"next",&next,1) && next>0 && next<=65536;
   while(ok && fgets(line,sizeof(line),f)) {
     if(!strchr(line,'\n')) {ok=false;break;}
@@ -150,7 +184,9 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
       !strncmp(line,"link create ",12) ||
       !strncmp(line,"vr interface set ",17) || !strncmp(line,"vr ip add ",10) ||
       !strncmp(line,"vr route add ",13) || !strncmp(line,"vr nat enable ",14) ||
-      !strncmp(line,"vr port-forward add ",20);
+      !strncmp(line,"vr port-forward add ",20) ||
+      !strncmp(line,"vr egress policy set ",21) ||
+      !strncmp(line,"vr egress rule add ",19);
     if(!permitted || (attachment!=(identity!=0))) {ok=false;break;}
     if(attachment) c->next_interface_id=identity;
     bool changed=false;

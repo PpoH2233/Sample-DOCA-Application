@@ -337,6 +337,17 @@ int main(void) {
     assert(read32(reverse+30)==private_ip && read16(reverse+36)==22);
     assert(checksum(reverse+14,20)==0 && l4_checksum(reverse+14)==0);
     length=make_packet(original,6,private_ip,22,remote_ip,51000);
+    {
+      const struct router_interface guest={.vr_id=101,.has_address=true,
+          .address=0xc0a80001,.prefix=24};
+      struct router_interface other=guest;
+      assert(router_nat_is_port_forward_reply(table,&guest,original,length));
+      other.address=0xc0a80101;
+      assert(!router_nat_is_port_forward_reply(table,&other,original,length));
+      original[33]^=1;
+      assert(!router_nat_is_port_forward_reply(table,&guest,original,length));
+      original[33]^=1;
+    }
     assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,3,
                 translated,sizeof(translated),&reply)==ROUTER_NAT_TRANSLATED);
     assert(reply->port_forward && read32(translated+26)==public_ip &&

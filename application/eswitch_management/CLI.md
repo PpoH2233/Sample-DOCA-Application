@@ -572,7 +572,11 @@ Contract-level notes:
   and readiness. `vr route show` lists connected and static routes.
   `vr nat show` reports the SNAT/PAT policy. `vr port-forward show` reports
   inbound mappings on a VR.
-- Detach requires no dependencies: remove port-forward rules, the NAT policy,
+- `vr egress policy` and `vr egress rule` bind to a **guest vs-link RIF**,
+  not a public IP or public uplink. A VR may have separate policies for each
+  guest network. The CloudStack adapter must map its `networkid` to this RIF.
+- Detach requires no dependencies: remove egress rules/policy,
+  port-forward rules, the NAT policy,
   static routes and the IP address first. `vr delete` requires that the VR has
   no interfaces.
 - One IPv4 address per interface, and overlapping subnets inside one VR are
@@ -633,6 +637,49 @@ and `pf_full`.
 This phase does not implement public-IP aliases, source filtering,
 hairpin NAT, ICMP forwarding or PF hardware CT promotion. It does not change
 the CloudStack extension; do not advertise `PortForwarding` there yet.
+
+#### Guest-network egress firewall (BlueField CLI only)
+
+The policy key is `(VR ID, guest RIF)`. With no policy, existing traffic is
+unchanged. Once a policy is set, the configured default (`allow` or `deny`)
+applies to guest IPv4 packets addressed to that RIF's MAC before LPM/NAT
+forwarding. Router-local IPs and ARP are unaffected. Rules match the original
+VM source/destination addresses, protocol, destination TCP/UDP port range, or
+ICMP type/code; omitted CIDRs mean `0.0.0.0/0`. The matching rule with the
+**lowest rule ID** wins, then the default action. Non-initial/fragmented IPv4
+packets fail closed while a policy is configured. Established port-forward
+replies are exempted by their reverse-session tuple.
+
+```sh
+# Guest network on VS100 enters VR1 through RIF SW100. The public RIF is
+# uplink-vlan6, but egress rules are NOT attached to uplink-vlan6.
+# Stage rules while preserving the old allow behavior; switch to deny last.
+eswitchctl vr egress policy set --id 1 --interface SW100 --default allow
+eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 100 \
+  --action allow --protocol tcp --source 192.168.100.0/24 \
+  --destination 0.0.0.0/0 --port-range 80
+eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 101 \
+  --action allow --protocol tcp --source 192.168.100.0/24 \
+  --destination 0.0.0.0/0 --port-range 443
+eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 102 \
+  --action allow --protocol udp --destination 0.0.0.0/0 --port-range 53
+eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 103 \
+  --action allow --protocol icmp --icmp-type 8 --icmp-code 0
+eswitchctl vr egress policy set --id 1 --interface SW100 --default deny
+eswitchctl vr egress policy show --id 1 --interface SW100
+eswitchctl vr egress rule show --id 1 --interface SW100
+eswitchctl status | grep guest_egress
+```
+
+For teardown, delete each rule, then `vr egress policy delete --id 1
+--interface SW100`. This policy also applies to routed traffic toward another
+guest VS, because it is classified by **source guest RIF** before route
+selection; same-VS L2 traffic does not traverse the VR. Hardware route/CT
+promotion for a VR with any guest egress policy is disabled so an existing
+fast path cannot bypass the software ACL. Rule changes flush current NAT/CT
+sessions. The policies and rules persist in `eswitch.conf.router` under
+`router-state 5`; older state versions still load. Hardware ACL offload and
+CloudStack wrapper integration are not included in this phase.
 
 #### 5.8.1 VR and interface lifecycle
 

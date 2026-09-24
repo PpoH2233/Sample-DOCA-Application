@@ -10,7 +10,9 @@
 enum operation { CREATE, DELETE, SHOW, LINK_CREATE, LINK_DELETE, LINK_SHOW,
   ATTACH_PORT, ATTACH_SWITCH, ATTACH_LINK, DETACH_PORT, DETACH_SWITCH,
   DETACH_LINK, IP_ADD, IP_DEL, ROUTE_ADD, ROUTE_DEL, ROUTE_SHOW, MAC_SET,
-  NAT_ENABLE, NAT_DISABLE, NAT_SHOW, PF_ADD, PF_DELETE, PF_SHOW };
+  NAT_ENABLE, NAT_DISABLE, NAT_SHOW, PF_ADD, PF_DELETE, PF_SHOW,
+  EGRESS_POLICY_SET, EGRESS_POLICY_DELETE, EGRESS_POLICY_SHOW,
+  EGRESS_RULE_ADD, EGRESS_RULE_DELETE, EGRESS_RULE_SHOW };
 struct command {
   enum operation op;
   uint16_t id, port, vswitch, link;
@@ -23,6 +25,10 @@ struct command {
   uint16_t private_port, private_port_last;
   uint32_t private_ip;
   uint8_t protocol;
+  uint32_t source, destination;
+  uint8_t source_prefix, destination_prefix;
+  int16_t icmp_type, icmp_code;
+  bool allow, default_allow;
 };
 
 static bool error(char *out, size_t size, const char *message) {
@@ -126,7 +132,11 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
   enum { ID=1, NAME=2, PORT=4, SWITCH=8, ADDRESS=16, PREFIX=32,
          VIA=64, MAC=128, PORT_RANGE=256, LINK=512, RULE_ID=1024,
          PROTOCOL=2048, PUBLIC_PORT=4096, PRIVATE_IP=8192,
-         PRIVATE_PORT=16384 };
+         PRIVATE_PORT=16384, SOURCE=32768, DESTINATION=65536,
+         ACTION=131072, DEFAULT=262144, ICMP_TYPE=524288,
+         ICMP_CODE=1048576 };
+  c->icmp_type = -1;
+  c->icmp_code = -1;
   if (!request || strlen(request) >= sizeof(text))
     return error(out, size, "command too long");
   strcpy(text, request);
@@ -213,9 +223,30 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
       c->op=PF_SHOW; required=ID;
       allowed=RULE_ID;
     } else return error(out,size,"expected port-forward add|delete|show");
+  } else if (count > 3 && !strcmp(verb,"egress")) {
+    start=4;
+    if (!strcmp(tokens[2],"policy")) {
+      if (!strcmp(tokens[3],"set")) {
+        c->op=EGRESS_POLICY_SET; required=ID|NAME|DEFAULT;
+      } else if (!strcmp(tokens[3],"delete")) {
+        c->op=EGRESS_POLICY_DELETE; required=ID|NAME;
+      } else if (!strcmp(tokens[3],"show")) {
+        c->op=EGRESS_POLICY_SHOW; required=ID|NAME;
+      } else return error(out,size,"expected egress policy set|delete|show");
+    } else if (!strcmp(tokens[2],"rule")) {
+      if (!strcmp(tokens[3],"add")) {
+        c->op=EGRESS_RULE_ADD;
+        required=ID|NAME|RULE_ID|PROTOCOL|ACTION;
+        allowed=SOURCE|DESTINATION|PORT_RANGE|ICMP_TYPE|ICMP_CODE;
+      } else if (!strcmp(tokens[3],"delete")) {
+        c->op=EGRESS_RULE_DELETE; required=ID|NAME|RULE_ID;
+      } else if (!strcmp(tokens[3],"show")) {
+        c->op=EGRESS_RULE_SHOW; required=ID|NAME; allowed=RULE_ID;
+      } else return error(out,size,"expected egress rule add|delete|show");
+    } else return error(out,size,"expected egress policy|rule");
   } else return error(out,size,
     "unsupported vr operation; expected create|delete|show|port|switch|link|"
-    "interface|ip|route|nat|port-forward (see router/README.md)");
+    "interface|ip|route|nat|port-forward|egress (see router/README.md)");
 options:
   allowed|=required;
   if ((count-start)%2) return error(out,size,"options require values");
@@ -241,7 +272,10 @@ options:
     else if (!strcmp(k,"--via")) { bit=VIA; valid=address(v,&c->gateway); }
     else if (!strcmp(k,"--mac")) { bit=MAC; valid=mac_address(v,c->mac); }
     else if (!strcmp(k,"--port-range")) {
-      bit=PORT_RANGE; valid=port_range(v,&c->port_first,&c->port_last);
+      bit=PORT_RANGE;
+      valid=c->op==EGRESS_RULE_ADD ?
+        forwarding_ports(v,&c->port_first,&c->port_last) :
+        port_range(v,&c->port_first,&c->port_last);
     }
     else if (!strcmp(k,"--rule-id")) {
       bit=RULE_ID; valid=number(v,&c->rule_id) && c->rule_id;
@@ -250,6 +284,11 @@ options:
       bit=PROTOCOL;
       if (!strcmp(v,"tcp")) { c->protocol=6; valid=true; }
       else if (!strcmp(v,"udp")) { c->protocol=17; valid=true; }
+      else if(c->op==EGRESS_RULE_ADD && !strcmp(v,"icmp")) {
+        c->protocol=1; valid=true;
+      } else if(c->op==EGRESS_RULE_ADD && !strcmp(v,"all")) {
+        c->protocol=0; valid=true;
+      }
     }
     else if (!strcmp(k,"--public-port")) {
       bit=PUBLIC_PORT;
@@ -261,6 +300,25 @@ options:
     else if (!strcmp(k,"--private-port")) {
       bit=PRIVATE_PORT;
       valid=forwarding_ports(v,&c->private_port,&c->private_port_last);
+    } else if (!strcmp(k,"--source")) {
+      bit=SOURCE; valid=router_ipv4_prefix(v,&c->source,&c->source_prefix);
+    } else if (!strcmp(k,"--destination")) {
+      bit=DESTINATION;
+      valid=router_ipv4_prefix(v,&c->destination,&c->destination_prefix);
+    } else if (!strcmp(k,"--action")) {
+      bit=ACTION; valid=!strcmp(v,"allow") || !strcmp(v,"deny");
+      c->allow=!strcmp(v,"allow");
+    } else if (!strcmp(k,"--default")) {
+      bit=DEFAULT; valid=!strcmp(v,"allow") || !strcmp(v,"deny");
+      c->default_allow=!strcmp(v,"allow");
+    } else if (!strcmp(k,"--icmp-type") || !strcmp(k,"--icmp-code")) {
+      uint16_t value;
+      bit=!strcmp(k,"--icmp-type") ? ICMP_TYPE : ICMP_CODE;
+      valid=number(v,&value) && value<=255;
+      if(valid) {
+        if(bit==ICMP_TYPE) c->icmp_type=(int16_t)value;
+        else c->icmp_code=(int16_t)value;
+      }
     }
     if (!bit || !(allowed&bit) || (found&bit) || !valid)
       return error(out,size,"unknown, duplicate or invalid option");
@@ -273,6 +331,14 @@ options:
     return error(out,size,"public and private port ranges must have equal length");
   if ((c->op==ROUTE_ADD || c->op==ROUTE_DEL) && (c->address & mask(c->prefix))!=c->address)
     return error(out,size,"route prefix must have zero host bits");
+  if (c->op==EGRESS_RULE_ADD &&
+      (((c->source & mask(c->source_prefix))!=c->source) ||
+       ((c->destination & mask(c->destination_prefix))!=c->destination)))
+    return error(out,size,"egress CIDR must have zero host bits");
+  if (c->op==EGRESS_RULE_ADD &&
+      (((found&PORT_RANGE) && c->protocol!=6 && c->protocol!=17) ||
+       ((found&(ICMP_TYPE|ICMP_CODE)) && c->protocol!=1)))
+    return error(out,size,"egress ports require TCP/UDP; ICMP type/code require ICMP");
   return true;
 }
 bool router_command_valid(const char *s, char *out, size_t size) {
@@ -327,6 +393,21 @@ bool router_port_forward_uses_interface(const struct router_config *c,
     if (c->port_forwards[i].interface_id==interface_id) return true;
   return false;
 }
+const struct router_egress_policy *router_egress_policy_find(
+    const struct router_config *c, uint16_t vr_id, uint16_t interface_id) {
+  if (!c) return NULL;
+  for (size_t i=0;i<c->egress_policy_count;i++)
+    if (c->egress_policies[i].vr_id==vr_id &&
+        c->egress_policies[i].interface_id==interface_id)
+      return &c->egress_policies[i];
+  return NULL;
+}
+bool router_egress_vr_has_policy(const struct router_config *c, uint16_t vr_id) {
+  if (!c) return false;
+  for (size_t i=0;i<c->egress_policy_count;i++)
+    if (c->egress_policies[i].vr_id==vr_id) return true;
+  return false;
+}
 static bool same_port(const struct router_port_identity *a,const struct router_port_identity *b) {
   return a->host==b->host && a->pf==b->pf && a->vf==b->vf;
 }
@@ -364,6 +445,11 @@ static bool routes_reference(const struct router_config *c,uint16_t rif) {
 static bool nat_references(const struct router_config *c,uint16_t rif) {
   for(size_t i=0;i<c->nat_policy_count;i++)
     if(c->nat_policies[i].interface_id==rif) return true;
+  return false;
+}
+static bool egress_references(const struct router_config *c,uint16_t rif) {
+  for(size_t i=0;i<c->egress_policy_count;i++)
+    if(c->egress_policies[i].interface_id==rif) return true;
   return false;
 }
 static bool peer_routes_reference(const struct router_config *c,
@@ -427,9 +513,44 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
   } else {
     if(!exists) return error(out,size,"VR not found");
     struct router_interface *rif=interface(c,q.id,q.name);
-    if(q.op==SHOW || q.op==ROUTE_SHOW || q.op==NAT_SHOW || q.op==PF_SHOW) {
+    if(q.op==SHOW || q.op==ROUTE_SHOW || q.op==NAT_SHOW || q.op==PF_SHOW ||
+       q.op==EGRESS_POLICY_SHOW || q.op==EGRESS_RULE_SHOW) {
       size_t used=append(out,size,0,
                          "OK vr=%u dataplane=ARM_LPM_ROUTER_LINK_NAT_MVP\n",q.id);
+      if(q.op==EGRESS_POLICY_SHOW || q.op==EGRESS_RULE_SHOW) {
+        const struct router_egress_policy *policy;
+        size_t shown=0;
+        if(!rif || rif->attachment!=ROUTER_VSWITCH)
+          return error(out,size,"guest vSwitch interface not found in VR");
+        policy=router_egress_policy_find(c,q.id,rif->interface_id);
+        if(!policy) return error(out,size,"egress policy not configured");
+        used=append(out,size,used,"egress interface=%s switch=%u default=%s "
+                    "dataplane=ARM_PRE_ROUTE\n",rif->name,rif->vswitch_id,
+                    policy->default_allow?"allow":"deny");
+        if(q.op==EGRESS_RULE_SHOW) {
+          for(size_t i=0;i<c->egress_rule_count;i++) {
+            const struct router_egress_rule *r=&c->egress_rules[i];
+            char src[INET_ADDRSTRLEN],dst[INET_ADDRSTRLEN];
+            if(r->vr_id!=q.id || r->interface_id!=rif->interface_id ||
+               (q.rule_id && r->rule_id!=q.rule_id)) continue;
+            used=append(out,size,used,"rule=%u action=%s protocol=%s "
+                "source=%s/%u destination=%s/%u",
+                r->rule_id,r->allow?"allow":"deny",
+                r->protocol==6?"tcp":r->protocol==17?"udp":
+                r->protocol==1?"icmp":"all",
+                iptext(r->source,src),r->source_prefix,
+                iptext(r->destination,dst),r->destination_prefix);
+            if(r->port_first) used=append(out,size,used," port=%u-%u",
+                                           r->port_first,r->port_last);
+            if(r->icmp_type>=0) used=append(out,size,used," icmp-type=%d",r->icmp_type);
+            if(r->icmp_code>=0) used=append(out,size,used," icmp-code=%d",r->icmp_code);
+            used=append(out,size,used,"\n"); shown++;
+          }
+          if(q.rule_id && !shown) return error(out,size,"egress rule not found");
+          if(!shown) used=append(out,size,used,"egress rules=0\n");
+        }
+        return used<size ? true : error(out,size,"response too large");
+      }
       if(q.op==NAT_SHOW) {
         const struct router_nat_policy *p=router_nat_policy_find(c,q.id);
         if(!p) used=append(out,size,used,"nat=disabled\n");
@@ -532,6 +653,65 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         return error(out,size,"port-forward rule not found");
       memmove(&c->port_forwards[i],&c->port_forwards[i+1],
               (--c->port_forward_count-i)*sizeof(c->port_forwards[0]));
+    } else if(q.op==EGRESS_POLICY_SET || q.op==EGRESS_POLICY_DELETE ||
+             q.op==EGRESS_RULE_ADD || q.op==EGRESS_RULE_DELETE) {
+      size_t policy_index=0;
+      if(!rif || rif->attachment!=ROUTER_VSWITCH)
+        return error(out,size,"egress policy requires a guest vSwitch interface");
+      for(;policy_index<c->egress_policy_count;policy_index++)
+        if(c->egress_policies[policy_index].vr_id==q.id &&
+           c->egress_policies[policy_index].interface_id==rif->interface_id)
+          break;
+      if(q.op==EGRESS_POLICY_SET) {
+        const struct router_nat_policy *nat=router_nat_policy_find(c,q.id);
+        if((nat && nat->interface_id==rif->interface_id) ||
+           router_port_forward_uses_interface(c,rif->interface_id))
+          return error(out,size,"egress policy cannot be set on a public RIF");
+        if(policy_index==c->egress_policy_count) {
+          if(c->egress_policy_count==ROUTER_MAX_EGRESS_POLICIES)
+            return error(out,size,"egress policy capacity reached");
+          c->egress_policies[c->egress_policy_count++]=
+              (struct router_egress_policy){q.id,rif->interface_id,q.default_allow};
+        } else c->egress_policies[policy_index].default_allow=q.default_allow;
+      } else {
+        if(policy_index==c->egress_policy_count)
+          return error(out,size,"egress policy not configured");
+        if(q.op==EGRESS_POLICY_DELETE) {
+          for(size_t i=0;i<c->egress_rule_count;i++)
+            if(c->egress_rules[i].vr_id==q.id &&
+               c->egress_rules[i].interface_id==rif->interface_id)
+              return error(out,size,"delete egress rules before policy");
+          memmove(&c->egress_policies[policy_index],
+                  &c->egress_policies[policy_index+1],
+                  (--c->egress_policy_count-policy_index)*
+                  sizeof(c->egress_policies[0]));
+        } else {
+          size_t i=0;
+          for(;i<c->egress_rule_count;i++)
+            if(c->egress_rules[i].vr_id==q.id &&
+               c->egress_rules[i].interface_id==rif->interface_id &&
+               c->egress_rules[i].rule_id==q.rule_id) break;
+          if(q.op==EGRESS_RULE_DELETE) {
+            if(i==c->egress_rule_count)
+              return error(out,size,"egress rule not found");
+            memmove(&c->egress_rules[i],&c->egress_rules[i+1],
+                    (--c->egress_rule_count-i)*sizeof(c->egress_rules[0]));
+          } else {
+            if(i!=c->egress_rule_count)
+              return error(out,size,"egress rule ID already exists on interface");
+            if(c->egress_rule_count==ROUTER_MAX_EGRESS_RULES)
+              return error(out,size,"egress rule capacity reached");
+            c->egress_rules[c->egress_rule_count++]=(struct router_egress_rule){
+                .vr_id=q.id,.interface_id=rif->interface_id,.rule_id=q.rule_id,
+                .source=q.source,.destination=q.destination,
+                .source_prefix=q.source_prefix,
+                .destination_prefix=q.destination_prefix,
+                .protocol=q.protocol,.port_first=q.port_first,
+                .port_last=q.port_last,.icmp_type=q.icmp_type,
+                .icmp_code=q.icmp_code,.allow=q.allow};
+          }
+        }
+      }
     } else if(q.op==ATTACH_PORT || q.op==ATTACH_SWITCH || q.op==ATTACH_LINK) {
       if(rif) return error(out,size,"interface name already exists in VR");
       if(c->interface_count==ROUTER_MAX_INTERFACES || c->next_interface_id>UINT16_MAX)
@@ -583,8 +763,9 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           return error(out,size,"attachment type mismatch");
         if(rif->has_address || routes_reference(c,rif->interface_id) ||
            nat_references(c,rif->interface_id) ||
-           router_port_forward_uses_interface(c,rif->interface_id))
-          return error(out,size,"remove NAT, port-forward, IP and route dependencies before detach");
+           router_port_forward_uses_interface(c,rif->interface_id) ||
+           egress_references(c,rif->interface_id))
+          return error(out,size,"remove NAT, port-forward, egress policy, IP and route dependencies before detach");
         size_t i=(size_t)(rif-c->interfaces);
         memmove(rif,rif+1,(--c->interface_count-i)*sizeof(*rif));
       } else if(q.op==IP_ADD) {
@@ -642,6 +823,8 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         if((rif->attachment!=ROUTER_PORT &&
             rif->attachment!=ROUTER_VSWITCH) || !rif->has_address)
           return error(out,size,"NAT interface must be an addressed public port-link or vs-link");
+        if(egress_references(c,rif->interface_id))
+          return error(out,size,"NAT public RIF cannot have a guest egress policy");
         if(!default_route_uses(c,q.id,rif->interface_id))
           return error(out,size,"NAT interface must own the VR default route");
         if(!q.address_from_interface && q.address!=rif->address)
@@ -654,6 +837,8 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
           .port_first=q.port_first,.port_last=q.port_last};
       } else if(q.op==PF_ADD) {
         const struct router_nat_policy *active_nat=router_nat_policy_find(c,q.id);
+        if(egress_references(c,rif->interface_id))
+          return error(out,size,"port-forward public RIF cannot have a guest egress policy");
         if((rif->attachment!=ROUTER_PORT && rif->attachment!=ROUTER_VSWITCH) ||
            !rif->has_address)
           return error(out,size,"port-forward interface must be an addressed public port-link or vs-link");

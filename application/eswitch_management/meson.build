@@ -43,6 +43,7 @@ executable(
     'router/router.c',
     'router/router_arp.c',
     'router/router_forward.c',
+    'router/router_egress.c',
     'router/router_icmp.c',
     'router/router_neighbor.c',
     'router/router_pending.c',
@@ -145,6 +146,15 @@ nat_test = executable(
   install: false,
 )
 test('eswitch-router-nat', nat_test)
+
+egress_test = executable(
+  'eswitch-router-egress-test',
+  ['router/router_egress_test.c', 'router/router_egress.c',
+   'router/router.c', 'router/router_state.c'],
+  build_by_default: false,
+  install: false,
+)
+test('eswitch-router-egress', egress_test)
 
 shared_wan_test = executable(
   'eswitch-router-shared-wan-test',
