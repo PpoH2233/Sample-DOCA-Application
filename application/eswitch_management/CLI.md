@@ -664,11 +664,11 @@ eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 101 \
 eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 102 \
   --action allow --protocol udp --destination 0.0.0.0/0 --port-range 53
 eswitchctl vr egress rule add --id 1 --interface SW100 --rule-id 103 \
-  --action allow --protocol icmp --icmp-type 8 --icmp-code 0
+  --action allow --protocol icmp
 eswitchctl vr egress policy set --id 1 --interface SW100 --default deny
 eswitchctl vr egress policy show --id 1 --interface SW100
 eswitchctl vr egress rule show --id 1 --interface SW100
-eswitchctl status | grep guest_egress
+eswitchctl status | grep -E 'guest_egress|egress_acl'
 ```
 
 For teardown, delete each rule, then `vr egress policy delete --id 1
@@ -676,10 +676,22 @@ For teardown, delete each rule, then `vr egress policy delete --id 1
 guest VS, because it is classified by **source guest RIF** before route
 selection; same-VS L2 traffic does not traverse the VR. Hardware route/CT
 promotion for a VR with any guest egress policy is disabled so an existing
-fast path cannot bypass the software ACL. Rule changes flush current NAT/CT
+fast path cannot bypass the authoritative Arm policy. Rule changes flush NAT/CT
 sessions. The policies and rules persist in `eswitch.conf.router` under
-`router-state 5`; older state versions still load. Hardware ACL offload and
-CloudStack wrapper integration are not included in this phase.
+`router-state 5`; older state versions still load.
+
+`vr egress policy set` and `vr egress rule add` inject a DOCA Flow ACL
+generation for the guest RIF, independent of `ESWITCH_HW_ROUTING`. A lower
+`rule-id` has higher priority. IPv4 CIDRs and protocol matches, plus TCP/UDP
+destination port ranges, are compiled into hardware entries. Hardware **deny** drops
+immediately. Hardware allow and default-allow continue to Arm for a second
+policy check and routing/NAT, so this phase is an enforcement offload, not a
+full routed fast path. Local router IPs in the same VR bypass the policy,
+including IPs on its other interfaces. When ACL creation fails, a policy uses
+ICMP type/code matching, or its VR has port-forward rules, the entire guest
+RIF uses the Arm policy checker. `egress_acl=ready active_policies=...` confirms
+which policies were injected; `fallback_policies` identifies Arm-only ones.
+No CloudStack wrapper changes are included.
 
 #### 5.8.1 VR and interface lifecycle
 

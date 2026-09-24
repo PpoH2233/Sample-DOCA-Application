@@ -63,6 +63,22 @@ struct eswitch_flood_group {
 #define ESWITCH_MAX_SF_RETURN_CONTEXTS 256U
 #define ESWITCH_MAX_CT_ADJACENCIES 1024U
 
+/* One immutable ACL generation per guest RIF. A BASIC selector is updated
+ * only after the replacement ACL has been committed. */
+struct eswitch_egress_acl {
+  uint16_t vr_id;
+  uint16_t interface_id;
+  uint16_t vswitch_id;
+  uint8_t rif_mac[6];
+  uint64_t fingerprint;
+  struct doca_flow_pipe *pipe;
+  struct eswitch_rule *rules;
+  size_t rule_count;
+  struct eswitch_rule selector;
+  bool active;
+  bool fallback_arm;
+};
+
 struct eswitch_ct_adjacency {
   uint32_t id;
   uint16_t vswitch_id;
@@ -123,6 +139,7 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *local_ip_pipe;
   struct doca_flow_pipe *route_control_pipe;
   struct doca_flow_pipe *route_selector_pipe;
+  struct doca_flow_pipe *egress_acl_selector_pipe;
   struct doca_flow_pipe *route_lpm_pipe;
   struct doca_flow_pipe *ct_dispatch_pipe;
   struct doca_flow_pipe *ct_pipe;
@@ -154,6 +171,8 @@ struct eswitch_pipeline {
   uint16_t sf_port_id;
   struct eswitch_sf_return_context
       sf_return_contexts[ESWITCH_MAX_SF_RETURN_CONTEXTS];
+  struct eswitch_egress_acl egress_acls[ROUTER_MAX_EGRESS_POLICIES];
+  uint64_t egress_acl_failures;
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -260,6 +279,11 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
     size_t route_count);
 doca_error_t eswitch_pipeline_hw_route_stats(
     const struct eswitch_pipeline *pipeline, uint64_t *lpm_misses);
+
+/* Inject the current guest-egress policy generation. Unsupported policies
+ * and resource failures are steered to the authoritative Arm checker. */
+doca_error_t eswitch_pipeline_egress_acl_sync(
+    struct eswitch_pipeline *pipeline, const struct router_config *config);
 
 /* Promote a software TCP/UDP NAT session into the bidirectional CT table.
  * Both adjacency entries are committed before the CT connection becomes

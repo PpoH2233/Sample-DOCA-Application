@@ -528,19 +528,19 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->rss_pipe};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-      .next_pipe = pipeline->hardware_routing_enabled
-          ? pipeline->route_selector_pipe : pipeline->source_guard_pipe};
+      .next_pipe = pipeline->egress_acl_selector_pipe != NULL
+          ? pipeline->egress_acl_selector_pipe : pipeline->source_guard_pipe};
   doca_error_t result;
 
   match.meta.pkt_meta = UINT32_MAX;
   memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
-  if (pipeline->hardware_routing_enabled)
+  if (pipeline->egress_acl_selector_pipe != NULL)
     match.outer.ip4.dst_ip = UINT32_MAX;
   mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.outer.eth.type = UINT16_MAX;
-  if (pipeline->hardware_routing_enabled)
+  if (pipeline->egress_acl_selector_pipe != NULL)
     mask.outer.ip4.dst_ip = UINT32_MAX;
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
@@ -666,7 +666,9 @@ static doca_error_t create_route_selector(struct eswitch_pipeline *pipeline) {
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
-                              .next_pipe = pipeline->route_control_pipe};
+                              .next_pipe = pipeline->hardware_routing_enabled
+                                  ? pipeline->route_control_pipe
+                                  : pipeline->rss_pipe};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
                                .next_pipe = pipeline->source_guard_pipe};
   doca_error_t result;
@@ -690,6 +692,378 @@ static doca_error_t create_route_selector(struct eswitch_pipeline *pipeline) {
                                    &pipeline->route_selector_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
   return result;
+}
+
+/* Only packets addressed to a guest RIF reach this selector: local RIF IPs
+ * were consumed by ESW_LOCAL_IP first. A selector miss retains the original
+ * routing/L2 path, so an unconfigured guest policy changes nothing. */
+static doca_error_t create_egress_acl_selector(
+    struct eswitch_pipeline *pipeline) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = pipeline->route_selector_pipe};
+  doca_error_t result;
+
+  match.meta.pkt_meta = UINT32_MAX;
+  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
+  mask.outer.eth.type = UINT16_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_GUEST_EGRESS_SELECT",
+                             DOCA_FLOW_PIPE_BASIC, false,
+                             ROUTER_MAX_EGRESS_POLICIES + 1U);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss,
+                                   &pipeline->egress_acl_selector_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
+}
+
+static const struct router_interface *acl_rif(
+    const struct router_config *config, uint16_t interface_id) {
+  for (size_t i = 0; i < config->interface_count; i++)
+    if (config->interfaces[i].interface_id == interface_id)
+      return &config->interfaces[i];
+  return NULL;
+}
+
+static int acl_rule_order(const void *a, const void *b) {
+  const struct router_egress_rule *const *left = a, *const *right = b;
+  return (int)(*left)->rule_id - (int)(*right)->rule_id;
+}
+
+static uint64_t acl_hash_word(uint64_t hash, uint64_t value) {
+  /* Hash individual fields, not padding in persisted structs. */
+  for (unsigned int i = 0; i < 8; i++) {
+    hash ^= (uint8_t)(value >> (i * 8));
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+static uint64_t acl_fingerprint(
+    const struct router_config *config,
+    const struct router_egress_policy *policy,
+    const struct router_egress_rule *const *rules, size_t count) {
+  uint64_t hash = UINT64_C(14695981039346656037);
+
+  hash = acl_hash_word(hash, policy->default_allow);
+  hash = acl_hash_word(hash, count);
+  for (size_t i = 0; i < config->interface_count; i++) {
+    const struct router_interface *rif = &config->interfaces[i];
+    if (rif->vr_id != policy->vr_id || !rif->has_address)
+      continue;
+    hash = acl_hash_word(hash, rif->interface_id);
+    hash = acl_hash_word(hash, rif->address);
+  }
+  for (size_t i = 0; i < count; i++) {
+    const struct router_egress_rule *rule = rules[i];
+    hash = acl_hash_word(hash, rule->rule_id);
+    hash = acl_hash_word(hash, rule->source);
+    hash = acl_hash_word(hash, rule->source_prefix);
+    hash = acl_hash_word(hash, rule->destination);
+    hash = acl_hash_word(hash, rule->destination_prefix);
+    hash = acl_hash_word(hash, rule->protocol);
+    hash = acl_hash_word(hash, rule->port_first);
+    hash = acl_hash_word(hash, rule->port_last);
+    hash = acl_hash_word(hash, (uint16_t)rule->icmp_type);
+    hash = acl_hash_word(hash, (uint16_t)rule->icmp_code);
+    hash = acl_hash_word(hash, rule->allow);
+  }
+  return hash;
+}
+
+static struct eswitch_egress_acl *acl_slot(
+    struct eswitch_pipeline *pipeline, uint16_t interface_id) {
+  struct eswitch_egress_acl *free_slot = NULL;
+
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (slot->active && slot->interface_id == interface_id)
+      return slot;
+    if (!slot->active && free_slot == NULL)
+      free_slot = slot;
+  }
+  return free_slot;
+}
+
+static bool acl_can_offload(const struct router_config *config,
+                            const struct router_egress_policy *policy,
+                            const struct router_egress_rule *const *rules,
+                            size_t count) {
+  /* Port-forward replies can override a guest deny in the Arm checker. Until
+   * the established-session exception is available before ACL, keep that VR
+   * wholly on Arm. ICMP type/code and protocol=all+port also need software. */
+  for (size_t i = 0; i < config->port_forward_count; i++)
+    if (config->port_forwards[i].vr_id == policy->vr_id)
+      return false;
+  for (size_t i = 0; i < count; i++)
+    if (rules[i]->icmp_type >= 0 || rules[i]->icmp_code >= 0 ||
+        (rules[i]->protocol == 0 && rules[i]->port_first != 0))
+      return false;
+  return true;
+}
+
+static doca_error_t acl_build_generation(
+    struct eswitch_pipeline *pipeline,
+    const struct router_config *config,
+    const struct router_egress_policy *policy,
+    const struct router_egress_rule *const *rules, size_t count,
+    struct doca_flow_pipe **pipe, struct eswitch_rule **entries) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match template = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_fwd miss = {0};
+  size_t local_count = 0, total, position = 0;
+  doca_error_t result;
+
+  *pipe = NULL;
+  *entries = NULL;
+  for (size_t i = 0; i < config->interface_count; i++)
+    if (config->interfaces[i].vr_id == policy->vr_id &&
+        config->interfaces[i].has_address)
+      local_count++;
+  total = local_count + count;
+  template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  template.outer.ip4.src_ip = UINT32_MAX;
+  template.outer.ip4.dst_ip = UINT32_MAX;
+  template.outer.ip4.next_proto = UINT8_MAX;
+  template.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  miss.type = policy->default_allow ? DOCA_FLOW_FWD_PIPE
+                                    : DOCA_FLOW_FWD_DROP;
+  if (policy->default_allow)
+    miss.next_pipe = pipeline->rss_pipe;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_GUEST_EGRESS_ACL",
+                             DOCA_FLOW_PIPE_ACL, false,
+                             total ? (uint32_t)total : 1U);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss, pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+  if (total == 0)
+    return DOCA_SUCCESS;
+  *entries = calloc(total, sizeof(**entries));
+  if (*entries == NULL) {
+    doca_flow_pipe_destroy(*pipe);
+    *pipe = NULL;
+    return DOCA_ERROR_NO_MEMORY;
+  }
+  /* Arm exempts every local IP of this VR, not just the ingress RIF IP.
+   * Insert these before user rules so a default-deny cannot intercept them. */
+  for (size_t i = 0; i < config->interface_count; i++) {
+    const struct router_interface *local = &config->interfaces[i];
+    struct doca_flow_match match = {0}, mask = {0};
+    struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                                .next_pipe = pipeline->rss_pipe};
+    if (local->vr_id != policy->vr_id || !local->has_address)
+      continue;
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.outer.ip4.dst_ip = DOCA_HTOBE32(local->address);
+    mask.outer.ip4.dst_ip = UINT32_MAX;
+    flow_entry_cookie_prepare(&(*entries)[position].cookie,
+                              "guest egress local-RIF bypass",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_acl_add_entry(
+        pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
+        (uint32_t)position, &fwd,
+        batch_flags((uint32_t)position, (uint32_t)total),
+        &(*entries)[position].cookie, &(*entries)[position].entry);
+    if (result != DOCA_SUCCESS)
+      goto build_done;
+    position++;
+  }
+  for (size_t i = 0; i < count; i++, position++) {
+    const struct router_egress_rule *rule = rules[i];
+    struct doca_flow_match match = {0}, mask = {0};
+    struct doca_flow_fwd fwd = {0};
+
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.outer.ip4.src_ip = DOCA_HTOBE32(rule->source);
+    match.outer.ip4.dst_ip = DOCA_HTOBE32(rule->destination);
+    mask.outer.ip4.src_ip = DOCA_HTOBE32(
+        ipv4_prefix_mask(rule->source_prefix));
+    mask.outer.ip4.dst_ip = DOCA_HTOBE32(
+        ipv4_prefix_mask(rule->destination_prefix));
+    if (rule->protocol != 0) {
+      match.outer.ip4.next_proto = rule->protocol;
+      mask.outer.ip4.next_proto = UINT8_MAX;
+    }
+    if (rule->port_first != 0) {
+      match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
+      /* ACL interprets the mask port as the inclusive range end. */
+      mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
+    }
+    fwd.type = rule->allow ? DOCA_FLOW_FWD_PIPE : DOCA_FLOW_FWD_DROP;
+    if (rule->allow)
+      fwd.next_pipe = pipeline->rss_pipe;
+    flow_entry_cookie_prepare(&(*entries)[position].cookie,
+                              "guest egress ACL rule", DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_acl_add_entry(
+        pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
+        (uint32_t)position, &fwd,
+        batch_flags((uint32_t)position, (uint32_t)total),
+        &(*entries)[position].cookie, &(*entries)[position].entry);
+    if (result != DOCA_SUCCESS)
+      break;
+  }
+build_done:
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, *entries, (uint32_t)total);
+  if (result != DOCA_SUCCESS) {
+    doca_flow_pipe_destroy(*pipe);
+    free(*entries);
+    *pipe = NULL;
+    *entries = NULL;
+  }
+  return result;
+}
+
+static doca_error_t acl_select_target(struct eswitch_pipeline *pipeline,
+                                      struct eswitch_egress_acl *slot,
+                                      const struct router_interface *rif,
+                                      struct doca_flow_pipe *target) {
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = target};
+  bool adding = slot->selector.entry == NULL;
+  doca_error_t result;
+
+  if (!adding) {
+    flow_entry_cookie_prepare(&slot->selector.cookie,
+                              "swap guest egress ACL", DOCA_FLOW_ENTRY_OP_UPD);
+    result = doca_flow_pipe_basic_update_entry(
+        pipeline->runtime->queue_id, pipeline->egress_acl_selector_pipe,
+        0, NULL, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        slot->selector.entry);
+  } else {
+    struct doca_flow_match match = {0};
+    match.meta.pkt_meta = DOCA_HTOBE32((uint32_t)rif->vswitch_id << 16);
+    memcpy(match.outer.eth.dst_mac, rif->mac, RTE_ETHER_ADDR_LEN);
+    match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+    flow_entry_cookie_prepare(&slot->selector.cookie,
+                              "select guest egress ACL", DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_basic_add_entry(
+        pipeline->runtime->queue_id, pipeline->egress_acl_selector_pipe,
+        &match, 0, NULL, NULL, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        &slot->selector.cookie, &slot->selector.entry);
+  }
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = process_rules(pipeline, &slot->selector, 1);
+  if (result != DOCA_SUCCESS && adding)
+    (void)remove_rule(pipeline, &slot->selector,
+                      "rollback guest egress ACL selector");
+  return result;
+}
+
+doca_error_t eswitch_pipeline_egress_acl_sync(
+    struct eswitch_pipeline *pipeline, const struct router_config *config) {
+  if (pipeline == NULL || config == NULL || !pipeline->created)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (pipeline->egress_acl_selector_pipe == NULL)
+    return DOCA_SUCCESS; /* Existing Arm policy remains authoritative. */
+
+  for (size_t p = 0; p < config->egress_policy_count; p++) {
+    const struct router_egress_policy *policy = &config->egress_policies[p];
+    const struct router_interface *rif = acl_rif(config, policy->interface_id);
+    const struct router_egress_rule *ordered[ROUTER_MAX_EGRESS_RULES];
+    struct eswitch_egress_acl *slot = acl_slot(pipeline, policy->interface_id);
+    struct doca_flow_pipe *next_pipe = NULL, *old_pipe;
+    struct eswitch_rule *next_rules = NULL, *old_rules;
+    uint64_t fingerprint;
+    size_t count = 0;
+    bool fallback;
+    doca_error_t result;
+
+    if (rif == NULL || rif->attachment != ROUTER_VSWITCH || slot == NULL)
+      return DOCA_ERROR_BAD_STATE;
+    /* An address may be staged after policy creation. No RIF data-plane
+     * context exists yet, so there is nothing to select or offload. */
+    if (!rif->has_address)
+      continue;
+    for (size_t i = 0; i < config->egress_rule_count; i++)
+      if (config->egress_rules[i].vr_id == policy->vr_id &&
+          config->egress_rules[i].interface_id == policy->interface_id)
+        ordered[count++] = &config->egress_rules[i];
+    qsort(ordered, count, sizeof(ordered[0]), acl_rule_order);
+    fingerprint = acl_fingerprint(config, policy, ordered, count);
+    fallback = !acl_can_offload(config, policy, ordered, count);
+    if (slot->active && slot->vr_id == policy->vr_id &&
+        slot->vswitch_id == rif->vswitch_id &&
+        memcmp(slot->rif_mac, rif->mac, 6) == 0 &&
+        slot->fingerprint == fingerprint &&
+        slot->fallback_arm == fallback)
+      continue;
+    if (!fallback) {
+      result = acl_build_generation(pipeline, config, policy, ordered, count,
+                                    &next_pipe, &next_rules);
+      if (result != DOCA_SUCCESS) {
+        pipeline->egress_acl_failures++;
+        fprintf(stderr, "Guest egress ACL fallback: vr=%u rif=%u error=%s\n",
+                policy->vr_id, policy->interface_id,
+                doca_error_get_descr(result));
+        fallback = true;
+      }
+    }
+    result = acl_select_target(pipeline, slot, rif,
+                               fallback ? pipeline->rss_pipe : next_pipe);
+    if (result != DOCA_SUCCESS) {
+      if (next_pipe != NULL)
+        doca_flow_pipe_destroy(next_pipe);
+      free(next_rules);
+      return result;
+    }
+    old_pipe = slot->pipe;
+    old_rules = slot->rules;
+    slot->vr_id = policy->vr_id;
+    slot->interface_id = policy->interface_id;
+    slot->vswitch_id = rif->vswitch_id;
+    memcpy(slot->rif_mac, rif->mac, 6);
+    slot->fingerprint = fingerprint;
+    slot->pipe = next_pipe;
+    slot->rules = next_rules;
+    slot->rule_count = fallback ? 0 : count;
+    slot->fallback_arm = fallback;
+    slot->active = true;
+    if (old_pipe != NULL)
+      doca_flow_pipe_destroy(old_pipe);
+    free(old_rules);
+  }
+  for (size_t s = 0; s < ROUTER_MAX_EGRESS_POLICIES; s++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[s];
+    bool keep = false;
+    doca_error_t result;
+
+    if (!slot->active)
+      continue;
+    for (size_t p = 0; p < config->egress_policy_count; p++)
+      if (config->egress_policies[p].interface_id == slot->interface_id)
+        keep = true;
+    if (keep)
+      continue;
+    result = remove_rule(pipeline, &slot->selector,
+                         "remove guest egress selector");
+    if (result != DOCA_SUCCESS)
+      return result;
+    if (slot->pipe != NULL)
+      doca_flow_pipe_destroy(slot->pipe);
+    free(slot->rules);
+    *slot = (struct eswitch_egress_acl){0};
+  }
+  return DOCA_SUCCESS;
 }
 
 static doca_error_t add_route_selector_rule(
@@ -1057,7 +1431,7 @@ static doca_error_t bind_sf_return_context(
     local_match.meta.pkt_meta =
         DOCA_HTOBE32((uint32_t)vswitch_id << 16);
     memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
-    if (pipeline->hardware_routing_enabled)
+    if (pipeline->egress_acl_selector_pipe != NULL)
       local_match.outer.ip4.dst_ip = DOCA_HTOBE32(rif_address);
     flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
                               "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
@@ -1082,15 +1456,15 @@ static doca_error_t bind_sf_return_context(
                               "rollback SF return context");
       return cleanup == DOCA_SUCCESS ? original_error : cleanup;
     }
-    if (pipeline->hardware_routing_enabled) {
+    if (pipeline->route_selector_pipe != NULL) {
       free_context->vr_id = vr_id;
       free_context->interface_id = interface_id;
       free_context->vswitch_id = vswitch_id;
       free_context->rif_address = rif_address;
       memcpy(free_context->rif_mac, rif_mac, 6);
-      /* Install the selector first. Its control-pipe miss is the RSS/Arm
-       * fallback, so the RIF remains functional when the optional eligibility
-       * action cannot be allocated. */
+      /* Install the RIF selector first. Without LPM, its hit goes to RSS;
+       * with LPM, route-control fallback still reaches RSS when optional
+       * eligibility cannot be allocated. */
       result = add_route_selector_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
         doca_error_t original_error = result;
@@ -1105,7 +1479,8 @@ static doca_error_t bind_sf_return_context(
                                 "rollback SF return context");
         return cleanup == DOCA_SUCCESS ? original_error : cleanup;
       }
-      result = add_route_eligible_rule(pipeline, free_context);
+      if (pipeline->hardware_routing_enabled)
+        result = add_route_eligible_rule(pipeline, free_context);
       if (result != DOCA_SUCCESS) {
         /* Hardware routing is optional. Preserve SF return and local-IP
          * entries, and preserve the selector so its fallback sends this RIF
@@ -1228,6 +1603,20 @@ doca_error_t eswitch_pipeline_sf_unbind_rif(
     struct eswitch_pipeline *pipeline, uint16_t interface_id) {
   if (pipeline == NULL || !pipeline->created || interface_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    doca_error_t result;
+    if (!slot->active || slot->interface_id != interface_id)
+      continue;
+    result = remove_rule(pipeline, &slot->selector,
+                         "unbind guest egress ACL selector");
+    if (result != DOCA_SUCCESS)
+      return result;
+    if (slot->pipe != NULL)
+      doca_flow_pipe_destroy(slot->pipe);
+    free(slot->rules);
+    *slot = (struct eswitch_egress_acl){0};
+  }
   for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
     struct eswitch_sf_return_context *context =
         &pipeline->sf_return_contexts[i];
@@ -1735,21 +2124,14 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
       printf("Creating eSwitch stage: router eligibility\n");
       result = create_route_control(pipeline);
     }
-    if (result == DOCA_SUCCESS) {
-      printf("Creating eSwitch stage: router MAC selector\n");
-      result = create_route_selector(pipeline);
-    }
     if (result != DOCA_SUCCESS) {
       fprintf(stderr, "Hardware routing unavailable (%s); continuing with "
                       "Arm slow path\n",
               doca_error_get_descr(result));
-      if (pipeline->route_selector_pipe != NULL)
-        doca_flow_pipe_destroy(pipeline->route_selector_pipe);
       if (pipeline->route_control_pipe != NULL)
         doca_flow_pipe_destroy(pipeline->route_control_pipe);
       if (pipeline->route_lpm_pipe != NULL)
         doca_flow_pipe_destroy(pipeline->route_lpm_pipe);
-      pipeline->route_selector_pipe = NULL;
       pipeline->route_control_pipe = NULL;
       pipeline->route_lpm_pipe = NULL;
       pipeline->hardware_routing_enabled = false;
@@ -1757,6 +2139,37 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
       pipeline->hw_route_failures++;
       if (pipeline->hardware_ct_enabled)
         pipeline->hardware_ct_degraded = true;
+    }
+  }
+  /* The ACL selector is useful even when LPM is disabled. Its route-selector
+   * hit then goes to RSS, preserving the existing Arm routing semantics. */
+  printf("Creating eSwitch stage: router MAC selector\n");
+  result = create_route_selector(pipeline);
+  if (result == DOCA_SUCCESS) {
+    printf("Creating eSwitch stage: guest egress ACL selector\n");
+    result = create_egress_acl_selector(pipeline);
+  }
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Guest egress ACL selector unavailable (%s); "
+                    "continuing with Arm slow path\n",
+            doca_error_get_descr(result));
+    if (pipeline->egress_acl_selector_pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->egress_acl_selector_pipe);
+    if (pipeline->route_selector_pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->route_selector_pipe);
+    pipeline->egress_acl_selector_pipe = NULL;
+    pipeline->route_selector_pipe = NULL;
+    pipeline->egress_acl_failures++;
+    if (pipeline->hardware_routing_enabled) {
+      if (pipeline->route_control_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->route_control_pipe);
+      if (pipeline->route_lpm_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->route_lpm_pipe);
+      pipeline->route_control_pipe = NULL;
+      pipeline->route_lpm_pipe = NULL;
+      pipeline->hardware_routing_enabled = false;
+      pipeline->hardware_routing_degraded = true;
+      pipeline->hw_route_failures++;
     }
   }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
@@ -1808,6 +2221,13 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->arp_dispatch_pipe);
   if (pipeline->local_ip_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->local_ip_pipe);
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    if (pipeline->egress_acls[i].pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->egress_acls[i].pipe);
+    free(pipeline->egress_acls[i].rules);
+  }
+  if (pipeline->egress_acl_selector_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->egress_acl_selector_pipe);
   if (pipeline->route_selector_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->route_selector_pipe);
   if (pipeline->route_control_pipe != NULL)

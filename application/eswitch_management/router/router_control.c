@@ -140,6 +140,12 @@ static void rollback_prearmed_candidate(struct eswitch_manager *m,
     if(result!=DOCA_SUCCESS)
       fprintf(stderr,"Router rollback pre-arm failed: %s\n",
               doca_error_get_descr(result));
+    else {
+      result=eswitch_pipeline_egress_acl_sync(m->pipeline,m->router);
+      if(result!=DOCA_SUCCESS)
+        fprintf(stderr,"Router rollback egress ACL failed: %s\n",
+                doca_error_get_descr(result));
+    }
   }
 }
 doca_error_t router_control_restore(struct eswitch_manager *m) {
@@ -248,6 +254,14 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       doca_error_t result=eswitch_manager_router_prearm(m,candidate);
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR router SF context pre-arm failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
+      doca_error_t result=eswitch_pipeline_egress_acl_sync(m->pipeline,candidate);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR guest egress ACL transaction failed: %s\n",
                  doca_error_get_descr(result));
         ok=false;
       }

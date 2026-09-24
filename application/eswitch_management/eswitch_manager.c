@@ -562,6 +562,9 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
     result = eswitch_manager_router_prepare(manager, manager->router,
                                             manager->started_ns);
   if (result == DOCA_SUCCESS)
+    result = eswitch_pipeline_egress_acl_sync(manager->pipeline,
+                                              manager->router);
+  if (result == DOCA_SUCCESS)
     result = eswitch_manager_hw_routes_sync(manager, manager->router);
   if (result != DOCA_SUCCESS)
     fprintf(stderr, "Failed to restore eSwitch configuration %s: %s\n",
@@ -1906,6 +1909,9 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t assignable_port_count = 0;
   size_t sf_return_count = 0;
   size_t sf_directed_count = 0;
+  size_t egress_acl_active = 0;
+  size_t egress_acl_fallback = 0;
+  size_t egress_acl_rules = 0;
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
@@ -1922,6 +1928,14 @@ static size_t format_status(const struct eswitch_manager *manager,
 
   for (size_t i = 0; i < ESWITCH_MAX_VSWITCHES; i++)
     switch_count += manager->switches[i].exists ? 1U : 0U;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    const struct eswitch_egress_acl *acl = &manager->pipeline->egress_acls[i];
+    if (!acl->active)
+      continue;
+    egress_acl_active += acl->pipe != NULL;
+    egress_acl_fallback += acl->fallback_arm;
+    egress_acl_rules += acl->rule_count;
+  }
   for (uint16_t i = 0; i < manager->ports->count; i++) {
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
     if (port->role == ETHERNET_PORT_ROLE_SF_REPRESENTOR)
@@ -2085,11 +2099,19 @@ static size_t format_status(const struct eswitch_manager *manager,
       "guest_egress=%s policies=%zu rules=%zu checked=%" PRIu64
       " allowed=%" PRIu64 " denied=%" PRIu64
       " established_pf_replies=%" PRIu64 "\n",
-      manager->router->egress_policy_count ? "arm-pre-route" : "disabled",
+      !manager->router->egress_policy_count ? "disabled" :
+          (egress_acl_active ? "doca-acl-deny-plus-arm-recheck" :
+                               "arm-pre-route"),
       manager->router->egress_policy_count,
       manager->router->egress_rule_count,manager->egress_checked,
       manager->egress_allowed,manager->egress_denied,
       manager->egress_established_replies);
+  used = append_text(response, size, used,
+      "egress_acl=%s active_policies=%zu fallback_policies=%zu "
+      "hw_rules=%zu failures=%" PRIu64 " arm_recheck=enabled\n",
+      manager->pipeline->egress_acl_selector_pipe != NULL ? "ready" : "off",
+      egress_acl_active, egress_acl_fallback, egress_acl_rules,
+      manager->pipeline->egress_acl_failures);
   used = append_text(response, size, used,
       "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
       " max_hops=%u\n", manager->router_link_forwards,
