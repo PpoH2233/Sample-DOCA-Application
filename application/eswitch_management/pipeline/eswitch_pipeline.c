@@ -826,6 +826,8 @@ static doca_error_t acl_build_generation(
     struct doca_flow_pipe **pipe, struct eswitch_rule **entries) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match template = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_actions *actions_array[1] = {&actions};
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
   size_t local_count = 0, total, position = 0;
@@ -843,6 +845,7 @@ static doca_error_t acl_build_generation(
   for (size_t i = 0; i < count; i++)
     if (rules[i]->port_first != 0)
       has_port_match = true;
+  template.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
   template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   template.outer.ip4.src_ip = UINT32_MAX;
   template.outer.ip4.dst_ip = UINT32_MAX;
@@ -870,6 +873,10 @@ static doca_error_t acl_build_generation(
   if (result == DOCA_SUCCESS) {
     stage = "pipe-config-match";
     result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
+  }
+  if (result == DOCA_SUCCESS) {
+    stage = "pipe-config-actions";
+    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
   }
   if (result == DOCA_SUCCESS) {
     stage = "pipe-create";
@@ -978,12 +985,15 @@ static doca_error_t acl_build_pf_reply_pipe(
     struct doca_flow_pipe **reply_pipe) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_actions *actions_array[1] = {&actions};
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
                                .next_pipe = acl_pipe};
   doca_error_t result;
 
   *reply_pipe = NULL;
+  match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   match.outer.ip4.src_ip = UINT32_MAX;
   match.outer.ip4.dst_ip = UINT32_MAX;
@@ -997,6 +1007,8 @@ static doca_error_t acl_build_pf_reply_pipe(
                              false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, &hit, &miss, reply_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
