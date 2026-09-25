@@ -757,6 +757,9 @@ static uint64_t acl_fingerprint(
 
   hash = acl_hash_word(hash, policy->default_allow);
   hash = acl_hash_word(hash, count);
+  for (size_t i = 0; i < config->port_forward_count; i++)
+    if (config->port_forwards[i].vr_id == policy->vr_id)
+      hash = acl_hash_word(hash, UINT64_C(0x50465245504c59));
   for (size_t i = 0; i < config->interface_count; i++) {
     const struct router_interface *rif = &config->interfaces[i];
     if (rif->vr_id != policy->vr_id || !rif->has_address)
@@ -795,16 +798,19 @@ static struct eswitch_egress_acl *acl_slot(
   return free_slot;
 }
 
+static doca_error_t acl_select_target(struct eswitch_pipeline *pipeline,
+                                      struct eswitch_egress_acl *slot,
+                                      const struct router_interface *rif,
+                                      struct doca_flow_pipe *target);
+
 static bool acl_can_offload(const struct router_config *config,
                             const struct router_egress_policy *policy,
                             const struct router_egress_rule *const *rules,
                             size_t count) {
-  /* Port-forward replies can override a guest deny in the Arm checker. Until
-   * the established-session exception is available before ACL, keep that VR
-   * wholly on Arm. ICMP type/code and protocol=all+port also need software. */
-  for (size_t i = 0; i < config->port_forward_count; i++)
-    if (config->port_forwards[i].vr_id == policy->vr_id)
-      return false;
+  /* ICMP type/code and protocol=all+port still need software. Port-forward
+   * replies use an exact, session-owned pipe before this ACL. */
+  (void)config;
+  (void)policy;
   for (size_t i = 0; i < count; i++)
     if (rules[i]->icmp_type >= 0 || rules[i]->icmp_code >= 0 ||
         (rules[i]->protocol == 0 && rules[i]->port_first != 0))
@@ -932,6 +938,211 @@ build_done:
   return result;
 }
 
+/* A separate ACL pipe is used for the TCP/UDP reply 5-tuples because an ACL
+ * pipe can match both protocols. Its miss goes to the guest egress ACL; hits
+ * go to Arm, where the session is checked again and reverse NAT is applied.
+ * This costs one extra lookup but avoids reserving a CT/NAT action per reply. */
+static doca_error_t acl_build_pf_reply_pipe(
+    struct eswitch_pipeline *pipeline, struct doca_flow_pipe *acl_pipe,
+    struct doca_flow_pipe **reply_pipe) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = acl_pipe};
+  doca_error_t result;
+
+  *reply_pipe = NULL;
+  match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  match.outer.ip4.src_ip = UINT32_MAX;
+  match.outer.ip4.dst_ip = UINT32_MAX;
+  match.outer.ip4.next_proto = UINT8_MAX;
+  match.outer.tcp.l4_port.src_port = UINT16_MAX;
+  match.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_PF_REPLY_EXACT", DOCA_FLOW_PIPE_ACL,
+                             false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss, reply_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  return result;
+}
+
+static bool acl_pf_reply_same_session(
+    const struct eswitch_pf_reply_exception *entry,
+    const struct router_nat_session *session) {
+  return session != NULL && entry->session == session && session->used &&
+         session->port_forward && entry->vr_id == session->vr_id &&
+         entry->protocol == session->protocol &&
+         entry->inside_ip == session->inside_ip &&
+         entry->inside_port == session->inside_port &&
+         entry->remote_ip == session->remote_ip &&
+         entry->remote_port == session->remote_port;
+}
+
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_prune(
+    struct eswitch_pipeline *pipeline) {
+  if (pipeline == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (slot->pf_replies == NULL)
+      continue;
+    for (size_t j = 0; j < ESWITCH_MAX_PF_REPLY_EXCEPTIONS; j++) {
+      struct eswitch_pf_reply_exception *entry = &slot->pf_replies[j];
+      doca_error_t result;
+      if (entry->rule.entry == NULL ||
+          acl_pf_reply_same_session(entry, entry->session))
+        continue;
+      result = remove_rule(pipeline, &entry->rule,
+                           "remove stale port-forward reply exception");
+      if (result != DOCA_SUCCESS)
+        return result;
+      *entry = (struct eswitch_pf_reply_exception){0};
+      slot->pf_reply_count--;
+    }
+  }
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_flush(
+    struct eswitch_pipeline *pipeline) {
+  if (pipeline == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (slot->pf_replies == NULL)
+      continue;
+    for (size_t j = 0; j < ESWITCH_MAX_PF_REPLY_EXCEPTIONS; j++) {
+      struct eswitch_pf_reply_exception *entry = &slot->pf_replies[j];
+      doca_error_t result;
+      if (entry->rule.entry == NULL)
+        continue;
+      result = remove_rule(pipeline, &entry->rule,
+                           "flush port-forward reply exception");
+      if (result != DOCA_SUCCESS)
+        return result;
+      *entry = (struct eswitch_pf_reply_exception){0};
+    }
+    slot->pf_reply_count = 0;
+  }
+  return DOCA_SUCCESS;
+}
+
+static doca_error_t acl_pf_reply_fallback(
+    struct eswitch_pipeline *pipeline, const struct router_config *config,
+    struct eswitch_egress_acl *slot) {
+  const struct router_interface *rif = acl_rif(config, slot->interface_id);
+  doca_error_t result;
+
+  if (rif == NULL)
+    return DOCA_ERROR_BAD_STATE;
+  /* Swap to Arm before destroying either pipe. This also protects existing
+   * sessions when the exception table is full or a hardware add fails. */
+  result = acl_select_target(pipeline, slot, rif, pipeline->rss_pipe);
+  if (result != DOCA_SUCCESS)
+    return result;
+  if (slot->pf_reply_pipe != NULL)
+    doca_flow_pipe_destroy(slot->pf_reply_pipe);
+  if (slot->pipe != NULL)
+    doca_flow_pipe_destroy(slot->pipe);
+  free(slot->pf_replies);
+  free(slot->rules);
+  slot->pf_reply_pipe = NULL;
+  slot->pipe = NULL;
+  slot->pf_replies = NULL;
+  slot->rules = NULL;
+  slot->pf_reply_count = 0;
+  slot->rule_count = 0;
+  slot->fallback_arm = true;
+  pipeline->egress_acl_pf_reply_fallbacks++;
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
+    struct eswitch_pipeline *pipeline, const struct router_config *config,
+    uint16_t guest_interface_id, const struct router_nat_session *session) {
+  struct eswitch_egress_acl *slot = NULL;
+  struct eswitch_pf_reply_exception *free_entry = NULL;
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
+  doca_error_t result;
+
+  if (pipeline == NULL || config == NULL || session == NULL ||
+      !session->used || !session->port_forward ||
+      (session->protocol != IPPROTO_TCP && session->protocol != IPPROTO_UDP))
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++)
+    if (pipeline->egress_acls[i].active &&
+        pipeline->egress_acls[i].interface_id == guest_interface_id &&
+        pipeline->egress_acls[i].vr_id == session->vr_id) {
+      slot = &pipeline->egress_acls[i];
+      break;
+    }
+  if (slot == NULL || slot->fallback_arm || slot->pf_reply_pipe == NULL)
+    return DOCA_SUCCESS;
+  if (session->inside_port == 0 || session->remote_port == 0) {
+    result = DOCA_ERROR_NOT_SUPPORTED;
+    goto fallback;
+  }
+  fwd.next_pipe = pipeline->rss_pipe;
+  result = eswitch_pipeline_egress_acl_pf_reply_prune(pipeline);
+  if (result != DOCA_SUCCESS)
+    goto fallback;
+  for (size_t i = 0; i < ESWITCH_MAX_PF_REPLY_EXCEPTIONS; i++) {
+    struct eswitch_pf_reply_exception *entry = &slot->pf_replies[i];
+    if (entry->rule.entry != NULL &&
+        acl_pf_reply_same_session(entry, session))
+      return DOCA_SUCCESS;
+    if (entry->rule.entry == NULL && free_entry == NULL)
+      free_entry = entry;
+  }
+  if (free_entry == NULL) {
+    result = DOCA_ERROR_NO_MEMORY;
+    goto fallback;
+  }
+  match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  match.outer.ip4.src_ip = DOCA_HTOBE32(session->inside_ip);
+  match.outer.ip4.dst_ip = DOCA_HTOBE32(session->remote_ip);
+  match.outer.ip4.next_proto = session->protocol;
+  match.outer.tcp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
+  match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
+  mask.outer.ip4.src_ip = UINT32_MAX;
+  mask.outer.ip4.dst_ip = UINT32_MAX;
+  mask.outer.ip4.next_proto = UINT8_MAX;
+  /* For an ACL entry, equal match/mask ports mean exact port matches. */
+  mask.outer.tcp.l4_port.src_port = match.outer.tcp.l4_port.src_port;
+  mask.outer.tcp.l4_port.dst_port = match.outer.tcp.l4_port.dst_port;
+  flow_entry_cookie_prepare(&free_entry->rule.cookie,
+                            "port-forward reply exception", DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_acl_add_entry(
+      pipeline->runtime->queue_id, slot->pf_reply_pipe, &match, &mask, 0,
+      NULL, 0, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      &free_entry->rule.cookie, &free_entry->rule.entry);
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, &free_entry->rule, 1);
+  if (result != DOCA_SUCCESS)
+    goto fallback;
+  free_entry->session = session;
+  free_entry->vr_id = session->vr_id;
+  free_entry->protocol = session->protocol;
+  free_entry->inside_ip = session->inside_ip;
+  free_entry->inside_port = session->inside_port;
+  free_entry->remote_ip = session->remote_ip;
+  free_entry->remote_port = session->remote_port;
+  slot->pf_reply_count++;
+  return DOCA_SUCCESS;
+fallback:
+  pipeline->egress_acl_failures++;
+  fprintf(stderr, "Port-forward reply ACL fallback: vr=%u rif=%u error=%s\n",
+          session->vr_id, guest_interface_id, doca_error_get_descr(result));
+  return acl_pf_reply_fallback(pipeline, config, slot);
+}
+
 static doca_error_t acl_select_target(struct eswitch_pipeline *pipeline,
                                       struct eswitch_egress_acl *slot,
                                       const struct router_interface *rif,
@@ -982,10 +1193,13 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     const struct router_egress_rule *ordered[ROUTER_MAX_EGRESS_RULES];
     struct eswitch_egress_acl *slot = acl_slot(pipeline, policy->interface_id);
     struct doca_flow_pipe *next_pipe = NULL, *old_pipe;
+    struct doca_flow_pipe *next_pf_pipe = NULL, *old_pf_pipe;
     struct eswitch_rule *next_rules = NULL, *old_rules;
+    struct eswitch_pf_reply_exception *next_pf_replies = NULL;
+    struct eswitch_pf_reply_exception *old_pf_replies;
     uint64_t fingerprint;
     size_t count = 0;
-    bool fallback;
+    bool fallback, has_pf = false;
     doca_error_t result;
 
     if (rif == NULL || rif->attachment != ROUTER_VSWITCH || slot == NULL)
@@ -999,6 +1213,9 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
           config->egress_rules[i].interface_id == policy->interface_id)
         ordered[count++] = &config->egress_rules[i];
     qsort(ordered, count, sizeof(ordered[0]), acl_rule_order);
+    for (size_t i = 0; i < config->port_forward_count; i++)
+      if (config->port_forwards[i].vr_id == policy->vr_id)
+        has_pf = true;
     fingerprint = acl_fingerprint(config, policy, ordered, count);
     fallback = !acl_can_offload(config, policy, ordered, count);
     if (slot->active && slot->vr_id == policy->vr_id &&
@@ -1010,36 +1227,67 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     if (!fallback) {
       result = acl_build_generation(pipeline, config, policy, ordered, count,
                                     &next_pipe, &next_rules);
+      if (result == DOCA_SUCCESS && has_pf) {
+        result = acl_build_pf_reply_pipe(pipeline, next_pipe, &next_pf_pipe);
+        if (result == DOCA_SUCCESS) {
+          next_pf_replies = calloc(ESWITCH_MAX_PF_REPLY_EXCEPTIONS,
+                                   sizeof(*next_pf_replies));
+          if (next_pf_replies == NULL)
+            result = DOCA_ERROR_NO_MEMORY;
+        }
+      }
       if (result != DOCA_SUCCESS) {
         pipeline->egress_acl_failures++;
         fprintf(stderr, "Guest egress ACL fallback: vr=%u rif=%u error=%s\n",
                 policy->vr_id, policy->interface_id,
                 doca_error_get_descr(result));
+        if (next_pf_pipe != NULL)
+          doca_flow_pipe_destroy(next_pf_pipe);
+        if (next_pipe != NULL)
+          doca_flow_pipe_destroy(next_pipe);
+        free(next_pf_replies);
+        free(next_rules);
+        next_pf_pipe = NULL;
+        next_pipe = NULL;
+        next_pf_replies = NULL;
+        next_rules = NULL;
         fallback = true;
       }
     }
     result = acl_select_target(pipeline, slot, rif,
-                               fallback ? pipeline->rss_pipe : next_pipe);
+                               fallback ? pipeline->rss_pipe :
+                               (next_pf_pipe != NULL ? next_pf_pipe : next_pipe));
     if (result != DOCA_SUCCESS) {
+      if (next_pf_pipe != NULL)
+        doca_flow_pipe_destroy(next_pf_pipe);
       if (next_pipe != NULL)
         doca_flow_pipe_destroy(next_pipe);
+      free(next_pf_replies);
       free(next_rules);
       return result;
     }
     old_pipe = slot->pipe;
+    old_pf_pipe = slot->pf_reply_pipe;
     old_rules = slot->rules;
+    old_pf_replies = slot->pf_replies;
     slot->vr_id = policy->vr_id;
     slot->interface_id = policy->interface_id;
     slot->vswitch_id = rif->vswitch_id;
     memcpy(slot->rif_mac, rif->mac, 6);
     slot->fingerprint = fingerprint;
     slot->pipe = next_pipe;
+    slot->pf_reply_pipe = next_pf_pipe;
     slot->rules = next_rules;
+    slot->pf_replies = next_pf_replies;
+    slot->pf_reply_count = 0;
     slot->rule_count = fallback ? 0 : count;
     slot->fallback_arm = fallback;
     slot->active = true;
+    if (old_pf_pipe != NULL)
+      doca_flow_pipe_destroy(old_pf_pipe);
     if (old_pipe != NULL)
       doca_flow_pipe_destroy(old_pipe);
+    free(old_pf_replies);
     free(old_rules);
   }
   for (size_t s = 0; s < ROUTER_MAX_EGRESS_POLICIES; s++) {
@@ -1058,9 +1306,12 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
                          "remove guest egress selector");
     if (result != DOCA_SUCCESS)
       return result;
+    if (slot->pf_reply_pipe != NULL)
+      doca_flow_pipe_destroy(slot->pf_reply_pipe);
     if (slot->pipe != NULL)
       doca_flow_pipe_destroy(slot->pipe);
     free(slot->rules);
+    free(slot->pf_replies);
     *slot = (struct eswitch_egress_acl){0};
   }
   return DOCA_SUCCESS;
@@ -1612,8 +1863,11 @@ doca_error_t eswitch_pipeline_sf_unbind_rif(
                          "unbind guest egress ACL selector");
     if (result != DOCA_SUCCESS)
       return result;
+    if (slot->pf_reply_pipe != NULL)
+      doca_flow_pipe_destroy(slot->pf_reply_pipe);
     if (slot->pipe != NULL)
       doca_flow_pipe_destroy(slot->pipe);
+    free(slot->pf_replies);
     free(slot->rules);
     *slot = (struct eswitch_egress_acl){0};
   }
@@ -2222,8 +2476,11 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
   if (pipeline->local_ip_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->local_ip_pipe);
   for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    if (pipeline->egress_acls[i].pf_reply_pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->egress_acls[i].pf_reply_pipe);
     if (pipeline->egress_acls[i].pipe != NULL)
       doca_flow_pipe_destroy(pipeline->egress_acls[i].pipe);
+    free(pipeline->egress_acls[i].pf_replies);
     free(pipeline->egress_acls[i].rules);
   }
   if (pipeline->egress_acl_selector_pipe != NULL)

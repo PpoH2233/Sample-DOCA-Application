@@ -438,7 +438,9 @@ static doca_error_t detach_port_persisted(struct eswitch_manager *manager,
     }
   }
 
-  result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
+  result = eswitch_pipeline_egress_acl_pf_reply_flush(manager->pipeline);
+  if (result == DOCA_SUCCESS)
+    result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
 
   if (result == DOCA_SUCCESS) {
     router_nat_flush(manager->nat, 0);
@@ -1604,12 +1606,27 @@ static void route_nat_ingress_frame(
     struct router_ipv4_decision decision;
     enum router_ipv4_disposition disposition = router_ipv4_lookup_interface(
         manager->router, ingress->interface_id, translated, length, &decision);
+    doca_error_t acl_result;
     /* A misconfigured target must never turn an inbound rule into a WAN
      * transit route through the VR's default route. */
     if (disposition != ROUTER_IPV4_FORWARD ||
         decision.egress_interface_id == ingress->interface_id) {
       manager->nat_fail_closed_drops++;
       router_nat_port_forward_reject(manager->nat, session);
+      goto out;
+    }
+    /* Commit the exact reply exception before the inbound packet reaches
+     * the guest. Otherwise its immediate reply could hit default-deny in
+     * hardware before Arm can consult the port-forward NAT session. */
+    acl_result = eswitch_pipeline_egress_acl_pf_reply_add(
+        manager->pipeline, manager->router, decision.egress_interface_id,
+        session);
+    if (acl_result != DOCA_SUCCESS) {
+      manager->nat_fail_closed_drops++;
+      router_nat_port_forward_reject(manager->nat, session);
+      if (manager->packet_debug)
+        fprintf(stderr, "Port-forward reply exception unavailable: %s\n",
+                doca_error_get_descr(acl_result));
       goto out;
     }
   }
@@ -1887,6 +1904,13 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
   }
   router_neighbor_age(&manager->neighbors, now_ns);
   router_nat_age(manager->nat, now_ns);
+  {
+    doca_error_t result = eswitch_pipeline_egress_acl_pf_reply_prune(
+        manager->pipeline);
+    if (result != DOCA_SUCCESS && manager->packet_debug)
+      fprintf(stderr, "Port-forward reply exception cleanup deferred: %s\n",
+              doca_error_get_descr(result));
+  }
   probe_configured_next_hops(manager, manager->router, now_ns);
   {
     doca_error_t result = eswitch_manager_hw_routes_sync(manager,
@@ -1912,6 +1936,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t egress_acl_active = 0;
   size_t egress_acl_fallback = 0;
   size_t egress_acl_rules = 0;
+  size_t egress_acl_pf_replies = 0;
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
@@ -1935,6 +1960,7 @@ static size_t format_status(const struct eswitch_manager *manager,
     egress_acl_active += acl->pipe != NULL;
     egress_acl_fallback += acl->fallback_arm;
     egress_acl_rules += acl->rule_count;
+    egress_acl_pf_replies += acl->pf_reply_count;
   }
   for (uint16_t i = 0; i < manager->ports->count; i++) {
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
@@ -2108,10 +2134,12 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->egress_established_replies);
   used = append_text(response, size, used,
       "egress_acl=%s active_policies=%zu fallback_policies=%zu "
-      "hw_rules=%zu failures=%" PRIu64 " arm_recheck=enabled\n",
+      "hw_rules=%zu failures=%" PRIu64 " arm_recheck=enabled "
+      "pf_reply_exceptions=%zu pf_reply_fallbacks=%" PRIu64 "\n",
       manager->pipeline->egress_acl_selector_pipe != NULL ? "ready" : "off",
       egress_acl_active, egress_acl_fallback, egress_acl_rules,
-      manager->pipeline->egress_acl_failures);
+      manager->pipeline->egress_acl_failures, egress_acl_pf_replies,
+      manager->pipeline->egress_acl_pf_reply_fallbacks);
   used = append_text(response, size, used,
       "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
       " max_hops=%u\n", manager->router_link_forwards,

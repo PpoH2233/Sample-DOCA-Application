@@ -688,9 +688,19 @@ immediately. Hardware allow and default-allow continue to Arm for a second
 policy check and routing/NAT, so this phase is an enforcement offload, not a
 full routed fast path. Local router IPs in the same VR bypass the policy,
 including IPs on its other interfaces. When ACL creation fails, a policy uses
-ICMP type/code matching, or its VR has port-forward rules, the entire guest
-RIF uses the Arm policy checker. `egress_acl=ready active_policies=...` confirms
-which policies were injected; `fallback_policies` identifies Arm-only ones.
+ICMP type/code matching, the entire guest RIF uses the Arm policy checker.
+Port-forward rules no longer force a whole-VR fallback: each admitted
+TCP/UDP port-forward session installs an exact reply 5-tuple in a separate
+hardware ACL pipe before the guest egress ACL. Its hit still goes to Arm,
+which rechecks the live NAT session and performs reverse NAT; a miss proceeds
+to the guest ACL. The exception is committed before the inbound packet is
+delivered to the VM and is removed after session aging or configuration flush.
+If the exception cannot be installed, that guest RIF switches to Arm before
+inbound delivery rather than risking default-deny on the reply. The number of
+installed entries and such fallbacks appear as `pf_reply_exceptions` and
+`pf_reply_fallbacks` on the `egress_acl` status line. `active_policies`
+confirms which policies were injected; `fallback_policies` identifies Arm-only
+ones.
 No CloudStack wrapper changes are included.
 
 #### 5.8.1 VR and interface lifecycle

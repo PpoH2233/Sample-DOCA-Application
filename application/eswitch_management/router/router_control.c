@@ -212,7 +212,10 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
      * tuple. Remove hardware entries before changing reachable dataplane
      * objects, then remove their software owners. */
     {
-      doca_error_t result=eswitch_pipeline_ct_flush(m->pipeline,0);
+      doca_error_t result=eswitch_pipeline_egress_acl_pf_reply_flush(
+          m->pipeline);
+      if(result==DOCA_SUCCESS)
+        result=eswitch_pipeline_ct_flush(m->pipeline,0);
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR hardware CT flush failed: %s\n",
                  doca_error_get_descr(result));

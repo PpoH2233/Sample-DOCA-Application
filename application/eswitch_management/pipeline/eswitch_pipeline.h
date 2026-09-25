@@ -62,6 +62,18 @@ struct eswitch_flood_group {
 
 #define ESWITCH_MAX_SF_RETURN_CONTEXTS 256U
 #define ESWITCH_MAX_CT_ADJACENCIES 1024U
+#define ESWITCH_MAX_PF_REPLY_EXCEPTIONS 128U
+
+struct eswitch_pf_reply_exception {
+  const struct router_nat_session *session;
+  uint16_t vr_id;
+  uint8_t protocol;
+  uint32_t inside_ip;
+  uint16_t inside_port;
+  uint32_t remote_ip;
+  uint16_t remote_port;
+  struct eswitch_rule rule;
+};
 
 /* One immutable ACL generation per guest RIF. A BASIC selector is updated
  * only after the replacement ACL has been committed. */
@@ -72,7 +84,10 @@ struct eswitch_egress_acl {
   uint8_t rif_mac[6];
   uint64_t fingerprint;
   struct doca_flow_pipe *pipe;
+  struct doca_flow_pipe *pf_reply_pipe;
   struct eswitch_rule *rules;
+  struct eswitch_pf_reply_exception *pf_replies;
+  size_t pf_reply_count;
   size_t rule_count;
   struct eswitch_rule selector;
   bool active;
@@ -173,6 +188,7 @@ struct eswitch_pipeline {
       sf_return_contexts[ESWITCH_MAX_SF_RETURN_CONTEXTS];
   struct eswitch_egress_acl egress_acls[ROUTER_MAX_EGRESS_POLICIES];
   uint64_t egress_acl_failures;
+  uint64_t egress_acl_pf_reply_fallbacks;
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -284,6 +300,15 @@ doca_error_t eswitch_pipeline_hw_route_stats(
  * and resource failures are steered to the authoritative Arm checker. */
 doca_error_t eswitch_pipeline_egress_acl_sync(
     struct eswitch_pipeline *pipeline, const struct router_config *config);
+/* Install an exact, session-owned exception before delivering the inbound
+ * port-forward packet to its guest. The hit still goes to Arm for NAT. */
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
+    struct eswitch_pipeline *pipeline, const struct router_config *config,
+    uint16_t guest_interface_id, const struct router_nat_session *session);
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_prune(
+    struct eswitch_pipeline *pipeline);
+doca_error_t eswitch_pipeline_egress_acl_pf_reply_flush(
+    struct eswitch_pipeline *pipeline);
 
 /* Promote a software TCP/UDP NAT session into the bidirectional CT table.
  * Both adjacency entries are committed before the CT connection becomes
