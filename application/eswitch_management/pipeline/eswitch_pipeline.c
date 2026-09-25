@@ -829,6 +829,7 @@ static doca_error_t acl_build_generation(
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
   size_t local_count = 0, total, position = 0;
+  const char *stage = "pipe-config-create";
   doca_error_t result;
 
   *pipe = NULL;
@@ -848,22 +849,37 @@ static doca_error_t acl_build_generation(
   if (policy->default_allow)
     miss.next_pipe = pipeline->rss_pipe;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Guest egress ACL build failed: vr=%u rif=%u stage=%s error=%s\n",
+            policy->vr_id, policy->interface_id, stage,
+            doca_error_get_descr(result));
     return result;
+  }
+  stage = "pipe-config-identity";
   result = set_pipe_identity(cfg, "ESW_GUEST_EGRESS_ACL",
                              DOCA_FLOW_PIPE_ACL, false,
                              total ? (uint32_t)total : 1U);
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    stage = "pipe-config-match";
     result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
-  if (result == DOCA_SUCCESS)
+  }
+  if (result == DOCA_SUCCESS) {
+    stage = "pipe-create";
     result = doca_flow_pipe_create(cfg, &hit, &miss, pipe);
+  }
   doca_flow_pipe_cfg_destroy(cfg);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Guest egress ACL build failed: vr=%u rif=%u stage=%s entries=%zu error=%s\n",
+            policy->vr_id, policy->interface_id, stage, total,
+            doca_error_get_descr(result));
     return result;
+  }
   if (total == 0)
     return DOCA_SUCCESS;
   *entries = calloc(total, sizeof(**entries));
   if (*entries == NULL) {
+    fprintf(stderr, "Guest egress ACL build failed: vr=%u rif=%u stage=entry-storage entries=%zu error=Memory allocation failure\n",
+            policy->vr_id, policy->interface_id, total);
     doca_flow_pipe_destroy(*pipe);
     *pipe = NULL;
     return DOCA_ERROR_NO_MEMORY;
@@ -883,6 +899,7 @@ static doca_error_t acl_build_generation(
     flow_entry_cookie_prepare(&(*entries)[position].cookie,
                               "guest egress local-RIF bypass",
                               DOCA_FLOW_ENTRY_OP_ADD);
+    stage = "local-RIF-entry-add";
     result = doca_flow_pipe_acl_add_entry(
         pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
         (uint32_t)position, &fwd,
@@ -918,6 +935,7 @@ static doca_error_t acl_build_generation(
       fwd.next_pipe = pipeline->rss_pipe;
     flow_entry_cookie_prepare(&(*entries)[position].cookie,
                               "guest egress ACL rule", DOCA_FLOW_ENTRY_OP_ADD);
+    stage = "policy-rule-entry-add";
     result = doca_flow_pipe_acl_add_entry(
         pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
         (uint32_t)position, &fwd,
@@ -927,9 +945,14 @@ static doca_error_t acl_build_generation(
       break;
   }
 build_done:
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    stage = "entries-process";
     result = process_rules(pipeline, *entries, (uint32_t)total);
+  }
   if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Guest egress ACL build failed: vr=%u rif=%u stage=%s entry=%zu/%zu error=%s\n",
+            policy->vr_id, policy->interface_id, stage, position, total,
+            doca_error_get_descr(result));
     doca_flow_pipe_destroy(*pipe);
     free(*entries);
     *pipe = NULL;
