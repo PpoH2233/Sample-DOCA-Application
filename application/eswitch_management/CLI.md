@@ -682,13 +682,16 @@ sessions. The policies and rules persist in `eswitch.conf.router` under
 
 `vr egress policy set` and `vr egress rule add` inject a DOCA Flow ACL
 generation for the guest RIF, independent of `ESWITCH_HW_ROUTING`. A lower
-`rule-id` has higher priority. IPv4 CIDRs and protocol matches, plus TCP/UDP
-destination port ranges, are compiled into hardware entries. Hardware **deny** drops
+`rule-id` has higher priority. TCP/UDP IPv4 CIDRs and destination port ranges
+are candidates for hardware ACL entries. Other protocols currently use the
+Arm policy checker until their ACL entry formats are validated on the DPU.
+Hardware **deny** drops
 immediately. Hardware allow and default-allow continue to Arm for a second
 policy check and routing/NAT, so this phase is an enforcement offload, not a
 full routed fast path. Local router IPs in the same VR bypass the policy,
-including IPs on its other interfaces. When ACL creation fails, a policy uses
-ICMP type/code matching, the entire guest RIF uses the Arm policy checker.
+including IPs on its other interfaces. When ACL creation fails or a policy
+uses a rule outside the validated TCP/UDP subset, the entire guest RIF uses
+the Arm policy checker.
 Port-forward rules no longer force a whole-VR fallback: each admitted
 TCP/UDP port-forward session installs an exact reply 5-tuple in a separate
 hardware ACL pipe before the guest egress ACL. Its hit still goes to Arm,

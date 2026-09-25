@@ -807,13 +807,15 @@ static bool acl_can_offload(const struct router_config *config,
                             const struct router_egress_policy *policy,
                             const struct router_egress_rule *const *rules,
                             size_t count) {
-  /* ICMP type/code and protocol=all+port still need software. Port-forward
-   * replies use an exact, session-owned pipe before this ACL. */
+  /* The DOCA 3.4 ACL sample programs TCP/UDP five-tuples with an explicit
+   * L4 parser type. Keep other protocols on the authoritative Arm path until
+   * their ACL entry shapes are validated on the target hardware. */
   (void)config;
   (void)policy;
   for (size_t i = 0; i < count; i++)
-    if (rules[i]->icmp_type >= 0 || rules[i]->icmp_code >= 0 ||
-        (rules[i]->protocol == 0 && rules[i]->port_first != 0))
+    if ((rules[i]->protocol != IPPROTO_TCP &&
+         rules[i]->protocol != IPPROTO_UDP) ||
+        rules[i]->icmp_type >= 0 || rules[i]->icmp_code >= 0)
       return false;
   return true;
 }
@@ -831,7 +833,6 @@ static doca_error_t acl_build_generation(
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
   size_t local_count = 0, total, position = 0;
-  bool has_port_match = false;
   const char *stage = "pipe-config-create";
   doca_error_t result;
 
@@ -848,19 +849,17 @@ static doca_error_t acl_build_generation(
           config->interfaces[i].has_address)
         local_count++;
   total = local_count + count;
-  for (size_t i = 0; i < count; i++)
-    if (rules[i]->port_first != 0)
-      has_port_match = true;
   template.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
   template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   template.outer.ip4.src_ip = UINT32_MAX;
   template.outer.ip4.dst_ip = UINT32_MAX;
-  template.outer.ip4.next_proto = UINT8_MAX;
-  /* A port-free policy must not reserve a TCP-port parser match. Besides
-   * wasting ACL resources, this makes an empty/default policy depend on
-   * L4 parsing even though its local-RIF bypasses match only IPv4. */
-  if (has_port_match)
+  /* Match the shipped DOCA 3.4 flow_acl template for a populated TCP/UDP
+   * ACL. The ACL entry supplies its own TCP or UDP parser type and ports. */
+  if (count != 0) {
+    template.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+    template.outer.tcp.l4_port.src_port = UINT16_MAX;
     template.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  }
   miss.type = policy->default_allow ? DOCA_FLOW_FWD_PIPE
                                     : DOCA_FLOW_FWD_DROP;
   if (policy->default_allow)
@@ -943,14 +942,23 @@ static doca_error_t acl_build_generation(
         ipv4_prefix_mask(rule->source_prefix));
     mask.outer.ip4.dst_ip = DOCA_HTOBE32(
         ipv4_prefix_mask(rule->destination_prefix));
-    if (rule->protocol != 0) {
-      match.outer.ip4.next_proto = rule->protocol;
-      mask.outer.ip4.next_proto = UINT8_MAX;
+    if (rule->protocol == IPPROTO_TCP) {
+      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+    } else {
+      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
     }
+    mask.parser_meta.outer_l4_type = UINT32_MAX;
     if (rule->port_first != 0) {
-      match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
       /* ACL interprets the mask port as the inclusive range end. */
-      mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
+      if (rule->protocol == IPPROTO_TCP) {
+        match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
+        mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
+      } else {
+        match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
+        mask.outer.udp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
+      }
     }
     fwd.type = rule->allow ? DOCA_FLOW_FWD_PIPE : DOCA_FLOW_FWD_DROP;
     if (rule->allow)
