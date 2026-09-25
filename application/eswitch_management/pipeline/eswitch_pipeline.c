@@ -837,10 +837,16 @@ static doca_error_t acl_build_generation(
 
   *pipe = NULL;
   *entries = NULL;
-  for (size_t i = 0; i < config->interface_count; i++)
-    if (config->interfaces[i].vr_id == policy->vr_id &&
-        config->interfaces[i].has_address)
-      local_count++;
+  /* A default-allow miss already forwards local destinations to Arm. Avoid
+   * consuming ACL entries for redundant local-RIF exceptions; in particular,
+   * some HWS configurations reject an IP-only ACL entry at insertion time.
+   * Default-deny still needs explicit exceptions and safely falls back to
+   * Arm if the hardware cannot install them. */
+  if (!policy->default_allow)
+    for (size_t i = 0; i < config->interface_count; i++)
+      if (config->interfaces[i].vr_id == policy->vr_id &&
+          config->interfaces[i].has_address)
+        local_count++;
   total = local_count + count;
   for (size_t i = 0; i < count; i++)
     if (rules[i]->port_first != 0)
@@ -906,7 +912,8 @@ static doca_error_t acl_build_generation(
     struct doca_flow_match match = {0}, mask = {0};
     struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
                                 .next_pipe = pipeline->rss_pipe};
-    if (local->vr_id != policy->vr_id || !local->has_address)
+    if (policy->default_allow || local->vr_id != policy->vr_id ||
+        !local->has_address)
       continue;
     match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
     match.outer.ip4.dst_ip = DOCA_HTOBE32(local->address);
