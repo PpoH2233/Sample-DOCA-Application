@@ -128,7 +128,8 @@ static bool parse_u32_env(const char *name, uint32_t default_value,
 static uint32_t actions_mem_size(bool hardware_routing_enabled,
                                  uint32_t route_capacity,
                                  bool hardware_ct_enabled,
-                                 bool uplink_arp_meter_enabled) {
+                                 bool uplink_arp_meter_enabled,
+                                 uint32_t acl_action_entries) {
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
   uint32_t rounded = 1;
 
@@ -156,6 +157,13 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
   required += ESWITCH_MAX_VLAN_MEMBERSHIPS *
                   DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
               4096U;
+  /* ACL pipes allocate action resources when the pipe is created, before
+   * any policy entries are installed. Reserve independently of the VLAN
+   * budget; otherwise even a two-entry ACL may fail at pipe-create after
+   * the base switch pipes have consumed the parent port's action pool. */
+  required += acl_action_entries *
+                  ESWITCH_ACL_ACTION_MEM_UNITS_PER_ENTRY *
+                  DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE;
   /* CT owns its L3/L4 action memory, while the post-CT adjacency pipe uses
    * the parent switch-port pool for L2 and TTL rewrites. */
   if (hardware_ct_enabled)
@@ -194,7 +202,9 @@ int main(int argc, char **argv) {
   uint32_t hardware_ct_capacity;
   uint32_t uplink_arp_pps;
   uint32_t uplink_arp_burst;
+  uint32_t acl_action_entries;
   uint32_t flow_actions_mem_size;
+  uint32_t legacy_actions_mem_size;
   int separator;
   int exit_status = EXIT_FAILURE;
 
@@ -224,6 +234,14 @@ int main(int argc, char **argv) {
             ESWITCH_CT_MIN_CAPACITY, ESWITCH_CT_MAX_CAPACITY);
     return EXIT_FAILURE;
   }
+  if (!parse_u32_env("ESWITCH_ACL_ACTION_ENTRIES",
+                     ESWITCH_ACL_ACTION_DEFAULT_ENTRIES,
+                     ESWITCH_ACL_ACTION_MAX_ENTRIES, &acl_action_entries) ||
+      acl_action_entries == 0) {
+    fprintf(stderr, "ESWITCH_ACL_ACTION_ENTRIES must be 1..%u\n",
+            ESWITCH_ACL_ACTION_MAX_ENTRIES);
+    return EXIT_FAILURE;
+  }
   if (!parse_u32_env("ESWITCH_UPLINK_ARP_PPS",
                      ESWITCH_UPLINK_ARP_DEFAULT_PPS,
                      ESWITCH_UPLINK_ARP_MAX_PPS, &uplink_arp_pps) ||
@@ -240,7 +258,12 @@ int main(int argc, char **argv) {
   flow_actions_mem_size = actions_mem_size(hardware_routing_enabled,
                                             hardware_route_capacity,
                                             hardware_ct_requested,
-                                            uplink_arp_pps != 0);
+                                            uplink_arp_pps != 0,
+                                            acl_action_entries);
+  legacy_actions_mem_size = actions_mem_size(hardware_routing_enabled,
+                                              hardware_route_capacity,
+                                              hardware_ct_requested,
+                                              uplink_arp_pps != 0, 0);
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
 
@@ -297,6 +320,17 @@ int main(int argc, char **argv) {
   result = switch_flow_ports_start_with_actions_mem(
       &devices.ethernet_ports, flow_actions_mem_size,
       uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
+  if (result == DOCA_ERROR_NO_MEMORY &&
+      flow_actions_mem_size > legacy_actions_mem_size) {
+    fprintf(stderr, "ACL action-memory reserve unavailable; retrying Flow "
+                    "ports with previous budget %u (ACL may fall back to Arm)\n",
+            legacy_actions_mem_size);
+    flow_actions_mem_size = legacy_actions_mem_size;
+    acl_action_entries = 0;
+    result = switch_flow_ports_start_with_actions_mem(
+        &devices.ethernet_ports, flow_actions_mem_size,
+        uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
+  }
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start DOCA Flow ports: %s\n",
             doca_error_get_descr(result));
@@ -314,9 +348,10 @@ int main(int argc, char **argv) {
   printf("TX DOMAIN: parent=%u lookup=explicit-parent revision=%s\n",
          flow_ports.items[0].ethernet->port_id, ESWITCH_TX_REVISION);
   printf("HARDWARE ROUTING: configured=%s requested-capacity=%u "
-         "actions-mem=%u scope=private-vs-ipv4\n",
+         "actions-mem=%u acl-action-entries=%u scope=private-vs-ipv4\n",
          hardware_routing_enabled ? "enabled" : "disabled",
-         hardware_route_capacity, flow_actions_mem_size);
+         hardware_route_capacity, flow_actions_mem_size,
+         acl_action_entries);
   printf("HARDWARE CT: configured=%s requested-capacity=%u "
          "initialized=%s protocols=tcp,udp miss=arm\n",
          hardware_ct_requested ? "enabled" : "disabled",

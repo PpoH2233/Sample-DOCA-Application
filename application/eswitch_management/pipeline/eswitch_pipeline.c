@@ -829,6 +829,7 @@ static doca_error_t acl_build_generation(
   struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
   size_t local_count = 0, total, position = 0;
+  bool has_port_match = false;
   const char *stage = "pipe-config-create";
   doca_error_t result;
 
@@ -839,11 +840,18 @@ static doca_error_t acl_build_generation(
         config->interfaces[i].has_address)
       local_count++;
   total = local_count + count;
+  for (size_t i = 0; i < count; i++)
+    if (rules[i]->port_first != 0)
+      has_port_match = true;
   template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   template.outer.ip4.src_ip = UINT32_MAX;
   template.outer.ip4.dst_ip = UINT32_MAX;
   template.outer.ip4.next_proto = UINT8_MAX;
-  template.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  /* A port-free policy must not reserve a TCP-port parser match. Besides
+   * wasting ACL resources, this makes an empty/default policy depend on
+   * L4 parsing even though its local-RIF bypasses match only IPv4. */
+  if (has_port_match)
+    template.outer.tcp.l4_port.dst_port = UINT16_MAX;
   miss.type = policy->default_allow ? DOCA_FLOW_FWD_PIPE
                                     : DOCA_FLOW_FWD_DROP;
   if (policy->default_allow)

@@ -22,6 +22,11 @@ ESWITCH_HW_ROUTING="1"
 # the device cannot allocate the requested LPM size.
 ESWITCH_HW_ROUTE_CAPACITY="256"
 
+# Parent-port DOCA Flow action-memory reserve for guest egress ACL pipes.
+# This is a memory-sizing hint, not a CLI rule limit. Increase before app
+# startup if many guest ACL entries/policies must coexist in hardware.
+ESWITCH_ACL_ACTION_ENTRIES="16"
+
 # Promote established TCP/UDP NAT sessions to DOCA Flow CT. First packets,
 # misses, ICMP and unsupported flows continue through the Arm slow path.
 ESWITCH_HW_CT="1"

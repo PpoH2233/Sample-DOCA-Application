@@ -103,6 +103,17 @@ reserved before Flow ports start, in addition to the existing L2/SF action
 pool. If the LPM allocation is still too large,
 the application retries smaller tables; if none can be admitted it remains
 available on the Arm dataplane with `hw_state=fallback-arm`.
+Guest egress ACL pipes reserve parent-port action memory at startup using the
+same per-entry sizing factor as NVIDIA's Flow ACL sample. Set
+`ESWITCH_ACL_ACTION_ENTRIES` to a value from 1 to 512 (default 16) before
+starting the application if more ACL policies/rules must coexist in hardware.
+This is an action-memory sizing hint, not a limit on configured rules; policies
+that cannot be admitted continue through the existing Arm pre-route check.
+If the larger reserve prevents Flow ports from starting with `NO_MEMORY`,
+startup retries the previous action-memory budget so ACL can fall back to Arm
+without taking down the switch.
+For policies with no destination-port rule, the ACL template omits the TCP-port
+field so IPv4-only local-RIF bypasses do not require an unused L4 match.
 
 ```text
 endpoint
