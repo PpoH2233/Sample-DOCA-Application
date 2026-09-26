@@ -1012,7 +1012,7 @@ static doca_error_t acl_build_pf_reply_pipe(
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   match.outer.ip4.src_ip = UINT32_MAX;
   match.outer.ip4.dst_ip = UINT32_MAX;
-  match.outer.ip4.next_proto = UINT8_MAX;
+  match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
   match.outer.tcp.l4_port.src_port = UINT16_MAX;
   match.outer.tcp.l4_port.dst_port = UINT16_MAX;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
@@ -1128,6 +1128,7 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
   struct eswitch_pf_reply_exception *free_entry = NULL;
   struct doca_flow_match match = {0}, mask = {0};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE};
+  const char *stage = "validate-session";
   doca_error_t result;
 
   if (pipeline == NULL || config == NULL || session == NULL ||
@@ -1148,6 +1149,7 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
     goto fallback;
   }
   fwd.next_pipe = pipeline->rss_pipe;
+  stage = "prune-stale-entries";
   result = eswitch_pipeline_egress_acl_pf_reply_prune(pipeline);
   if (result != DOCA_SUCCESS)
     goto fallback;
@@ -1160,29 +1162,43 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
       free_entry = entry;
   }
   if (free_entry == NULL) {
+    stage = "entry-capacity";
     result = DOCA_ERROR_NO_MEMORY;
     goto fallback;
   }
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   match.outer.ip4.src_ip = DOCA_HTOBE32(session->inside_ip);
   match.outer.ip4.dst_ip = DOCA_HTOBE32(session->remote_ip);
-  match.outer.ip4.next_proto = session->protocol;
-  match.outer.tcp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
-  match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
   mask.outer.ip4.src_ip = UINT32_MAX;
   mask.outer.ip4.dst_ip = UINT32_MAX;
-  mask.outer.ip4.next_proto = UINT8_MAX;
+  mask.parser_meta.outer_l4_type = UINT32_MAX;
   /* For an ACL entry, equal match/mask ports mean exact port matches. */
-  mask.outer.tcp.l4_port.src_port = match.outer.tcp.l4_port.src_port;
-  mask.outer.tcp.l4_port.dst_port = match.outer.tcp.l4_port.dst_port;
+  if (session->protocol == IPPROTO_TCP) {
+    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+    match.outer.tcp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
+    match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
+    mask.outer.tcp.l4_port.src_port = match.outer.tcp.l4_port.src_port;
+    mask.outer.tcp.l4_port.dst_port = match.outer.tcp.l4_port.dst_port;
+  } else {
+    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
+    match.outer.udp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
+    match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
+    mask.outer.udp.l4_port.src_port = match.outer.udp.l4_port.src_port;
+    mask.outer.udp.l4_port.dst_port = match.outer.udp.l4_port.dst_port;
+  }
   flow_entry_cookie_prepare(&free_entry->rule.cookie,
                             "port-forward reply exception", DOCA_FLOW_ENTRY_OP_ADD);
+  stage = "entry-add";
   result = doca_flow_pipe_acl_add_entry(
       pipeline->runtime->queue_id, slot->pf_reply_pipe, &match, &mask, 0,
       NULL, 0, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
       &free_entry->rule.cookie, &free_entry->rule.entry);
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    stage = "entries-process";
     result = process_rules(pipeline, &free_entry->rule, 1);
+  }
   if (result != DOCA_SUCCESS)
     goto fallback;
   free_entry->session = session;
@@ -1196,8 +1212,10 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
   return DOCA_SUCCESS;
 fallback:
   pipeline->egress_acl_failures++;
-  fprintf(stderr, "Port-forward reply ACL fallback: vr=%u rif=%u error=%s\n",
-          session->vr_id, guest_interface_id, doca_error_get_descr(result));
+  fprintf(stderr, "Port-forward reply ACL fallback: vr=%u rif=%u stage=%s protocol=%u error=%s\n",
+          session->vr_id, guest_interface_id, stage,
+          (unsigned int)session->protocol,
+          doca_error_get_descr(result));
   return acl_pf_reply_fallback(pipeline, config, slot);
 }
 
