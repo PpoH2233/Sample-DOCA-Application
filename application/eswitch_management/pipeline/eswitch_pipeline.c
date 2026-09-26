@@ -1021,42 +1021,36 @@ build_done:
   return result;
 }
 
-/* A separate ACL pipe is used for the TCP/UDP reply 5-tuples because an ACL
- * pipe can match both protocols. Its miss goes to the guest egress ACL; hits
- * go to Arm, where the session is checked again and reverse NAT is applied.
- * This costs one extra lookup but avoids reserving a CT/NAT action per reply. */
+/* These are exact session exceptions, not port-range policy rules. A control
+ * pipe avoids the ACL template's protocol/range/action constraints. Hits
+ * still go to Arm for session validation; misses go to the policy ACL. */
 static doca_error_t acl_build_pf_reply_pipe(
     struct eswitch_pipeline *pipeline, struct doca_flow_pipe *acl_pipe,
+    struct eswitch_rule *miss_rule,
     struct doca_flow_pipe **reply_pipe) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_match match = {0};
-  struct doca_flow_actions actions = {0};
-  struct doca_flow_actions *actions_array[1] = {&actions};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
                                .next_pipe = acl_pipe};
   doca_error_t result;
 
   *reply_pipe = NULL;
-  match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
-  match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-  match.outer.ip4.src_ip = UINT32_MAX;
-  match.outer.ip4.dst_ip = UINT32_MAX;
-  match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
-  match.outer.tcp.l4_port.src_port = UINT16_MAX;
-  match.outer.tcp.l4_port.dst_port = UINT16_MAX;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, "ESW_PF_REPLY_EXACT", DOCA_FLOW_PIPE_ACL,
-                             false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS);
+  result = set_pipe_identity(cfg, "ESW_PF_REPLY_EXACT", DOCA_FLOW_PIPE_CONTROL,
+                             false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS + 1);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, &match, NULL);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, &hit, &miss, reply_pipe);
+    result = doca_flow_pipe_create(cfg, NULL, NULL, reply_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
+  if (result == DOCA_SUCCESS) {
+    flow_entry_cookie_prepare(&miss_rule->cookie, "PF exception policy miss",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, *reply_pipe, NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, 7, &miss, &miss_rule->cookie, &miss_rule->entry);
+    if (result == DOCA_SUCCESS)
+      result = process_rules(pipeline, miss_rule, 1);
+  }
   return result;
 }
 
@@ -1197,33 +1191,40 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
     goto fallback;
   }
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+  mask.parser_meta.outer_l3_type = UINT32_MAX;
   match.outer.ip4.src_ip = DOCA_HTOBE32(session->inside_ip);
   match.outer.ip4.dst_ip = DOCA_HTOBE32(session->remote_ip);
+  match.meta.pkt_meta = DOCA_HTOBE32(
+      eswitch_metadata_encode(slot->vswitch_id, session->inside.port_id));
+  mask.meta.pkt_meta = UINT32_MAX;
+  memcpy(match.outer.eth.src_mac, session->inside.mac, RTE_ETHER_ADDR_LEN);
+  memset(mask.outer.eth.src_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.outer.ip4.src_ip = UINT32_MAX;
   mask.outer.ip4.dst_ip = UINT32_MAX;
   mask.parser_meta.outer_l4_type = UINT32_MAX;
-  /* For an ACL entry, equal match/mask ports mean exact port matches. */
+  /* Control entries use ordinary bit masks, not ACL range upper bounds. */
   if (session->protocol == IPPROTO_TCP) {
     match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
     match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
     match.outer.tcp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
     match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
-    mask.outer.tcp.l4_port.src_port = match.outer.tcp.l4_port.src_port;
-    mask.outer.tcp.l4_port.dst_port = match.outer.tcp.l4_port.dst_port;
+    mask.outer.tcp.l4_port.src_port = UINT16_MAX;
+    mask.outer.tcp.l4_port.dst_port = UINT16_MAX;
   } else {
     match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
     match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
     match.outer.udp.l4_port.src_port = DOCA_HTOBE16(session->inside_port);
     match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(session->remote_port);
-    mask.outer.udp.l4_port.src_port = match.outer.udp.l4_port.src_port;
-    mask.outer.udp.l4_port.dst_port = match.outer.udp.l4_port.dst_port;
+    mask.outer.udp.l4_port.src_port = UINT16_MAX;
+    mask.outer.udp.l4_port.dst_port = UINT16_MAX;
   }
   flow_entry_cookie_prepare(&free_entry->rule.cookie,
                             "port-forward reply exception", DOCA_FLOW_ENTRY_OP_ADD);
   stage = "entry-add";
-  result = doca_flow_pipe_acl_add_entry(
+  result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, slot->pf_reply_pipe, &match, &mask, 0,
-      NULL, 0, &fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+      NULL, NULL, NULL, NULL, 0, &fwd,
       &free_entry->rule.cookie, &free_entry->rule.entry);
   if (result == DOCA_SUCCESS) {
     stage = "entries-process";
@@ -1334,13 +1335,16 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
       result = acl_build_generation(pipeline, config, policy, ordered, count,
                                     &next_pipe, &next_rules);
       if (result == DOCA_SUCCESS && has_pf) {
-        result = acl_build_pf_reply_pipe(pipeline, next_pipe, &next_pf_pipe);
-        if (result == DOCA_SUCCESS) {
-          next_pf_replies = calloc(ESWITCH_MAX_PF_REPLY_EXCEPTIONS,
-                                   sizeof(*next_pf_replies));
-          if (next_pf_replies == NULL)
-            result = DOCA_ERROR_NO_MEMORY;
-        }
+        /* The extra slot owns the miss cookie; prune/flush iterate only
+         * session slots and never remove the policy fallback. */
+        next_pf_replies = calloc(ESWITCH_MAX_PF_REPLY_EXCEPTIONS + 1,
+                                 sizeof(*next_pf_replies));
+        if (next_pf_replies == NULL)
+          result = DOCA_ERROR_NO_MEMORY;
+        else
+          result = acl_build_pf_reply_pipe(pipeline, next_pipe,
+              &next_pf_replies[ESWITCH_MAX_PF_REPLY_EXCEPTIONS].rule,
+              &next_pf_pipe);
       }
       if (result != DOCA_SUCCESS) {
         pipeline->egress_acl_failures++;
@@ -2153,7 +2157,7 @@ static doca_error_t ct_bind_adjacency(
     struct eswitch_ct_adjacency *entry = &pipeline->ct_adjacencies[i];
 
     if (!entry->active) {
-      if (free_entry == NULL)
+      if (entry->rule.entry == NULL && free_entry == NULL)
         free_entry = entry;
       continue;
     }
@@ -2192,7 +2196,10 @@ static doca_error_t ct_bind_adjacency(
   if (result == DOCA_SUCCESS)
     result = process_rules(pipeline, &free_entry->rule, 1);
   if (result != DOCA_SUCCESS) {
-    memset(free_entry, 0, sizeof(*free_entry));
+    doca_error_t cleanup = remove_rule(pipeline, &free_entry->rule,
+                                       "rollback CT adjacency");
+    if (cleanup == DOCA_SUCCESS)
+      memset(free_entry, 0, sizeof(*free_entry));
     return result;
   }
   free_entry->active = true;
@@ -2303,6 +2310,7 @@ doca_error_t eswitch_pipeline_ct_promote(
       DOCA_FLOW_CT_ENTRY_FLAGS_DIR_ORIGIN |
       DOCA_FLOW_CT_ENTRY_FLAGS_DIR_REPLY;
   bool found = false;
+  const char *stage = "session-slot";
   doca_error_t result;
 
   if (pipeline == NULL || session == NULL || !session->used ||
@@ -2316,26 +2324,35 @@ doca_error_t eswitch_pipeline_ct_promote(
   if (session->protocol != IPPROTO_TCP && session->protocol != IPPROTO_UDP)
     return DOCA_ERROR_NOT_SUPPORTED;
   hardware = ct_session_slot(pipeline, session);
-  if (hardware == NULL) {
-    pipeline->ct_full++;
-    return DOCA_ERROR_FULL;
-  }
-  if (hardware->active)
+  if (hardware != NULL && hardware->active)
     return DOCA_SUCCESS;
+  if (!offload_retry_ready(&pipeline->ct_retry, session->last_seen_ns)) {
+    pipeline->ct_retry_suppressed++;
+    /* Deferred, not another failed hardware operation. */
+    return DOCA_SUCCESS;
+  }
+  if (hardware == NULL) {
+    result = DOCA_ERROR_FULL;
+    goto fail;
+  }
+  stage = "ct-capacity";
   if (pipeline->ct_active >= pipeline->ct_capacity) {
-    pipeline->ct_full++;
-    return DOCA_ERROR_FULL;
+    result = DOCA_ERROR_FULL;
+    goto fail;
   }
 
+  stage = "origin-adjacency";
   result = ct_bind_adjacency(pipeline, origin_target_vswitch,
                              origin_target_port,
                              origin_source_mac, origin_destination_mac,
                              &origin_adjacency);
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    stage = "reply-adjacency";
     result = ct_bind_adjacency(pipeline, reply_target_vswitch,
                                reply_target_port,
                                reply_source_mac, reply_destination_mac,
                                &reply_adjacency);
+  }
   if (result != DOCA_SUCCESS)
     goto fail;
 
@@ -2371,12 +2388,14 @@ doca_error_t eswitch_pipeline_ct_promote(
   hardware->software = session;
   flow_entry_cookie_prepare(&hardware->cookie, "NAT CT connection",
                             DOCA_FLOW_ENTRY_OP_ADD);
+  stage = "ct-prepare";
   result = doca_flow_ct_entry_prepare(
       ct_queue_id(pipeline), pipeline->ct_pipe, prepare_flags, &origin, 0,
       &reply, 0, &hardware->entry, &found);
   if (result != DOCA_SUCCESS)
     goto fail_reset;
   if (!found) {
+    stage = "ct-add";
     result = doca_flow_ct_add_entry(
         ct_queue_id(pipeline), pipeline->ct_pipe, entry_flags, &origin,
         &reply, &origin_action, &reply_action, NULL, NULL, 0,
@@ -2388,6 +2407,7 @@ doca_error_t eswitch_pipeline_ct_promote(
         hardware->entry = NULL;
       goto fail_reset;
     }
+    stage = "ct-process";
     result = doca_flow_ct_entries_process(
         pipeline->switch_port, ct_queue_id(pipeline),
         ESWITCH_CT_QUEUE_DEPTH, ESWITCH_CT_QUEUE_DEPTH, NULL);
@@ -2402,21 +2422,25 @@ doca_error_t eswitch_pipeline_ct_promote(
   router_nat_session_set_hardware_active(session, true);
   pipeline->ct_active++;
   hardware->lease_until_ns = session->last_seen_ns + UINT64_C(30000000000);
+  stage = "origin-admission";
   result = ct_admit_direction(pipeline, hardware, 0,
       reply_target_vswitch, reply_target_port, reply_source_mac,
       reply_destination_mac, session->inside_ip, session->remote_ip,
       session->inside_port, session->remote_port);
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    stage = "reply-admission";
     result = ct_admit_direction(pipeline, hardware, 1,
         origin_target_vswitch, origin_target_port, origin_source_mac,
         origin_destination_mac, session->remote_ip, session->public_ip,
         session->remote_port, session->public_port);
+  }
   if (result != DOCA_SUCCESS) {
     /* Keep the software owner pinned until hardware deletion succeeds. */
     (void)eswitch_pipeline_ct_flush(pipeline, session->vr_id);
     goto fail;
   }
   pipeline->ct_promotions++;
+  offload_retry_reset(&pipeline->ct_retry);
   return DOCA_SUCCESS;
 
 fail_reset:
@@ -2433,8 +2457,19 @@ fail_reset:
   }
 fail:
   pipeline->ct_failures++;
-  if (result == DOCA_ERROR_FULL || result == DOCA_ERROR_NO_MEMORY)
+  if (result == DOCA_ERROR_FULL)
     pipeline->ct_full++;
+  if (result == DOCA_ERROR_NO_MEMORY)
+    pipeline->ct_no_memory++;
+  pipeline->ct_last_failure_stage = stage;
+  pipeline->ct_last_failure = result;
+  offload_retry_failed(&pipeline->ct_retry, session->last_seen_ns);
+  fprintf(stderr, "NAT CT PROMOTION FAILED: stage=%s vr=%u proto=%u "
+                  "inside-port=%u public-port=%u active=%zu capacity=%u "
+                  "error=%s retry-ms=%u fallback=arm\n",
+          stage, session->vr_id, session->protocol, session->inside_port,
+          session->public_port, pipeline->ct_active, pipeline->ct_capacity,
+          doca_error_get_descr(result), pipeline->ct_retry.delay_ms);
   pipeline->hardware_ct_degraded = true;
   return result;
 }
@@ -2495,7 +2530,7 @@ doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
       struct eswitch_ct_adjacency *adjacency = &pipeline->ct_adjacencies[i];
       doca_error_t result;
 
-      if (!adjacency->active)
+      if (adjacency->rule.entry == NULL)
         continue;
       result = remove_rule(pipeline, &adjacency->rule,
                            "remove CT adjacency");

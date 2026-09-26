@@ -128,6 +128,7 @@ static bool parse_u32_env(const char *name, uint32_t default_value,
 static uint32_t actions_mem_size(bool hardware_routing_enabled,
                                  uint32_t route_capacity,
                                  bool hardware_ct_enabled,
+                                 uint32_t ct_capacity,
                                  bool uplink_arp_meter_enabled,
                                  uint32_t acl_action_entries) {
   uint32_t required = SWITCH_ACTIONS_MEM_SIZE;
@@ -164,10 +165,10 @@ static uint32_t actions_mem_size(bool hardware_routing_enabled,
   required += acl_action_entries *
                   ESWITCH_ACL_ACTION_MEM_UNITS_PER_ENTRY *
                   DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE;
-  /* CT owns its L3/L4 action memory, while the post-CT adjacency pipe uses
-   * the parent switch-port pool for L2 and TTL rewrites. */
+  /* CT owns its L3/L4 action memory. Adjacency L2/TTL rewrites AND the two
+   * connection-zone admission writes use the parent switch-port pool. */
   if (hardware_ct_enabled)
-    required += ESWITCH_MAX_CT_ADJACENCIES *
+    required += (ESWITCH_MAX_CT_ADJACENCIES + 2U * ct_capacity) *
                     DOCA_FLOW_MAX_ENTRY_ACTIONS_MEM_SIZE +
                 4096U;
   while (rounded < required)
@@ -258,11 +259,13 @@ int main(int argc, char **argv) {
   flow_actions_mem_size = actions_mem_size(hardware_routing_enabled,
                                             hardware_route_capacity,
                                             hardware_ct_requested,
+                                            hardware_ct_capacity,
                                             uplink_arp_pps != 0,
                                             acl_action_entries);
   legacy_actions_mem_size = actions_mem_size(hardware_routing_enabled,
                                               hardware_route_capacity,
                                               hardware_ct_requested,
+                                              hardware_ct_capacity,
                                               uplink_arp_pps != 0, 0);
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);

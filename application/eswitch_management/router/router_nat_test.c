@@ -1,4 +1,5 @@
 #include "router_nat.h"
+#include "offload_retry.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -241,6 +242,22 @@ int main(void) {
 
   /* A global control-plane flush must preserve hardware-owned entries until
    * the CT pipe removes them, then remove their software owners. */
+  {
+    struct offload_retry retry = {0};
+    uint64_t now = UINT64_C(1000000000);
+    assert(offload_retry_ready(&retry,now));
+    offload_retry_failed(&retry,now);
+    assert(retry.delay_ms==250);
+    assert(!offload_retry_ready(&retry,now+UINT64_C(249999999)));
+    assert(offload_retry_ready(&retry,retry.until_ns));
+    for(unsigned i=0;i<10;i++) {
+      now=retry.until_ns;
+      offload_retry_failed(&retry,now);
+    }
+    assert(retry.delay_ms==8000);
+    offload_retry_reset(&retry);
+    assert(retry.delay_ms==0 && offload_retry_ready(&retry,now));
+  }
   {
     struct router_interface guest = {.vr_id=1, .interface_id=1,
         .attachment=ROUTER_VSWITCH, .vswitch_id=100};

@@ -13,6 +13,7 @@
 #include "../../ethernet_switch/flow_runtime.h"
 #include "../router/router_hw.h"
 #include "../router/router_nat.h"
+#include "../router/offload_retry.h"
 #include "../eswitch_config.h"
 #include "../eswitch_vlan.h"
 
@@ -180,6 +181,11 @@ struct eswitch_pipeline {
   struct eswitch_ct_session ct_sessions[ROUTER_NAT_MAX_SESSIONS];
   uint32_t ct_capacity;
   size_t ct_active;
+  struct offload_retry ct_retry;
+  uint64_t ct_retry_suppressed;
+  uint64_t ct_no_memory;
+  const char *ct_last_failure_stage;
+  doca_error_t ct_last_failure;
   uint64_t ct_promotions;
   uint64_t ct_failures;
   uint64_t ct_full;

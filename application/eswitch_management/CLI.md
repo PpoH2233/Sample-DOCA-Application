@@ -686,7 +686,7 @@ session authorization, not a broad source-port bypass. Rule changes flush NAT/CT
 sessions. The policies and rules persist in `eswitch.conf.router` under
 `router-state 5`; older state versions still load.
 
-In revision `doca34-authorized-session-ct-v41`, CT uses a conservative 30-second
+In revision `doca34-ct-diagnostics-backoff-v42`, CT uses a conservative 30-second
 lease, with batch revocation at the maintenance scan, because hardware activity
 aging/counters are not implemented. Removal first revokes admission, then waits
 for CT deletion before releasing the software owner/NAT port. Neighbor mapping
@@ -697,6 +697,14 @@ fragments, IPv4 options and TTL <= 1 remain Arm paths. Hardware behavior must be
 validated on BF3; `hw_ct_active` is installed state, not a packet-hit counter.
 See [authorized CT validation](AUTHORIZED_CT_TESTING.md) before enabling this
 on production traffic.
+
+PF reply session exceptions use an exact DOCA Flow CONTROL pipe before the
+policy ACL; misses do not bypass policy. CT promotions have a global 250 ms
+to 8 second retry backoff while traffic continues on Arm. `ct_no_memory` and
+`hw_ct_full` count allocation errors and FULL separately. `ct_retry_suppressed`
+counts deferred packet-triggered attempts; `ct_last_failure_stage` and
+`ct_last_error` retain the latest failed stage/error. No CLI syntax changes
+are required. See [performance tests](PERFORMANCE_TESTING.md).
 
 `vr egress policy set` and `vr egress rule add` inject a DOCA Flow ACL
 generation for the guest RIF, independent of `ESWITCH_HW_ROUTING`. A lower

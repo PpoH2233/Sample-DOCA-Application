@@ -2086,6 +2086,15 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline->ct_admission_pipe != NULL ? "exact-ingress-session"
                                                   : "arm-only");
   used = append_text(response, size, used,
+      "ct_retry_backoff_ms=%u ct_retry_suppressed=%" PRIu64
+      " ct_no_memory=%" PRIu64 " ct_last_failure_stage=%s"
+      " ct_last_error=%d\n",
+      manager->pipeline->ct_retry.delay_ms,
+      manager->pipeline->ct_retry_suppressed, manager->pipeline->ct_no_memory,
+      manager->pipeline->ct_last_failure_stage != NULL
+          ? manager->pipeline->ct_last_failure_stage : "none",
+      (int)manager->pipeline->ct_last_failure);
+  used = append_text(response, size, used,
       "nat_policies=%zu nat_sessions=%zu nat_out=%" PRIu64
       " nat_in=%" PRIu64 " nat_reverse_misses=%" PRIu64
       " nat_created=%" PRIu64 " nat_aged=%" PRIu64

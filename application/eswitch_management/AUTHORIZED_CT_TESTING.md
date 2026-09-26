@@ -1,4 +1,4 @@
-# Authorized NAT CT fast path (v41)
+# Authorized NAT CT fast path (v42)
 
 ## Scope and safety
 
@@ -40,7 +40,7 @@ its first correctly routed guest reply must pass the established-session check.
 
 ## One SNAT connection
 
-1. Record `eswitchctl status` before traffic. Require revision v41,
+1. Record `eswitchctl status` before traffic. Require revision v42,
    `hw_ct_state=ready` and `ct_authorization=exact-ingress-session`.
 2. Use a known reachable TCP/UDP service, rather than assuming the upstream
    gateway has an open TCP port. Transfer a large file over one TCP connection.
@@ -105,3 +105,21 @@ Hardware activity counters/aging, per-session rather than batch lease eviction,
 asynchronous installation, selective mutation invalidation and dedicated
 port-link WAN admission remain future work. This phase does not offload ordinary
 non-NAT routing behind an egress policy or ICMP NAT.
+
+## v42 diagnostics and benchmark
+
+PF reply exceptions now use an exact CONTROL pipe with ordinary bit masks and
+an explicit miss to the guest policy ACL. Entries include ingress VS/port and
+source MAC. The user-facing `pf_reply_exceptions`/`pf_reply_fallbacks` fields
+retain their names. This programming change still requires BF3 validation.
+
+CT resource failures emit a stage-specific log with packet debug disabled.
+`ct_retry_backoff_ms`, `ct_retry_suppressed`, `ct_no_memory`,
+`ct_last_failure_stage` and `ct_last_error` distinguish real hardware attempts
+from packets staying on Arm during the 250 ms–8 second global promotion
+backoff. `hw_ct_full` counts FULL only, no longer NO_MEMORY. Admission zone
+writes are now included in the parent action-memory budget.
+
+After single-flow correctness passes, follow [performance experiments](PERFORMANCE_TESTING.md)
+for repeated SCP downloads and multi-VM load testing. Do not benchmark an
+offload-failed run as a successful hardware fast path.
