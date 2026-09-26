@@ -1,4 +1,4 @@
-# Authorized NAT CT fast path (v42)
+# Authorized NAT CT fast path (v43)
 
 ## Scope and safety
 
@@ -27,8 +27,10 @@ connection. Capacity is not a promise that the device has enough resources.
 
 ```text
 VS ingress -> ARP dispatch -> exact authorized session gate
-  hit: valid nonfragment IPv4, TTL > 1, exact VS/port/MAC/5-tuple
-       -> connection-private CT zone -> NAT -> adjacency/TTL/VLAN -> egress
+  hit: exact VS/port/MAC/5-tuple -> write connection-private CT zone
+       -> shared IPv4 guard (nonfragment, valid checksum/header, IHL=5, TTL > 1)
+       -> CT NAT -> adjacency/TTL/VLAN -> egress
+  guard miss: Arm slow path (no CT lookup)
   miss: local delivery -> guest ACL -> Arm policy/route/neighbor/NAT
        -> forward packet -> commit CT -> commit bidirectional admission
 ```
@@ -40,7 +42,7 @@ its first correctly routed guest reply must pass the established-session check.
 
 ## One SNAT connection
 
-1. Record `eswitchctl status` before traffic. Require revision v42,
+1. Record `eswitchctl status` before traffic. Require revision v43,
    `hw_ct_state=ready` and `ct_authorization=exact-ingress-session`.
 2. Use a known reachable TCP/UDP service, rather than assuming the upstream
    gateway has an open TCP port. Transfer a large file over one TCP connection.
@@ -123,3 +125,27 @@ writes are now included in the parent action-memory budget.
 After single-flow correctness passes, follow [performance experiments](PERFORMANCE_TESTING.md)
 for repeated SCP downloads and multi-VM load testing. Do not benchmark an
 offload-failed run as a successful hardware fast path.
+
+## v43 admission/guard isolation
+
+The v42 failure at `origin-admission` occurred after CT programming, not because
+the connection table was full. Its cause remains a hardware-validation hypothesis.
+v43 separates the exact tuple plus zone-write action from the shared IPv4/TTL
+comparison. No session entry performs both operations in one control rule.
+Failure to construct either pipe leaves authorization on Arm; admissions cannot
+be installed without the guard. Existing rollback, owner pinning and retry
+backoff are retained.
+
+After restart, test one fresh SSH/PF connection and capture:
+
+```bash
+./eswitchctl status | grep -E '^(tx_revision|nat_dataplane|ct_authorization|ct_retry|egress_acl)'
+```
+
+Require increasing promotions and a nonzero active CT count during the transfer,
+with no new failure count. If admission still fails, the diagnostic now names
+`origin-admission-add`, `origin-admission-process`, `reply-admission-add` or
+`reply-admission-process`. Supply that log and startup output before increasing
+memory/capacity. Also repeat the fragment/options/checksum/TTL and policy-revoke
+tests above: splitting stages must not introduce an authorization bypass.
+Portable tests do not validate DOCA pipe creation or hardware completion.

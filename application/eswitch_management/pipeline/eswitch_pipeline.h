@@ -144,6 +144,8 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *rss_pipe;
   struct doca_flow_pipe *ct_admission_pipe;
   struct eswitch_rule ct_admission_miss;
+  struct doca_flow_pipe *ct_guard_pipe;
+  struct eswitch_rule ct_guard_rules[2];
   struct doca_flow_pipe *flood_selector_pipe;
   struct doca_flow_pipe *destination_pipe;
   struct doca_flow_pipe *learning_clone_pipe;
