@@ -1424,13 +1424,9 @@ static void route_arm_frame(struct eswitch_manager *manager,
            (nat_session->remote_ip >> 8) & 0xffU,
            nat_session->remote_ip & 0xffU, nat_session->remote_port);
   }
-  if (nat_session != NULL && !nat_session->port_forward &&
-      ingress->attachment==ROUTER_VSWITCH &&
-      !router_egress_vr_has_policy(manager->router, decision.vr_id) &&
-      manager->pipeline->hardware_ct_enabled &&
-      manager->pipeline->hardware_routing_enabled &&
-      (nat_session->protocol == IPPROTO_TCP ||
-       nat_session->protocol == IPPROTO_UDP)) {
+  if (manager->pipeline->hardware_ct_enabled &&
+      router_nat_session_offload_eligible(nat_session, ingress, egress,
+          ingress_port, frame + 6, egress_verdict != ROUTER_EGRESS_DENY)) {
     const struct router_interface *inside_rif = find_router_interface(
         manager, decision.vr_id, decision.ingress_interface_id);
 
@@ -1751,6 +1747,11 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
         neighbor_changed = router_neighbor_learn_arp_interface(
             &manager->neighbors, manager->router, uplink->interface_id,
             port_id, arp, sizeof(arp_scratch), now_ns);
+      if (neighbor_changed) {
+        result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
+        if (result != DOCA_SUCCESS)
+          return result;
+      }
       if (arp != NULL)
         replay_pending_ready(manager, now_ns);
       if (neighbor_changed) {
@@ -1809,6 +1810,11 @@ static doca_error_t process_packet(struct eswitch_manager *manager,
       neighbor_changed = router_neighbor_learn_arp(
           &manager->neighbors, manager->router, domain_id, port_id, arp,
           sizeof(arp_scratch), now_ns);
+    if (neighbor_changed) {
+      result = eswitch_pipeline_ct_flush(manager->pipeline, 0);
+      if (result != DOCA_SUCCESS)
+        return result;
+    }
     if (neighbor_changed && manager->packet_debug) {
       printf("ROUTE NEIGHBOR LEARN: vs=%u port=%u ip=%u.%u.%u.%u mac="
              "%02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -1903,6 +1909,12 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
     manager->route_tx_drops += expired;
   }
   router_neighbor_age(&manager->neighbors, now_ns);
+  {
+    doca_error_t result = eswitch_pipeline_ct_expire(manager->pipeline, now_ns);
+    if (result != DOCA_SUCCESS)
+      fprintf(stderr, "CT lease revocation deferred: %s\n",
+              doca_error_get_descr(result));
+  }
   router_nat_age(manager->nat, now_ns);
   {
     doca_error_t result = eswitch_pipeline_egress_acl_pf_reply_prune(
@@ -2068,6 +2080,11 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline->ct_capacity, manager->pipeline->ct_active,
       manager->pipeline->ct_promotions, manager->pipeline->ct_failures,
       manager->pipeline->ct_full);
+  used = append_text(response, size, used,
+      "ct_authorization=%s ct_scope=vs-to-vs-nat-tcp-udp "
+      "ct_zone=connection ct_lease_ms=30000 ct_activity_counters=off\n",
+      manager->pipeline->ct_admission_pipe != NULL ? "exact-ingress-session"
+                                                  : "arm-only");
   used = append_text(response, size, used,
       "nat_policies=%zu nat_sessions=%zu nat_out=%" PRIu64
       " nat_in=%" PRIu64 " nat_reverse_misses=%" PRIu64

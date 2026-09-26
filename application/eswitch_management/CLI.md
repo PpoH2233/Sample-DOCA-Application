@@ -596,8 +596,9 @@ Implemented today: private-vSwitch gateway ARP, local ICMP echo, connected and
 static route LPM, neighbor discovery, IPv4 forwarding, and Arm-side TCP/UDP/ICMP
 Echo NAT with uplink ARP, all through the Arm system SF. Eligible private IPv4
 routes can be promoted to the DOCA Flow hardware LPM fast path. When
-`ESWITCH_HW_CT=1` is combined with `ESWITCH_HW_ROUTING=1`, established TCP/UDP
-NAT sessions can be promoted to bidirectional DOCA Flow CT; misses and ICMP
+`ESWITCH_HW_CT=1`, Arm-authorized TCP/UDP NAT sessions between two VS RIFs
+can be promoted to bidirectional DOCA Flow CT, independently of
+`ESWITCH_HW_ROUTING`; misses and ICMP
 remain on Arm. Unsupported or resource-constrained cases fail open to the Arm
 slow path. Hardware CT aging/counters and ICMP routing error generation are not
 implemented. Status strings
@@ -635,7 +636,8 @@ in the router state file. A range uses `router-state 4`; older state files load.
 and `pf_full`.
 
 This phase does not implement public-IP aliases, source filtering,
-hairpin NAT, ICMP forwarding or PF hardware CT promotion. It does not change
+hairpin NAT or ICMP port forwarding. Established PF replies can authorize
+bidirectional CT when both guest and public RIFs attach to VS. It does not change
 the CloudStack extension; do not advertise `PortForwarding` there yet.
 
 #### Guest-network egress firewall (BlueField CLI only)
@@ -674,11 +676,27 @@ eswitchctl status | grep -E 'guest_egress|egress_acl'
 For teardown, delete each rule, then `vr egress policy delete --id 1
 --interface SW100`. This policy also applies to routed traffic toward another
 guest VS, because it is classified by **source guest RIF** before route
-selection; same-VS L2 traffic does not traverse the VR. Hardware route/CT
-promotion for a VR with any guest egress policy is disabled so an existing
-fast path cannot bypass the authoritative Arm policy. Rule changes flush NAT/CT
+selection; same-VS L2 traffic does not traverse the VR. Destination-only
+hardware LPM promotion remains disabled for a VR with a guest egress policy.
+TCP/UDP NAT CT promotion is permitted only after Arm authorizes and forwards
+the packet. An exact ingress VS/port/MAC/5-tuple gate precedes local delivery
+and ACL; each connection owns a CT zone. Gate misses retain the old policy
+path, including Arm fallback policies. Established PF replies use the same
+session authorization, not a broad source-port bypass. Rule changes flush NAT/CT
 sessions. The policies and rules persist in `eswitch.conf.router` under
 `router-state 5`; older state versions still load.
+
+In revision `doca34-authorized-session-ct-v41`, CT uses a conservative 30-second
+lease, with batch revocation at the maintenance scan, because hardware activity
+aging/counters are not implemented. Removal first revokes admission, then waits
+for CT deletion before releasing the software owner/NAT port. Neighbor mapping
+changes and router configuration changes also revoke CT. A resource/programming
+failure keeps traffic on Arm; check `hw_ct_failures` and `ct_authorization`.
+Dedicated `port-link` WAN, router-links, shared-VS internal VR hops, ICMP,
+fragments, IPv4 options and TTL <= 1 remain Arm paths. Hardware behavior must be
+validated on BF3; `hw_ct_active` is installed state, not a packet-hit counter.
+See [authorized CT validation](AUTHORIZED_CT_TESTING.md) before enabling this
+on production traffic.
 
 `vr egress policy set` and `vr egress rule add` inject a DOCA Flow ACL
 generation for the guest RIF, independent of `ESWITCH_HW_ROUTING`. A lower

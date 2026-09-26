@@ -241,6 +241,40 @@ int main(void) {
 
   /* A global control-plane flush must preserve hardware-owned entries until
    * the CT pipe removes them, then remove their software owners. */
+  {
+    struct router_interface guest = {.vr_id=1, .interface_id=1,
+        .attachment=ROUTER_VSWITCH, .vswitch_id=100};
+    struct router_interface wan = {.vr_id=1, .interface_id=2,
+        .attachment=ROUTER_VSWITCH, .vswitch_id=999};
+    struct router_nat_session authorized = {.used=true, .vr_id=1,
+        .protocol=6, .public_interface_id=2,
+        .inside={.interface_id=1, .vswitch_id=100, .port_id=1,
+                 .mac={2,0,0,0,0,1}}};
+    const uint8_t wrong_mac[6] = {2,0,0,0,0,2};
+    assert(router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                              authorized.inside.mac,true));
+    authorized.port_forward=true; /* Established PF reply is also eligible. */
+    assert(router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                              authorized.inside.mac,true));
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               authorized.inside.mac,false));
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,2,
+                                               authorized.inside.mac,true));
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               wrong_mac,true));
+    guest.interface_id=3;
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               authorized.inside.mac,true));
+    guest.interface_id=1; wan.vr_id=2;
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               authorized.inside.mac,true));
+    wan.vr_id=1; wan.attachment=ROUTER_PORT;
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               authorized.inside.mac,true));
+    wan.attachment=ROUTER_VSWITCH; authorized.protocol=1;
+    assert(!router_nat_session_offload_eligible(&authorized,&guest,&wan,1,
+                                               authorized.inside.mac,true));
+  }
   length=make_packet(original,6,0xc0a80032,51001,remote_ip,443);
   assert(router_nat_outbound(table,&policy,public_ip,&vm1,original,length,1,
                              translated,sizeof(translated),&s1)==

@@ -636,3 +636,19 @@ void router_nat_session_set_hardware_active(
   if (session != NULL)
     ((struct router_nat_session *)session)->hardware_active = active;
 }
+
+bool router_nat_session_offload_eligible(
+    const struct router_nat_session *s, const struct router_interface *ingress,
+    const struct router_interface *egress, uint16_t port,
+    const uint8_t source_mac[6], bool authorized) {
+  return authorized && s != NULL && s->used && ingress != NULL &&
+      egress != NULL && source_mac != NULL &&
+      (s->protocol == IPPROTO_TCP_VALUE || s->protocol == IPPROTO_UDP_VALUE) &&
+      ingress->attachment == ROUTER_VSWITCH &&
+      egress->attachment == ROUTER_VSWITCH &&
+      s->vr_id == ingress->vr_id && s->vr_id == egress->vr_id &&
+      s->inside.interface_id == ingress->interface_id &&
+      s->inside.vswitch_id == ingress->vswitch_id &&
+      s->public_interface_id == egress->interface_id &&
+      s->inside.port_id == port && memcmp(s->inside.mac, source_mac, 6) == 0;
+}

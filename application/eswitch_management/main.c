@@ -374,7 +374,7 @@ int main(int argc, char **argv) {
   }
   pipeline.hardware_ct_requested = hardware_ct_requested;
   if (hardware_ct_requested &&
-      (!pipeline.hardware_ct_enabled || !pipeline.hardware_routing_enabled))
+      (!pipeline.hardware_ct_enabled || pipeline.ct_admission_pipe == NULL))
     pipeline.hardware_ct_degraded = true;
   result = sf_packet_io_start(sf_interface, &sf_io);
   if (result != DOCA_SUCCESS) {

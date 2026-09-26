@@ -69,6 +69,13 @@ struct router_nat_stats {
   uint64_t port_forward_full;
 };
 
+/* Call only after Arm policy authorization and successful forwarding. */
+bool router_nat_session_offload_eligible(
+    const struct router_nat_session *session,
+    const struct router_interface *ingress,
+    const struct router_interface *egress, uint16_t ingress_port,
+    const uint8_t source_mac[6], bool authorized);
+
 struct router_nat_table {
   struct router_nat_session entries[ROUTER_NAT_MAX_SESSIONS];
   /* Single dataplane owner, like entries; not safe for concurrent writers. */

@@ -50,7 +50,8 @@ doca_error_t router_nat_ct_init(bool requested, bool supported,
     result = doca_flow_ct_cfg_set_actions_mem_size(
         cfg, actions_mem_size);
 
-  /* meta.u32[1] carries the VR zone.  meta.u32[0] is reserved for the
+  /* meta.u32[1] carries the connection-private admission zone.
+   * meta.u32[0] is reserved for the
    * post-CT adjacency selector written independently in each direction. */
   zone_mask.u32[1] = UINT32_MAX;
   modify_mask.flow.u32[0] = UINT32_MAX;

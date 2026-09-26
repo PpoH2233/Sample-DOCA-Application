@@ -108,6 +108,8 @@ struct eswitch_ct_session {
   const struct router_nat_session *software;
   struct doca_flow_pipe_entry *entry;
   struct flow_entry_cookie cookie;
+  struct eswitch_rule admission[2];
+  uint64_t lease_until_ns;
   bool active;
 };
 
@@ -139,6 +141,8 @@ struct eswitch_pipeline {
   struct doca_flow_port *switch_port;
 
   struct doca_flow_pipe *rss_pipe;
+  struct doca_flow_pipe *ct_admission_pipe;
+  struct eswitch_rule ct_admission_miss;
   struct doca_flow_pipe *flood_selector_pipe;
   struct doca_flow_pipe *destination_pipe;
   struct doca_flow_pipe *learning_clone_pipe;
@@ -324,6 +328,8 @@ doca_error_t eswitch_pipeline_ct_promote(
     const uint8_t reply_destination_mac[6]);
 doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
                                        uint16_t vr_id);
+doca_error_t eswitch_pipeline_ct_expire(struct eswitch_pipeline *pipeline,
+                                       uint64_t now_ns);
 doca_error_t eswitch_pipeline_detach_port(struct eswitch_pipeline *pipeline,
                                           uint16_t port_index);
 doca_error_t eswitch_pipeline_detach_vswitch_port(
