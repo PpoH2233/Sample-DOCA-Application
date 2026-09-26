@@ -561,23 +561,64 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
   return result;
 }
 
-/* CT is reachable only through an Arm-authorized, ingress-scoped tuple.
- * A miss retains local delivery, ACL and the original routing path. */
-/* Keep the shared IPv4 validity/TTL comparison separate from the per-session
- * exact tuple and zone action. Invalid authorized traffic returns to Arm. */
-static doca_error_t create_ct_guard(struct eswitch_pipeline *pipeline) {
+/* TTL is an unsigned byte: exact exceptions 0 and 1 are equivalent to >1,
+ * without allocating a hardware comparison resource. Only valid IPv4 reaches
+ * this stage; its catchall is not reachable from unauthenticated traffic. */
+static doca_error_t create_ct_ttl(struct eswitch_pipeline *pipeline,
+                                  const char **stage) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_match match = {0}, mask = {0};
-  struct doca_flow_match_condition condition = {0};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
-                             .next_pipe = pipeline->ct_pipe};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->rss_pipe};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
+                             .next_pipe = pipeline->ct_pipe};
+  *stage = "ttl-pipe-config";
+  doca_error_t result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_CT_TTL", DOCA_FLOW_PIPE_CONTROL, false, 3);
+  *stage = "ttl-pipe-create";
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL, &pipeline->ct_ttl_pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  for (unsigned i = 0; result == DOCA_SUCCESS && i < 3; i++) {
+    struct doca_flow_match match = {0}, mask = {0};
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.outer.ip4.ttl = (uint8_t)i;
+    mask.outer.ip4.ttl = UINT8_MAX;
+    flow_entry_cookie_prepare(&pipeline->ct_ttl_rules[i].cookie,
+                              "CT TTL guard", DOCA_FLOW_ENTRY_OP_ADD);
+    *stage = i < 2 ? "ttl-exception-add" : "ttl-pass-add";
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, pipeline->ct_ttl_pipe,
+        i < 2 ? &match : NULL, i < 2 ? &mask : NULL,
+        NULL, NULL, NULL, NULL, NULL, i < 2 ? 0 : 7,
+        i < 2 ? &miss : &hit, &pipeline->ct_ttl_rules[i].cookie,
+        &pipeline->ct_ttl_rules[i].entry);
+  }
+  if (result == DOCA_SUCCESS) {
+    *stage = "ttl-process";
+    result = process_rules(pipeline, pipeline->ct_ttl_rules, 3);
+  }
+  return result;
+}
+
+/* CT is reachable only through an authorized tuple AND a valid IPv4 header.
+ * Invalid authorized traffic returns to Arm, preserving policy revalidation. */
+static doca_error_t create_ct_guard(struct eswitch_pipeline *pipeline,
+                                    const char **stage) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
+                             .next_pipe = pipeline->ct_ttl_pipe};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->rss_pipe};
+  *stage = "guard-pipe-config";
   doca_error_t result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_CT_IPV4_GUARD", DOCA_FLOW_PIPE_CONTROL,
                              false, 2);
+  *stage = "guard-pipe-create";
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL, &pipeline->ct_guard_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
@@ -593,36 +634,39 @@ static doca_error_t create_ct_guard(struct eswitch_pipeline *pipeline) {
   match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
   match.outer.ip4.version_ihl = 0x45;
   mask.outer.ip4.version_ihl = UINT8_MAX;
-  match.outer.ip4.ttl = 1;
-  condition.operation = DOCA_FLOW_COMPARE_GT;
-  condition.field_op.a.field_string = "outer.ipv4.ttl";
-  condition.field_op.width = 8;
   flow_entry_cookie_prepare(&pipeline->ct_guard_rules[0].cookie,
                             "CT IPv4 guard", DOCA_FLOW_ENTRY_OP_ADD);
+  *stage = "guard-entry-add";
   result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, pipeline->ct_guard_pipe,
-      &match, &mask, &condition, NULL, NULL, NULL, NULL, 0, &hit,
+      &match, &mask, NULL, NULL, NULL, NULL, NULL, 0, &hit,
       &pipeline->ct_guard_rules[0].cookie, &pipeline->ct_guard_rules[0].entry);
   if (result == DOCA_SUCCESS) {
     flow_entry_cookie_prepare(&pipeline->ct_guard_rules[1].cookie,
                               "CT IPv4 guard miss", DOCA_FLOW_ENTRY_OP_ADD);
+    *stage = "guard-miss-add";
     result = doca_flow_pipe_control_add_entry(
         pipeline->runtime->queue_id, pipeline->ct_guard_pipe,
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, 7, &miss,
         &pipeline->ct_guard_rules[1].cookie, &pipeline->ct_guard_rules[1].entry);
   }
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    *stage = "guard-process";
     result = process_rules(pipeline, pipeline->ct_guard_rules, 2);
+  }
   return result;
 }
 
-static doca_error_t create_ct_admission(struct eswitch_pipeline *pipeline) {
+static doca_error_t create_ct_admission(struct eswitch_pipeline *pipeline,
+                                        const char **stage) {
   struct doca_flow_pipe_cfg *cfg = NULL;
+  *stage = "admission-pipe-config";
   doca_error_t result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_CT_AUTHORIZED", DOCA_FLOW_PIPE_CONTROL,
                              false, 2 * pipeline->ct_capacity + 1);
+  *stage = "admission-pipe-create";
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL,
                                    &pipeline->ct_admission_pipe);
@@ -633,12 +677,15 @@ static doca_error_t create_ct_admission(struct eswitch_pipeline *pipeline) {
     struct eswitch_rule *fallback = &pipeline->ct_admission_miss;
     flow_entry_cookie_prepare(&fallback->cookie, "CT admission miss",
                               DOCA_FLOW_ENTRY_OP_ADD);
+    *stage = "admission-miss-add";
     result = doca_flow_pipe_control_add_entry(
         pipeline->runtime->queue_id, pipeline->ct_admission_pipe,
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, 7, &miss,
         &fallback->cookie, &fallback->entry);
-    if (result == DOCA_SUCCESS)
+    if (result == DOCA_SUCCESS) {
+      *stage = "admission-process";
       result = process_rules(pipeline, fallback, 1);
+    }
   }
   return result;
 }
@@ -2362,6 +2409,7 @@ doca_error_t eswitch_pipeline_ct_promote(
     return DOCA_ERROR_INVALID_VALUE;
   if (!pipeline->hardware_ct_enabled || pipeline->ct_pipe == NULL ||
       pipeline->ct_admission_pipe == NULL || pipeline->ct_guard_pipe == NULL ||
+      pipeline->ct_ttl_pipe == NULL ||
       origin_target_vswitch == 0 ||
       reply_target_vswitch == 0)
     return DOCA_ERROR_NOT_SUPPORTED;
@@ -2737,9 +2785,12 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   }
   CREATE_STAGE("local IPv4 delivery", create_local_ip(pipeline));
   if (pipeline->hardware_ct_enabled) {
-    result = create_ct_guard(pipeline);
+    const char *stage = "ttl";
+    result = create_ct_ttl(pipeline, &stage);
     if (result == DOCA_SUCCESS)
-      result = create_ct_admission(pipeline);
+      result = create_ct_guard(pipeline, &stage);
+    if (result == DOCA_SUCCESS)
+      result = create_ct_admission(pipeline, &stage);
     if (result != DOCA_SUCCESS) {
       if (pipeline->ct_admission_pipe != NULL)
         doca_flow_pipe_destroy(pipeline->ct_admission_pipe);
@@ -2747,9 +2798,16 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
       if (pipeline->ct_guard_pipe != NULL)
         doca_flow_pipe_destroy(pipeline->ct_guard_pipe);
       pipeline->ct_guard_pipe = NULL;
+      if (pipeline->ct_ttl_pipe != NULL)
+        doca_flow_pipe_destroy(pipeline->ct_ttl_pipe);
+      pipeline->ct_ttl_pipe = NULL;
       pipeline->hardware_ct_degraded = true;
-      fprintf(stderr, "CT admission unavailable; keeping Arm authorization: %s\n",
-              doca_error_get_descr(result));
+      pipeline->ct_last_failure_stage = stage;
+      pipeline->ct_last_failure = result;
+      fprintf(stderr, "CT admission unavailable: stage=%s; keeping Arm authorization: %s\n",
+              stage, doca_error_get_descr(result));
+    } else {
+      printf("CT authorization ready: exact-session -> IPv4 guard -> TTL exceptions -> CT\n");
     }
   }
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
@@ -2802,6 +2860,8 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->ct_admission_pipe);
   if (pipeline->ct_guard_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->ct_guard_pipe);
+  if (pipeline->ct_ttl_pipe != NULL)
+    doca_flow_pipe_destroy(pipeline->ct_ttl_pipe);
   if (pipeline->local_ip_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->local_ip_pipe);
   for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {

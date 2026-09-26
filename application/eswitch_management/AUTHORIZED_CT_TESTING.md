@@ -1,4 +1,4 @@
-# Authorized NAT CT fast path (v43)
+# Authorized NAT CT fast path (v44)
 
 ## Scope and safety
 
@@ -28,7 +28,8 @@ connection. Capacity is not a promise that the device has enough resources.
 ```text
 VS ingress -> ARP dispatch -> exact authorized session gate
   hit: exact VS/port/MAC/5-tuple -> write connection-private CT zone
-       -> shared IPv4 guard (nonfragment, valid checksum/header, IHL=5, TTL > 1)
+       -> shared IPv4 guard (nonfragment, valid checksum/header, IHL=5)
+       -> TTL guard (0/1 to Arm, 2–255 to CT)
        -> CT NAT -> adjacency/TTL/VLAN -> egress
   guard miss: Arm slow path (no CT lookup)
   miss: local delivery -> guest ACL -> Arm policy/route/neighbor/NAT
@@ -42,7 +43,7 @@ its first correctly routed guest reply must pass the established-session check.
 
 ## One SNAT connection
 
-1. Record `eswitchctl status` before traffic. Require revision v43,
+1. Record `eswitchctl status` before traffic. Require revision v44,
    `hw_ct_state=ready` and `ct_authorization=exact-ingress-session`.
 2. Use a known reachable TCP/UDP service, rather than assuming the upstream
    gateway has an open TCP port. Transfer a large file over one TCP connection.
@@ -149,3 +150,25 @@ with no new failure count. If admission still fails, the diagnostic now names
 memory/capacity. Also repeat the fragment/options/checksum/TTL and policy-revoke
 tests above: splitting stages must not introduce an authorization bypass.
 Portable tests do not validate DOCA pipe creation or hardware completion.
+
+## v44 exact TTL exceptions and startup diagnostics
+
+The shared guard no longer combines header validation and a TTL comparison.
+An independent CONTROL pipe matches TTL 0 and 1 exactly and forwards those
+exceptions to Arm; its catchall forwards to CT. Only authenticated sessions
+with validated IPv4 headers reach this pipe. This preserves TTL > 1 semantics
+without the comparison resource implicated by the v43 startup failure hypothesis.
+It does not remove IPv4 options, fragmentation or checksum checks.
+
+Startup must print `CT authorization ready`. Startup failure logs now include
+`ttl-*`, `guard-*` or `admission-*` stages, and status preserves the stage/error
+in `ct_last_failure_stage` and `ct_last_error`. Promotion failure counters still
+count promotion attempts, not startup failures.
+
+Run one new SSH/PF connection first, then verify nonzero promotions/active CT
+during a transfer shorter than the 30-second lease. Test an authorized tuple
+with TTL 0, 1, 2 and 255: 0/1 must not enter CT; 2 must forward with TTL 1 and
+255 with TTL 254. Repeat checksum, options, fragment and policy-revocation
+negative tests before benchmarking. No additional CLI rules are required.
+The new hardware pipe shape requires compilation and traffic verification on BF3;
+successful portable tests alone are not proof of offload.
