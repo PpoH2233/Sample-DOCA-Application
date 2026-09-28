@@ -86,27 +86,31 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
             r->vr_id,r->rule_id,name,r->protocol==6?"tcp":"udp",
             public_ports,ipstr(r->private_ip,private_ip),private_ports);
   }
-  for(size_t i=0;i<c->egress_policy_count;i++) {
-    const struct router_egress_policy *p=&c->egress_policies[i];
+  for(unsigned direction=0;direction<2;direction++) {
+  const char *kind=direction?"ingress":"egress";
+  size_t policy_count=direction?c->ingress_policy_count:c->egress_policy_count;
+  size_t rule_count=direction?c->ingress_rule_count:c->egress_rule_count;
+  for(size_t i=0;i<policy_count;i++) {
+    const struct router_egress_policy *p=direction?&c->ingress_policies[i]:&c->egress_policies[i];
     const char *name=NULL;
     for(size_t j=0;j<c->interface_count;j++)
       if(c->interfaces[j].interface_id==p->interface_id &&
          c->interfaces[j].vr_id==p->vr_id) name=c->interfaces[j].name;
     if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling egress policy interface");}
-    fprintf(f,"vr egress policy set --id %u --interface %s --default %s\n",
-            p->vr_id,name,p->default_allow?"allow":"deny");
+    fprintf(f,"vr %s policy set --id %u --interface %s --default %s\n",
+            kind,p->vr_id,name,p->default_allow?"allow":"deny");
   }
-  for(size_t i=0;i<c->egress_rule_count;i++) {
-    const struct router_egress_rule *r=&c->egress_rules[i];
+  for(size_t i=0;i<rule_count;i++) {
+    const struct router_egress_rule *r=direction?&c->ingress_rules[i]:&c->egress_rules[i];
     const char *name=NULL;
     char source[INET_ADDRSTRLEN],destination[INET_ADDRSTRLEN];
     for(size_t j=0;j<c->interface_count;j++)
       if(c->interfaces[j].interface_id==r->interface_id &&
          c->interfaces[j].vr_id==r->vr_id) name=c->interfaces[j].name;
     if(!name) {fclose(f);unlink(tmp);return fail(out,size,"dangling egress rule interface");}
-    fprintf(f,"vr egress rule add --id %u --interface %s --rule-id %u "
+    fprintf(f,"vr %s rule add --id %u --interface %s --rule-id %u "
               "--action %s --protocol %s --source %s/%u --destination %s/%u",
-            r->vr_id,name,r->rule_id,r->allow?"allow":"deny",
+            kind,r->vr_id,name,r->rule_id,r->allow?"allow":"deny",
             r->protocol==6?"tcp":r->protocol==17?"udp":
             r->protocol==1?"icmp":"all",
             ipstr(r->source,source),r->source_prefix,
@@ -116,6 +120,7 @@ bool router_config_save(const char *path,const struct router_config *c,char *out
     if(r->icmp_type>=0) fprintf(f," --icmp-type %d",r->icmp_type);
     if(r->icmp_code>=0) fprintf(f," --icmp-code %d",r->icmp_code);
     fputc('\n',f);
+  }
   }
   bool ok=!ferror(f) && fflush(f)==0 && fsync(fd)==0;
   if(fclose(f)!=0) ok=false;
@@ -186,7 +191,9 @@ bool router_config_load(const char *path,struct router_config *config,char *out,
       !strncmp(line,"vr route add ",13) || !strncmp(line,"vr nat enable ",14) ||
       !strncmp(line,"vr port-forward add ",20) ||
       !strncmp(line,"vr egress policy set ",21) ||
-      !strncmp(line,"vr egress rule add ",19);
+      !strncmp(line,"vr egress rule add ",19) ||
+      !strncmp(line,"vr ingress policy set ",22) ||
+      !strncmp(line,"vr ingress rule add ",20);
     if(!permitted || (attachment!=(identity!=0))) {ok=false;break;}
     if(attachment) c->next_interface_id=identity;
     bool changed=false;

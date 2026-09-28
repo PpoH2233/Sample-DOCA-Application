@@ -1495,6 +1495,20 @@ static void route_uplink_ipv4_packet(
     const struct router_interface *ingress, uint16_t ingress_port,
     uint64_t now_ns);
 
+static bool ingress_firewall_allowed(struct eswitch_manager *manager,
+    const struct router_interface *ingress, const uint8_t *frame, size_t length) {
+  enum router_egress_verdict verdict = router_ingress_check(manager->router, ingress, frame, length);
+  if (verdict == ROUTER_EGRESS_NOT_APPLICABLE)
+    return true;
+  manager->ingress_checked++;
+  if (verdict == ROUTER_EGRESS_DENY) {
+    manager->ingress_denied++;
+    return false;
+  }
+  manager->ingress_allowed++;
+  return true;
+}
+
 static void route_nat_ingress_frame(
     struct eswitch_manager *manager, const uint8_t *frame, size_t length,
     const struct router_interface *ingress, uint16_t ingress_port,
@@ -1546,6 +1560,14 @@ static void route_nat_ingress_frame(
   }
   nat_result = router_nat_inbound(manager->nat, ingress->vr_id, frame, length,
                                   now_ns, translated, capacity, &session);
+  /* Reverse lookup authenticates only outbound-session replies. PF traffic
+   * must pass the public tuple firewall before creating/using DNAT state. */
+  if (nat_result == ROUTER_NAT_TRANSLATED && session != NULL &&
+      session->public_interface_id == ingress->interface_id && !session->port_forward) {
+    manager->ingress_established++;
+  } else if (!ingress_firewall_allowed(manager, ingress, frame, length)) {
+    goto out;
+  }
   if (nat_result == ROUTER_NAT_NOT_APPLICABLE &&
       router_port_forward_uses_interface(manager->router,
                                          ingress->interface_id)) {
@@ -1664,6 +1686,8 @@ static void route_router_ingress_frame(
                             link_hops, now_ns);
     return;
   }
+  if (!ingress_firewall_allowed(manager, ingress, frame, length))
+    return;
   route_arm_frame(manager, frame, length, ingress, ingress_port, link_hops,
                   0, now_ns);
 }
@@ -2147,6 +2171,12 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->routed_seen, manager->routed_forwarded,
       manager->route_no_route, manager->route_ttl_expired,
       manager->route_invalid);
+  used = append_text(response, size, used,
+      "public_ingress=arm-pre-nat policies=%zu rules=%zu checked=%" PRIu64
+      " allowed=%" PRIu64 " denied=%" PRIu64 " established_replies=%" PRIu64 "\n",
+      manager->router->ingress_policy_count, manager->router->ingress_rule_count,
+      manager->ingress_checked, manager->ingress_allowed, manager->ingress_denied,
+      manager->ingress_established);
   used = append_text(response, size, used,
       "guest_egress=%s policies=%zu rules=%zu checked=%" PRIu64
       " allowed=%" PRIu64 " denied=%" PRIu64

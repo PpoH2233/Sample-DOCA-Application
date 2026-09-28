@@ -60,6 +60,12 @@ int main(void) {
     count = router_hw_routes_build(&filtered, &neighbors, now, routes,
                                    ROUTER_HW_MAX_ROUTES);
     assert(count == 1 && routes[0].vr_id == 202);
+    filtered.egress_policy_count=0;
+    filtered.ingress_policies[filtered.ingress_policy_count++]=
+        (struct router_egress_policy){.vr_id=101,.interface_id=2,.default_allow=false};
+    assert(!router_hw_route_plans_equal(&config,&filtered,&neighbors,now));
+    count=router_hw_routes_build(&filtered,&neighbors,now,routes,ROUTER_HW_MAX_ROUTES);
+    assert(count==1 && routes[0].vr_id==202);
   }
 
   /* A VLAN-backed public RIF is still NAT slow path. Attachment type alone

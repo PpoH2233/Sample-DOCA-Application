@@ -46,6 +46,7 @@ struct eswitch_manager {
   bool packet_debug;
   uint64_t routed_seen, routed_forwarded, route_no_route;
   uint64_t egress_checked, egress_allowed, egress_denied;
+  uint64_t ingress_checked, ingress_allowed, ingress_denied, ingress_established;
   uint64_t egress_established_replies;
   uint64_t route_ttl_expired, route_invalid, route_neighbor_misses;
   uint64_t route_arp_probes, route_proactive_probes, route_tx_drops;

@@ -75,6 +75,9 @@ struct router_config {
   struct router_port_forward port_forwards[ROUTER_MAX_PORT_FORWARDS];
   struct router_egress_policy egress_policies[ROUTER_MAX_EGRESS_POLICIES];
   struct router_egress_rule egress_rules[ROUTER_MAX_EGRESS_RULES];
+  size_t ingress_policy_count, ingress_rule_count;
+  struct router_egress_policy ingress_policies[ROUTER_MAX_EGRESS_POLICIES];
+  struct router_egress_rule ingress_rules[ROUTER_MAX_EGRESS_RULES];
 };
 /* Callbacks validate attachments against the manager's current inventory.
  * Public ports must be representors and not owned by an L2 switch. */
@@ -102,6 +105,7 @@ bool router_port_forward_uses_interface(const struct router_config *,
 const struct router_egress_policy *router_egress_policy_find(
     const struct router_config *, uint16_t vr_id, uint16_t interface_id);
 bool router_egress_vr_has_policy(const struct router_config *, uint16_t vr_id);
+bool router_ingress_vr_has_policy(const struct router_config *, uint16_t vr_id);
 bool router_ipv4_prefix(const char *, uint32_t *, uint8_t *);
 /* Strict parser shared by eswitchctl and daemon. No mutations on failure. */
 bool router_command_valid(const char *, char *, size_t);

@@ -18,9 +18,9 @@ static uint32_t prefix_mask(uint8_t length) {
   return length == 0 ? 0 : UINT32_MAX << (32 - length);
 }
 
-enum router_egress_verdict router_egress_check(
+static enum router_egress_verdict firewall_check(
     const struct router_config *config, const struct router_interface *ingress,
-    const uint8_t *frame, size_t length) {
+    const uint8_t *frame, size_t length, bool public_ingress) {
   const struct router_egress_policy *policy;
   const struct router_egress_rule *best = NULL;
   const uint8_t *ip, *l4;
@@ -29,10 +29,17 @@ enum router_egress_verdict router_egress_check(
   size_t ip_header_length, l4_length;
   uint8_t protocol;
 
-  if (config == NULL || ingress == NULL || frame == NULL ||
-      ingress->attachment != ROUTER_VSWITCH ||
-      (policy = router_egress_policy_find(config, ingress->vr_id,
-                                           ingress->interface_id)) == NULL ||
+  if (config == NULL || ingress == NULL || frame == NULL)
+    return ROUTER_EGRESS_NOT_APPLICABLE;
+  const struct router_egress_policy *policies = public_ingress ? config->ingress_policies : config->egress_policies;
+  const struct router_egress_rule *rules = public_ingress ? config->ingress_rules : config->egress_rules;
+  size_t policy_count = public_ingress ? config->ingress_policy_count : config->egress_policy_count;
+  size_t rule_count = public_ingress ? config->ingress_rule_count : config->egress_rule_count;
+  policy = NULL;
+  for (size_t i=0;i<policy_count;i++)
+    if(policies[i].vr_id==ingress->vr_id && policies[i].interface_id==ingress->interface_id)
+      policy=&policies[i];
+  if ((!public_ingress && ingress->attachment != ROUTER_VSWITCH) || policy == NULL ||
       length < ETH_LEN || memcmp(frame, ingress->mac, 6) != 0 ||
       frame[12] != 0x08 || frame[13] != 0x00)
     return ROUTER_EGRESS_NOT_APPLICABLE;
@@ -49,7 +56,7 @@ enum router_egress_verdict router_egress_check(
     return ROUTER_EGRESS_DENY;
   destination = read32(ip + 16);
   /* Local VR services are not guest-network egress traffic. */
-  for (size_t i = 0; i < config->interface_count; i++) {
+  for (size_t i = 0; !public_ingress && i < config->interface_count; i++) {
     const struct router_interface *candidate = &config->interfaces[i];
     if (candidate->vr_id == ingress->vr_id && candidate->has_address &&
         candidate->address == destination)
@@ -70,8 +77,8 @@ enum router_egress_verdict router_egress_check(
     return ROUTER_EGRESS_DENY;
   if (protocol == 6 || protocol == 17)
     destination_port = read16(l4 + 2);
-  for (size_t i = 0; i < config->egress_rule_count; i++) {
-    const struct router_egress_rule *rule = &config->egress_rules[i];
+  for (size_t i = 0; i < rule_count; i++) {
+    const struct router_egress_rule *rule = &rules[i];
     if (rule->vr_id != ingress->vr_id ||
         rule->interface_id != ingress->interface_id ||
         (rule->protocol != 0 && rule->protocol != protocol) ||
@@ -92,4 +99,15 @@ enum router_egress_verdict router_egress_check(
   if (best != NULL)
     return best->allow ? ROUTER_EGRESS_ALLOW : ROUTER_EGRESS_DENY;
   return policy->default_allow ? ROUTER_EGRESS_ALLOW : ROUTER_EGRESS_DENY;
+}
+
+enum router_egress_verdict router_egress_check(
+    const struct router_config *config, const struct router_interface *ingress,
+    const uint8_t *frame, size_t length) {
+  return firewall_check(config, ingress, frame, length, false);
+}
+enum router_egress_verdict router_ingress_check(
+    const struct router_config *config, const struct router_interface *ingress,
+    const uint8_t *frame, size_t length) {
+  return firewall_check(config, ingress, frame, length, true);
 }

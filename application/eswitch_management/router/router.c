@@ -28,7 +28,7 @@ struct command {
   uint32_t source, destination;
   uint8_t source_prefix, destination_prefix;
   int16_t icmp_type, icmp_code;
-  bool allow, default_allow;
+  bool allow, default_allow, ingress;
 };
 
 static bool error(char *out, size_t size, const char *message) {
@@ -223,7 +223,8 @@ static bool parse(const char *request, struct command *c, char *out, size_t size
       c->op=PF_SHOW; required=ID;
       allowed=RULE_ID;
     } else return error(out,size,"expected port-forward add|delete|show");
-  } else if (count > 3 && !strcmp(verb,"egress")) {
+  } else if (count > 3 && (!strcmp(verb,"egress") || !strcmp(verb,"ingress"))) {
+    c->ingress = !strcmp(verb,"ingress");
     start=4;
     if (!strcmp(tokens[2],"policy")) {
       if (!strcmp(tokens[3],"set")) {
@@ -408,6 +409,12 @@ bool router_egress_vr_has_policy(const struct router_config *c, uint16_t vr_id) 
     if (c->egress_policies[i].vr_id==vr_id) return true;
   return false;
 }
+bool router_ingress_vr_has_policy(const struct router_config *c, uint16_t vr_id) {
+  if (!c) return false;
+  for (size_t i=0;i<c->ingress_policy_count;i++)
+    if (c->ingress_policies[i].vr_id==vr_id) return true;
+  return false;
+}
 static bool same_port(const struct router_port_identity *a,const struct router_port_identity *b) {
   return a->host==b->host && a->pf==b->pf && a->vf==b->vf;
 }
@@ -452,6 +459,11 @@ static bool egress_references(const struct router_config *c,uint16_t rif) {
     if(c->egress_policies[i].interface_id==rif) return true;
   return false;
 }
+static bool ingress_references(const struct router_config *c,uint16_t rif) {
+  for(size_t i=0;i<c->ingress_policy_count;i++)
+    if(c->ingress_policies[i].interface_id==rif) return true;
+  return false;
+}
 static bool peer_routes_reference(const struct router_config *c,
                                   const struct router_interface *rif) {
   const struct router_interface *peer;
@@ -475,6 +487,10 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
                     const char *request,char *out,size_t size,bool *changed) {
   struct command q={0}; *changed=false;
   if(!parse(request,&q,out,size)) return false;
+  struct router_egress_policy *policies = q.ingress ? c->ingress_policies : c->egress_policies;
+  struct router_egress_rule *rules = q.ingress ? c->ingress_rules : c->egress_rules;
+  size_t *policy_count = q.ingress ? &c->ingress_policy_count : &c->egress_policy_count;
+  size_t *rule_count = q.ingress ? &c->ingress_rule_count : &c->egress_rule_count;
   if(q.op==LINK_CREATE) {
     if(router_has_link(c,q.id)) return error(out,size,"router link already exists");
     if(c->link_count==ROUTER_MAX_LINKS) return error(out,size,"router link capacity reached");
@@ -520,16 +536,19 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
       if(q.op==EGRESS_POLICY_SHOW || q.op==EGRESS_RULE_SHOW) {
         const struct router_egress_policy *policy;
         size_t shown=0;
-        if(!rif || rif->attachment!=ROUTER_VSWITCH)
+        if(!rif || (!q.ingress && rif->attachment!=ROUTER_VSWITCH))
           return error(out,size,"guest vSwitch interface not found in VR");
-        policy=router_egress_policy_find(c,q.id,rif->interface_id);
+        policy=NULL;
+        for(size_t i=0;i<*policy_count;i++)
+          if(policies[i].vr_id==q.id && policies[i].interface_id==rif->interface_id)
+            policy=&policies[i];
         if(!policy) return error(out,size,"egress policy not configured");
-        used=append(out,size,used,"egress interface=%s switch=%u default=%s "
-                    "dataplane=ARM_PRE_ROUTE\n",rif->name,rif->vswitch_id,
-                    policy->default_allow?"allow":"deny");
+        used=append(out,size,used,"%s interface=%s switch=%u default=%s "
+                    "dataplane=%s\n",q.ingress?"ingress":"egress",rif->name,rif->vswitch_id,
+                    policy->default_allow?"allow":"deny",q.ingress?"ARM_PRE_NAT":"ARM_PRE_ROUTE");
         if(q.op==EGRESS_RULE_SHOW) {
-          for(size_t i=0;i<c->egress_rule_count;i++) {
-            const struct router_egress_rule *r=&c->egress_rules[i];
+          for(size_t i=0;i<(*rule_count);i++) {
+            const struct router_egress_rule *r=&rules[i];
             char src[INET_ADDRSTRLEN],dst[INET_ADDRSTRLEN];
             if(r->vr_id!=q.id || r->interface_id!=rif->interface_id ||
                (q.rule_id && r->rule_id!=q.rule_id)) continue;
@@ -547,7 +566,7 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
             used=append(out,size,used,"\n"); shown++;
           }
           if(q.rule_id && !shown) return error(out,size,"egress rule not found");
-          if(!shown) used=append(out,size,used,"egress rules=0\n");
+          if(!shown) used=append(out,size,used,"%s rules=0\n",q.ingress?"ingress":"egress");
         }
         return used<size ? true : error(out,size,"response too large");
       }
@@ -656,52 +675,55 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
     } else if(q.op==EGRESS_POLICY_SET || q.op==EGRESS_POLICY_DELETE ||
              q.op==EGRESS_RULE_ADD || q.op==EGRESS_RULE_DELETE) {
       size_t policy_index=0;
-      if(!rif || rif->attachment!=ROUTER_VSWITCH)
+      if(!rif || (!q.ingress && rif->attachment!=ROUTER_VSWITCH))
         return error(out,size,"egress policy requires a guest vSwitch interface");
-      for(;policy_index<c->egress_policy_count;policy_index++)
-        if(c->egress_policies[policy_index].vr_id==q.id &&
-           c->egress_policies[policy_index].interface_id==rif->interface_id)
+      if(q.ingress && (q.op==EGRESS_POLICY_SET || q.op==EGRESS_RULE_ADD) &&
+         (rif->attachment==ROUTER_LINK || !rif->has_address))
+        return error(out,size,"ingress policy requires an addressed port or vSwitch RIF");
+      for(;policy_index<(*policy_count);policy_index++)
+        if(policies[policy_index].vr_id==q.id &&
+           policies[policy_index].interface_id==rif->interface_id)
           break;
       if(q.op==EGRESS_POLICY_SET) {
         const struct router_nat_policy *nat=router_nat_policy_find(c,q.id);
-        if((nat && nat->interface_id==rif->interface_id) ||
-           router_port_forward_uses_interface(c,rif->interface_id))
+        if(!q.ingress && ((nat && nat->interface_id==rif->interface_id) ||
+           router_port_forward_uses_interface(c,rif->interface_id)))
           return error(out,size,"egress policy cannot be set on a public RIF");
-        if(policy_index==c->egress_policy_count) {
-          if(c->egress_policy_count==ROUTER_MAX_EGRESS_POLICIES)
+        if(policy_index==(*policy_count)) {
+          if((*policy_count)==ROUTER_MAX_EGRESS_POLICIES)
             return error(out,size,"egress policy capacity reached");
-          c->egress_policies[c->egress_policy_count++]=
+          policies[(*policy_count)++]=
               (struct router_egress_policy){q.id,rif->interface_id,q.default_allow};
-        } else c->egress_policies[policy_index].default_allow=q.default_allow;
+        } else policies[policy_index].default_allow=q.default_allow;
       } else {
-        if(policy_index==c->egress_policy_count)
+        if(policy_index==(*policy_count))
           return error(out,size,"egress policy not configured");
         if(q.op==EGRESS_POLICY_DELETE) {
-          for(size_t i=0;i<c->egress_rule_count;i++)
-            if(c->egress_rules[i].vr_id==q.id &&
-               c->egress_rules[i].interface_id==rif->interface_id)
+          for(size_t i=0;i<(*rule_count);i++)
+            if(rules[i].vr_id==q.id &&
+               rules[i].interface_id==rif->interface_id)
               return error(out,size,"delete egress rules before policy");
-          memmove(&c->egress_policies[policy_index],
-                  &c->egress_policies[policy_index+1],
-                  (--c->egress_policy_count-policy_index)*
-                  sizeof(c->egress_policies[0]));
+          memmove(&policies[policy_index],
+                  &policies[policy_index+1],
+                  (--(*policy_count)-policy_index)*
+                  sizeof(policies[0]));
         } else {
           size_t i=0;
-          for(;i<c->egress_rule_count;i++)
-            if(c->egress_rules[i].vr_id==q.id &&
-               c->egress_rules[i].interface_id==rif->interface_id &&
-               c->egress_rules[i].rule_id==q.rule_id) break;
+          for(;i<(*rule_count);i++)
+            if(rules[i].vr_id==q.id &&
+               rules[i].interface_id==rif->interface_id &&
+               rules[i].rule_id==q.rule_id) break;
           if(q.op==EGRESS_RULE_DELETE) {
-            if(i==c->egress_rule_count)
+            if(i==(*rule_count))
               return error(out,size,"egress rule not found");
-            memmove(&c->egress_rules[i],&c->egress_rules[i+1],
-                    (--c->egress_rule_count-i)*sizeof(c->egress_rules[0]));
+            memmove(&rules[i],&rules[i+1],
+                    (--(*rule_count)-i)*sizeof(rules[0]));
           } else {
-            if(i!=c->egress_rule_count)
+            if(i!=(*rule_count))
               return error(out,size,"egress rule ID already exists on interface");
-            if(c->egress_rule_count==ROUTER_MAX_EGRESS_RULES)
+            if((*rule_count)==ROUTER_MAX_EGRESS_RULES)
               return error(out,size,"egress rule capacity reached");
-            c->egress_rules[c->egress_rule_count++]=(struct router_egress_rule){
+            rules[(*rule_count)++]=(struct router_egress_rule){
                 .vr_id=q.id,.interface_id=rif->interface_id,.rule_id=q.rule_id,
                 .source=q.source,.destination=q.destination,
                 .source_prefix=q.source_prefix,
@@ -764,7 +786,7 @@ bool router_command(struct router_config *c,const struct router_inventory *inv,
         if(rif->has_address || routes_reference(c,rif->interface_id) ||
            nat_references(c,rif->interface_id) ||
            router_port_forward_uses_interface(c,rif->interface_id) ||
-           egress_references(c,rif->interface_id))
+           egress_references(c,rif->interface_id) || ingress_references(c,rif->interface_id))
           return error(out,size,"remove NAT, port-forward, egress policy, IP and route dependencies before detach");
         size_t i=(size_t)(rif-c->interfaces);
         memmove(rif,rif+1,(--c->interface_count-i)*sizeof(*rif));

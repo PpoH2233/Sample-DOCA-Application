@@ -88,7 +88,8 @@ size_t router_hw_routes_build(const struct router_config *config,
     /* Route entries key on VR, not ingress guest RIF. ACL deny is offloaded,
      * but permits still require the authoritative Arm recheck, so a VR with
      * a guest policy cannot enter this routed fast path yet. */
-    if (router_egress_vr_has_policy(config, neighbor->vr_id))
+    if (router_egress_vr_has_policy(config, neighbor->vr_id) ||
+        router_ingress_vr_has_policy(config, neighbor->vr_id))
       continue;
     egress = interface_by_id(config, neighbor->vr_id,
                              neighbor->interface_id);
@@ -109,7 +110,8 @@ size_t router_hw_routes_build(const struct router_config *config,
         config, configured->vr_id, configured->interface_id);
     const struct router_neighbor *neighbor;
 
-    if (router_egress_vr_has_policy(config, configured->vr_id))
+    if (router_egress_vr_has_policy(config, configured->vr_id) ||
+        router_ingress_vr_has_policy(config, configured->vr_id))
       continue;
 
     if (egress == NULL || egress->attachment != ROUTER_VSWITCH ||

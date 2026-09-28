@@ -14,5 +14,8 @@ enum router_egress_verdict {
 enum router_egress_verdict router_egress_check(
     const struct router_config *config, const struct router_interface *ingress,
     const uint8_t *frame, size_t length);
+enum router_egress_verdict router_ingress_check(
+    const struct router_config *config, const struct router_interface *ingress,
+    const uint8_t *frame, size_t length);
 
 #endif

@@ -1282,3 +1282,50 @@ promoted to hardware.
   4096), matching the software NAT table ceiling. This first implementation
   uses explicit flush at router mutation and shutdown and has no hardware aging
   or per-session CT counters.
+# Public-interface ingress firewall (v45)
+
+Ingress policies are scoped to VR ID and RIF interface, independently of guest
+egress policies. No policy preserves previous behavior. IPv4 rules inspect the
+original public destination IP and destination port before port-forward DNAT.
+ARP is not filtered. Router-local IPv4 services (including public-IP ping) are
+subject to ingress rules. Lowest rule ID wins; unmatched packets use the default.
+Fragments and malformed IPv4 under a policy fail closed.
+
+```bash
+eswitchctl vr ingress policy set --id 1 --interface uplink-vlan6 --default deny
+eswitchctl vr ingress rule add --id 1 --interface uplink-vlan6 --rule-id 100 \
+  --action allow --protocol tcp --source 0.0.0.0/0 \
+  --destination 161.246.6.38/32 --port-range 2222
+eswitchctl vr ingress rule add --id 1 --interface uplink-vlan6 --rule-id 110 \
+  --action allow --protocol icmp --icmp-type 8 --icmp-code 0
+eswitchctl vr ingress policy show --id 1 --interface uplink-vlan6
+eswitchctl vr ingress rule show --id 1 --interface uplink-vlan6
+eswitchctl vr ingress rule delete --id 1 --interface uplink-vlan6 --rule-id 100
+```
+
+`policy delete` requires removing all interface rules first. `rule show` supports
+optional `--rule-id`; `rule delete` requires it. Supported protocols: tcp, udp,
+icmp, all. Optional source/destination CIDRs default to any; TCP/UDP
+`--port-range` accepts one port or inclusive first-last. ICMP type/code may be
+omitted independently. Rule IDs are unique per direction and interface.
+Policies/rules persist in the existing `.router` state file.
+
+Verified reverse-session replies for outbound SNAT bypass the ingress default;
+port-forward packets require ingress authorization before creating DNAT state.
+Mutations revoke hardware CT and software sessions before commit, preventing old
+sessions bypassing a tightened firewall. Existing SSH may therefore disconnect
+when changing rules; use an independent management connection.
+
+This version evaluates new ingress traffic on Arm (`public_ingress=arm-pre-nat`),
+not a new DOCA ACL pipe. Existing authorized NAT/PF TCP/UDP CT promotion remains
+available: session admission follows the first permitted slow-path packet(s).
+VR-wide LPM promotion is suppressed for VRs with ingress policies so it cannot
+bypass enforcement. Dedicated port-link WAN and ICMP remain slow-path.
+
+BF3 smoke test: allow the actual PF public port before testing default deny;
+verify permitted SSH, denied other public ports, ICMP type/code, and outbound
+curl replies despite default deny. Check `eswitchctl status | grep public_ingress`.
+Use a real listening target and packet captures rather than an upstream port
+that might be closed. Remove an allow rule during a transfer and confirm CT
+revocation plus denial of a fresh connection. Repeat on another VR on the same
+public VS to verify isolation. Hardware/runtime verification is required on BF3.
