@@ -1,0 +1,13 @@
+[2026-09-11 19:16:40:679320][2763998144][DOCA][DBG][NUTILS][dpdk_utils.c:190][port_init] Port 0 MAC: 9c 63 c0 7b 9b a2
+[2026-09-11 19:16:40:679411][2763998144][DOCA][INF][NUTILS][dpdk_utils.c:126][port_init] Skip represent port 1 init in switch mode
+TX seq=1 accepted=1 destination_port=1 variant=metadata-only fdir=4294967295 flags=0x0000000000800000
+TX seq=2 accepted=1 destination_port=1 variant=metadata-only fdir=4294967295 flags=0x0000000000800000
+TX seq=3 accepted=1 destination_port=1 variant=metadata-only fdir=4294967295 flags=0x0000000000800000
+TX seq=4 accepted=1 destination_port=1 variant=metadata-only fdir=4294967295 flags=0x0000000000800000
+TX seq=5 accepted=1 destination_port=1 variant=metadata-only fdir=4294967295 flags=0x0000000000800000
+TX seq=6 accepted=1 destination_port=1 variant=rx-context fdir=1 flags=0x0000000000802000
+TX seq=7 accepted=1 destination_port=1 variant=rx-context fdir=1 flags=0x0000000000802000
+TX seq=8 accepted=1 destination_port=1 variant=rx-context fdir=1 flags=0x0000000000802000
+TX seq=9 accepted=1 destination_port=1 variant=rx-context fdir=1 flags=0x0000000000802000
+TX seq=10 accepted=1 destination_port=1 variant=rx-context fdir=1 flags=0x0000000000802000
+[2026-09-11 19:16:47:841408][2763998144][DOCA][DBG][NUTILS][dpdk_utils.c:726][dpdk_fini] DPDK fini is done

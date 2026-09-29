@@ -536,13 +536,17 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
   match.meta.pkt_meta = UINT32_MAX;
   memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
-  if (pipeline->egress_acl_selector_pipe != NULL)
+  if (pipeline->egress_acl_selector_pipe != NULL) {
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
     match.outer.ip4.dst_ip = UINT32_MAX;
+  }
   mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   mask.outer.eth.type = UINT16_MAX;
-  if (pipeline->egress_acl_selector_pipe != NULL)
+  if (pipeline->egress_acl_selector_pipe != NULL) {
+    mask.outer.l3_type = UINT32_MAX;
     mask.outer.ip4.dst_ip = UINT32_MAX;
+  }
   monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
 
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
@@ -725,6 +729,8 @@ static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
   struct doca_flow_match mask = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
   struct doca_flow_action_desc desc = {0};
   struct doca_flow_action_descs descs = {.nb_action_desc = 1,
                                          .desc_array = &desc};
@@ -762,6 +768,8 @@ static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
       result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL,
                                               descs_array, 1);
     if (result == DOCA_SUCCESS)
+      result = doca_flow_pipe_cfg_set_monitor(cfg, &monitor);
+    if (result == DOCA_SUCCESS)
       result = doca_flow_pipe_cfg_set_miss_counter(cfg, true);
     if (result == DOCA_SUCCESS)
       result = doca_flow_pipe_create(cfg, &fwd, &miss,
@@ -788,6 +796,8 @@ static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
 
 static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_monitor fallback_monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->hardware_ct_enabled
                                   ? pipeline->ct_dispatch_pipe
@@ -839,7 +849,7 @@ static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, pipeline->route_control_pipe,
-      NULL, NULL, NULL, NULL, NULL, NULL, NULL, 7, &fwd,
+      NULL, NULL, NULL, NULL, NULL, NULL, &fallback_monitor, 7, &fwd,
       &pipeline->route_fallback_rule.cookie,
       &pipeline->route_fallback_rule.entry);
   if (result != DOCA_SUCCESS)
@@ -849,35 +859,35 @@ static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
 
 static doca_error_t create_route_selector(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_match match = {0};
-  struct doca_flow_match mask = {0};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
-                              .next_pipe = pipeline->hardware_routing_enabled
-                                  ? pipeline->route_control_pipe
-                                  : pipeline->rss_pipe};
-  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-                               .next_pipe = pipeline->source_guard_pipe};
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+  struct doca_flow_fwd fallback = {.type = DOCA_FLOW_FWD_PIPE,
+                                   .next_pipe = pipeline->source_guard_pipe};
   doca_error_t result;
 
-  match.meta.pkt_meta = UINT32_MAX;
-  memset(match.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
-  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
-  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
-  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
-  mask.outer.eth.type = UINT16_MAX;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_ROUTER_SELECTOR",
-                             DOCA_FLOW_PIPE_BASIC, false,
-                             ROUTER_MAX_INTERFACES);
+                             DOCA_FLOW_PIPE_CONTROL, false,
+                             ROUTER_MAX_INTERFACES + 1U);
   if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, &match, &mask);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, &hit, &miss,
+    result = doca_flow_pipe_create(cfg, NULL, NULL,
                                    &pipeline->route_selector_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
-  return result;
+  if (result != DOCA_SUCCESS)
+    return result;
+  flow_entry_cookie_prepare(&pipeline->route_selector_fallback_rule.cookie,
+                            "router selector fallback",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_selector_pipe,
+      NULL, NULL, NULL, NULL, NULL, NULL, &monitor, 7, &fallback,
+      &pipeline->route_selector_fallback_rule.cookie,
+      &pipeline->route_selector_fallback_rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &pipeline->route_selector_fallback_rule, 1);
 }
 
 /* Only packets addressed to a guest RIF reach this selector: local RIF IPs
@@ -1778,17 +1788,25 @@ static doca_error_t add_route_selector_rule(
     struct eswitch_pipeline *pipeline,
     struct eswitch_sf_return_context *context) {
   struct doca_flow_match match = {0};
+  struct doca_flow_match mask = {0};
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+  struct doca_flow_fwd fwd = {
+      .type = DOCA_FLOW_FWD_PIPE,
+      .next_pipe = pipeline->hardware_routing_enabled
+          ? pipeline->route_control_pipe : pipeline->rss_pipe};
   doca_error_t result;
 
   match.meta.pkt_meta = DOCA_HTOBE32((uint32_t)context->vswitch_id << 16);
+  mask.meta.pkt_meta = DOCA_HTOBE32(ESWITCH_METADATA_VSWITCH_MASK);
   memcpy(match.outer.eth.dst_mac, context->rif_mac, RTE_ETHER_ADDR_LEN);
-  match.outer.eth.type = DOCA_HTOBE16(RTE_ETHER_TYPE_IPV4);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, RTE_ETHER_ADDR_LEN);
   flow_entry_cookie_prepare(&context->route_selector_rule.cookie,
                             "private router MAC selector",
                             DOCA_FLOW_ENTRY_OP_ADD);
-  result = doca_flow_pipe_basic_add_entry(
-      pipeline->runtime->queue_id, pipeline->route_selector_pipe, &match, 0,
-      NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, pipeline->route_selector_pipe,
+      &match, &mask, NULL, NULL, NULL, NULL, &monitor, 1, &fwd,
       &context->route_selector_rule.cookie,
       &context->route_selector_rule.entry);
   if (result != DOCA_SUCCESS)
@@ -2142,8 +2160,10 @@ static doca_error_t bind_sf_return_context(
     local_match.meta.pkt_meta =
         DOCA_HTOBE32((uint32_t)vswitch_id << 16);
     memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
-    if (pipeline->egress_acl_selector_pipe != NULL)
+    if (pipeline->egress_acl_selector_pipe != NULL) {
+      local_match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
       local_match.outer.ip4.dst_ip = DOCA_HTOBE32(rif_address);
+    }
     flow_entry_cookie_prepare(&free_context->local_ip_rule.cookie,
                               "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
     result = doca_flow_pipe_basic_add_entry(
@@ -2664,7 +2684,9 @@ doca_error_t eswitch_pipeline_ct_promote(
   uint32_t prepare_flags = DOCA_FLOW_CT_ENTRY_FLAGS_ALLOC_ON_MISS;
   uint32_t entry_flags = DOCA_FLOW_CT_ENTRY_FLAGS_NO_WAIT |
       DOCA_FLOW_CT_ENTRY_FLAGS_DIR_ORIGIN |
-      DOCA_FLOW_CT_ENTRY_FLAGS_DIR_REPLY;
+      DOCA_FLOW_CT_ENTRY_FLAGS_DIR_REPLY |
+      DOCA_FLOW_CT_ENTRY_FLAGS_COUNTER_ORIGIN |
+      DOCA_FLOW_CT_ENTRY_FLAGS_COUNTER_REPLY;
   bool found = false;
   const char *stage = "session-slot";
   doca_error_t result;
@@ -2904,13 +2926,45 @@ doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
 
 doca_error_t eswitch_pipeline_ct_expire(struct eswitch_pipeline *pipeline,
                                        uint64_t now_ns) {
-  /* NO_AGING/NO_COUNTER is the existing CT contract. A bounded lease avoids
+  /* NO_AGING is the existing CT lifetime contract. A bounded lease avoids
    * indefinitely pinning NAT ports. Batch revoke is conservative until
    * hardware activity-based aging is implemented and verified on BF3. */
   for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++)
     if (pipeline->ct_sessions[i].active &&
         now_ns >= pipeline->ct_sessions[i].lease_until_ns)
       return eswitch_pipeline_ct_flush(pipeline, 0);
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_ct_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *origin_hits,
+    uint64_t *reply_hits) {
+  struct doca_flow_resource_query origin = {0}, reply = {0};
+  uint64_t last_hit_s = 0;
+
+  if (pipeline == NULL || origin_hits == NULL || reply_hits == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  *origin_hits = 0;
+  *reply_hits = 0;
+  if (!pipeline->hardware_ct_enabled || pipeline->ct_pipe == NULL)
+    return DOCA_SUCCESS;
+  for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
+    const struct eswitch_ct_session *session = &pipeline->ct_sessions[i];
+    doca_error_t result;
+
+    if (!session->active || session->entry == NULL)
+      continue;
+    memset(&origin, 0, sizeof(origin));
+    memset(&reply, 0, sizeof(reply));
+    result = doca_flow_ct_query_entry(
+        ct_queue_id(pipeline), pipeline->ct_pipe,
+        DOCA_FLOW_CT_ENTRY_FLAGS_NO_WAIT, session->entry,
+        &origin, &reply, &last_hit_s);
+    if (result != DOCA_SUCCESS)
+      return result;
+    *origin_hits += origin.counter.total_pkts;
+    *reply_hits += reply.counter.total_pkts;
+  }
   return DOCA_SUCCESS;
 }
 
@@ -3831,15 +3885,53 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
 }
 
 doca_error_t eswitch_pipeline_hw_route_stats(
-    const struct eswitch_pipeline *pipeline, uint64_t *lpm_misses) {
+    const struct eswitch_pipeline *pipeline, uint64_t *lpm_hits,
+    uint64_t *lpm_misses, uint64_t *selector_hits,
+    uint64_t *selector_misses, uint64_t *eligibility_fallbacks) {
   struct doca_flow_resource_query query = {0};
   doca_error_t result;
 
-  if (pipeline == NULL || lpm_misses == NULL)
+  if (pipeline == NULL || lpm_hits == NULL || lpm_misses == NULL ||
+      selector_hits == NULL || selector_misses == NULL ||
+      eligibility_fallbacks == NULL)
     return DOCA_ERROR_INVALID_VALUE;
+  *lpm_hits = 0;
   *lpm_misses = 0;
+  *selector_hits = 0;
+  *selector_misses = 0;
+  *eligibility_fallbacks = 0;
   if (!pipeline->hardware_routing_enabled)
     return DOCA_SUCCESS;
+  for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++) {
+    const struct eswitch_sf_return_context *context =
+        &pipeline->sf_return_contexts[i];
+    if (!context->active || context->route_selector_rule.entry == NULL)
+      continue;
+    result = doca_flow_resource_query_entry(context->route_selector_rule.entry,
+                                            &query);
+    if (result != DOCA_SUCCESS)
+      return result;
+    *selector_hits += query.counter.total_pkts;
+  }
+  result = doca_flow_resource_query_entry(
+      pipeline->route_selector_fallback_rule.entry, &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *selector_misses = query.counter.total_pkts;
+  result = doca_flow_resource_query_entry(pipeline->route_fallback_rule.entry,
+                                          &query);
+  if (result != DOCA_SUCCESS)
+    return result;
+  *eligibility_fallbacks = query.counter.total_pkts;
+  for (size_t i = 0; i < ROUTER_HW_MAX_ROUTES; i++) {
+    const struct eswitch_hw_route_entry *route = &pipeline->hw_routes[i];
+    if (!route->active || route->rule.entry == NULL)
+      continue;
+    result = doca_flow_resource_query_entry(route->rule.entry, &query);
+    if (result != DOCA_SUCCESS)
+      return result;
+    *lpm_hits += query.counter.total_pkts;
+  }
   result = doca_flow_resource_query_pipe_miss(pipeline->route_lpm_pipe,
                                                &query);
   if (result == DOCA_SUCCESS)

@@ -181,6 +181,7 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *ct_egress_pipe;
   struct eswitch_rule ct_dispatch_rules[3];
   struct eswitch_rule route_ttl_exception_rules[2];
+  struct eswitch_rule route_selector_fallback_rule;
   struct eswitch_rule route_fallback_rule;
   struct eswitch_hw_route_entry hw_routes[ROUTER_HW_MAX_ROUTES];
   size_t hw_route_count;
@@ -323,7 +324,12 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
     struct eswitch_pipeline *pipeline, const struct router_hw_route *routes,
     size_t route_count);
 doca_error_t eswitch_pipeline_hw_route_stats(
-    const struct eswitch_pipeline *pipeline, uint64_t *lpm_misses);
+    const struct eswitch_pipeline *pipeline, uint64_t *lpm_hits,
+    uint64_t *lpm_misses, uint64_t *selector_hits,
+    uint64_t *selector_misses, uint64_t *eligibility_fallbacks);
+doca_error_t eswitch_pipeline_ct_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *origin_hits,
+    uint64_t *reply_hits);
 
 /* Inject the current guest-egress policy generation. Unsupported policies
  * and resource failures are steered to the authoritative Arm checker. */

@@ -1248,6 +1248,14 @@ static void route_arm_frame(struct eswitch_manager *manager,
     goto out;
   }
   manager->routed_seen++;
+  if (manager->packet_debug)
+    printf("ROUTE RX: vr=%u ingress-rif=%u ingress-port=%u "
+           "src-mac=%02x:%02x:%02x:%02x:%02x:%02x "
+           "dst-mac=%02x:%02x:%02x:%02x:%02x:%02x len=%zu\n",
+           ingress->vr_id, ingress->interface_id, ingress_port,
+           frame[6], frame[7], frame[8], frame[9], frame[10], frame[11],
+           frame[0], frame[1], frame[2], frame[3], frame[4], frame[5],
+           length);
   if (disposition == ROUTER_IPV4_INVALID) {
     manager->route_invalid++;
     goto out;
@@ -1987,7 +1995,13 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
+  uint64_t hw_lpm_hits = 0;
   uint64_t hw_lpm_misses = 0;
+  uint64_t hw_selector_hits = 0;
+  uint64_t hw_selector_misses = 0;
+  uint64_t hw_eligibility_fallbacks = 0;
+  uint64_t hw_ct_origin_hits = 0;
+  uint64_t hw_ct_reply_hits = 0;
   uint64_t uplink_arp_hw_drops = 0;
   uint64_t now_ns = monotonic_ns();
   uint64_t hw_retry_in_ms = manager->next_hw_route_retry_ns > now_ns
@@ -1995,6 +2009,7 @@ static size_t format_status(const struct eswitch_manager *manager,
       : 0;
   doca_error_t sf_counter_result;
   doca_error_t hw_counter_result;
+  doca_error_t ct_counter_result;
   doca_error_t uplink_arp_counter_result;
   uint64_t uptime = (now_ns - manager->started_ns) / 1000000000ULL;
 
@@ -2032,7 +2047,10 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline, &sf_ingress_hits, &sf_context_hits,
       &local_ip_hits);
   hw_counter_result = eswitch_pipeline_hw_route_stats(manager->pipeline,
-                                                       &hw_lpm_misses);
+      &hw_lpm_hits, &hw_lpm_misses, &hw_selector_hits, &hw_selector_misses,
+      &hw_eligibility_fallbacks);
+  ct_counter_result = eswitch_pipeline_ct_stats(
+      manager->pipeline, &hw_ct_origin_hits, &hw_ct_reply_hits);
   uplink_arp_counter_result = eswitch_pipeline_uplink_arp_drop_query(
       manager->pipeline, &uplink_arp_hw_drops);
   used = append_text(response, size, used, "OK\n");
@@ -2069,7 +2087,9 @@ static size_t format_status(const struct eswitch_manager *manager,
       "hw_requested_capacity=%u hw_capacity=%u hw_routes=%zu "
       "promotions=%" PRIu64 " updates=%" PRIu64
       " removals=%" PRIu64 " failures=%" PRIu64
-      " lpm_misses=%" PRIu64 " counter_state=%s\n",
+      " lpm_hits=%" PRIu64 " lpm_misses=%" PRIu64
+      " selector_hits=%" PRIu64 " selector_misses=%" PRIu64
+      " eligibility_fallbacks=%" PRIu64 " counter_state=%s\n",
       manager->pipeline->hardware_routing_requested ? "enabled" : "disabled",
       !manager->pipeline->hardware_routing_requested ? "off" :
           (!manager->pipeline->hardware_routing_enabled ? "fallback-arm" :
@@ -2081,7 +2101,8 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline->hw_route_promotions,
       manager->pipeline->hw_route_updates,
       manager->pipeline->hw_route_removals,
-      manager->pipeline->hw_route_failures, hw_lpm_misses,
+      manager->pipeline->hw_route_failures, hw_lpm_hits, hw_lpm_misses,
+      hw_selector_hits, hw_selector_misses, hw_eligibility_fallbacks,
       !manager->pipeline->hardware_routing_enabled ? "off" :
           (hw_counter_result == DOCA_SUCCESS ? "ready" : "error"));
   used = append_text(response, size, used,
@@ -2121,9 +2142,13 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->pipeline->ct_full);
   used = append_text(response, size, used,
       "ct_authorization=%s ct_scope=vs-to-vs-nat-tcp-udp "
-      "ct_zone=connection ct_lease_ms=30000 ct_activity_counters=off\n",
+      "ct_zone=connection ct_lease_ms=30000 ct_activity_counters=%s "
+      "origin_hits=%" PRIu64 " reply_hits=%" PRIu64 "\n",
       manager->pipeline->ct_admission_pipe != NULL ? "exact-ingress-session"
-                                                  : "arm-only");
+                                                  : "arm-only",
+      !manager->pipeline->hardware_ct_enabled ? "off" :
+          (ct_counter_result == DOCA_SUCCESS ? "ready" : "error"),
+      hw_ct_origin_hits, hw_ct_reply_hits);
   used = append_text(response, size, used,
       "ct_retry_backoff_ms=%u ct_retry_suppressed=%" PRIu64
       " ct_no_memory=%" PRIu64 " ct_last_failure_stage=%s"

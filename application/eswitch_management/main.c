@@ -327,7 +327,8 @@ int main(int argc, char **argv) {
   }
   result = switch_flow_ports_start_with_actions_mem(
       &devices.ethernet_ports, flow_actions_mem_size,
-      uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
+      uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES,
+      hardware_ct_requested ? hardware_ct_capacity * 2U : 0U, &flow_ports);
   if (result == DOCA_ERROR_NO_MEMORY &&
       flow_actions_mem_size > legacy_actions_mem_size) {
     fprintf(stderr, "ACL action-memory reserve unavailable; retrying Flow "
@@ -337,7 +338,8 @@ int main(int argc, char **argv) {
     acl_action_entries = 0;
     result = switch_flow_ports_start_with_actions_mem(
         &devices.ethernet_ports, flow_actions_mem_size,
-        uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES, &flow_ports);
+        uplink_arp_pps == 0 ? 0 : ESWITCH_MAX_VSWITCHES,
+        hardware_ct_requested ? hardware_ct_capacity * 2U : 0U, &flow_ports);
   }
   if (result != DOCA_SUCCESS) {
     fprintf(stderr, "Failed to start DOCA Flow ports: %s\n",

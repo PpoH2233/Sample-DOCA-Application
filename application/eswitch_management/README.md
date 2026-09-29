@@ -379,9 +379,12 @@ that a validated echo reply was submitted through the SF return path. The
 misses, ARP probes, and successful routed transmissions.
 
 The `hw_routing_configured` status line reports active LPM entries,
-promotions, in-place adjacency updates, removals, failures and LPM misses.
-For a steady inter-VS flow, the egress hardware counter must increase while
-`routed_seen` stops increasing. Verify rollout on the BF3 with:
+promotions, in-place adjacency updates, removals and failures. `selector_hits`
+proves that a packet reached a private RIF selector; `lpm_hits` proves that an
+installed route forwarded it in hardware. `lpm_misses` and
+`eligibility_fallbacks` identify traffic returned to the slow path. For a
+steady inter-VS flow, `lpm_hits` must increase while `routed_seen` stops
+increasing. Verify rollout on the BF3 with:
 
 ```bash
 # Arm baseline for comparison.
@@ -395,18 +398,19 @@ ESWITCH_HW_ROUTING=0 ESWITCH_HW_CT=0 \
 ```
 
 Test gateway ARP/ICMP, bidirectional inter-VS ping and TCP/UDP, then NAT curl
-and NAT ICMP. For TCP/UDP NAT, `nat_created` and `ct_promotions` must increase,
-`ct_active` must remain non-zero, and `nat_out`/`nat_in` should stop increasing
-for the established flow while traffic continues. The first packet uses Arm;
-subsequent eligible packets use hardware. ICMP NAT counters continue to grow
-because ICMP stays on Arm. Change a neighbor MAC, detach and
+and NAT ICMP. For TCP/UDP NAT, `nat_created` and `hw_ct_promotions` must
+increase, `hw_ct_active` must remain non-zero, and CT `origin_hits` and
+`reply_hits` must increase while `nat_out`/`nat_in` stop increasing for the
+established flow. The first packet uses Arm; subsequent eligible packets use
+hardware. ICMP NAT counters continue to grow because ICMP stays on Arm. Change
+a neighbor MAC, detach and
 reattach a VF, edit a RIF MAC and remove a route; stale hardware forwarding
 must disappear. Fragments, IPv4 options and TTL 1 must still reach the slow
 path. Router configuration mutations conservatively flush all CT/NAT sessions.
-This initial CT implementation disables hardware aging and counters; entries
-are explicitly removed at configuration change and shutdown, so capacity must
-cover the maximum concurrent TCP/UDP sessions between restarts. Do not enable
-this flag in production until those hardware checks pass.
+This CT implementation disables hardware aging but enables per-direction
+hardware counters. Entries use a bounded software lease and are also removed
+at configuration change and shutdown, so capacity must cover the expected
+concurrent TCP/UDP sessions during a lease interval.
 
 Inspect startup and health status with:
 

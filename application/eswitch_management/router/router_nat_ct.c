@@ -38,8 +38,10 @@ doca_error_t router_nat_ct_init(bool requested, bool supported,
   result = doca_flow_ct_cfg_create(&cfg);
   if (result != DOCA_SUCCESS)
     return result;
-  result = doca_flow_ct_cfg_set_flags(
-      cfg, DOCA_FLOW_CT_FLAG_NO_AGING | DOCA_FLOW_CT_FLAG_NO_COUNTER);
+  /* Keep software-controlled leases, but enable per-direction hardware
+   * counters so status can distinguish an installed CT entry from packets
+   * actually taking the CT fast path. */
+  result = doca_flow_ct_cfg_set_flags(cfg, DOCA_FLOW_CT_FLAG_NO_AGING);
   if (result == DOCA_SUCCESS)
     result = doca_flow_ct_cfg_set_queues(cfg, 1);
   if (result == DOCA_SUCCESS)

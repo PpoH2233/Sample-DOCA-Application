@@ -240,11 +240,14 @@ representor is classified directly to the Arm RSS path with `(VR, port)`
 metadata; it is not allowed into tenant L2 learning. Public ARP is RIF-scoped.
 
 ```text
-VM -> private VS/RIF -> Arm LPM -> TCP/UDP SNAT/PAT or ICMP Echo ID NAT
-   -> public RIF/next-hop rewrite -> directed SF context -> uplink representor
+VM -> private VS/RIF -> first TCP/UDP packet on Arm SNAT/PAT
+   -> exact-session DOCA CT promotion -> later packets in hardware
+   -> public RIF/next-hop rewrite -> uplink representor
 
-uplink representor -> Arm reverse-session lookup -> DNAT
-   -> original private RIF/VM identity -> directed SF context -> VM
+uplink representor -> DOCA CT reverse-session hit -> DNAT in hardware
+   -> original private RIF/VM identity -> VM
+
+ICMP Echo NAT and unsupported packets continue through the Arm slow path.
 ```
 
 The first outbound packet may be dropped while the public next-hop ARP entry is
