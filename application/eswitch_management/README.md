@@ -85,9 +85,10 @@ TCP/UDP first packet installs a bidirectional CT entry. Later packets take
 hardware and selects a post-CT L2/TTL adjacency. A miss still reaches Arm.
 ICMP Echo NAT intentionally remains on Arm. Set `ESWITCH_HW_ROUTING=0` and/or
 `ESWITCH_HW_CT=0` to disable either fast path for an Arm baseline. The default
-CT capacity requests 4096 concurrent sessions globally (the software NAT table
-limit), shared across all VFs; it is not a per-VF reservation. If the admission
-pipe cannot be allocated, startup retries at half capacity down to 64;
+CT capacity requests 2048 concurrent sessions globally, shared across all VFs;
+it is not a per-VF reservation. The software NAT table still supports up to
+4096 sessions. If the admission pipe rejects the requested size or cannot be
+allocated, startup retries at half capacity down to 64;
 `hw_ct_requested_capacity` and `hw_ct_capacity` show requested and admitted
 capacity. LPM defaults to 64 routes, matching the combined LPM/CT startup
 tested on BF3. Hardware admission and packet-path behavior at higher CT

@@ -1279,12 +1279,12 @@ promoted to hardware.
   Arm. With `ESWITCH_HW_CT=1`, TCP/UDP sessions are then installed atomically
   in both DOCA Flow CT directions; CT misses and ICMP stay on Arm.
 - `ESWITCH_HW_CT_CAPACITY` is a power of two from 64 through 4096 (default
-  request 4096), matching the software NAT table ceiling. If the admission
-  pipe cannot be allocated, startup retries smaller powers of two down to 64;
+  request 2048); the software NAT table ceiling remains 4096. If the admission
+  pipe rejects the requested size or cannot be allocated, startup retries
+  smaller powers of two down to 64;
   `hw_ct_requested_capacity` and `hw_ct_capacity` report the request and the
-  admitted limit. This first implementation
-  uses explicit flush at router mutation and shutdown and has no hardware aging
-  or per-session CT counters.
+  admitted limit. This first implementation uses explicit flush at router
+  mutation and shutdown and has no hardware aging or per-session CT counters.
 # Public-interface ingress firewall (v46)
 
 Ingress policies are scoped to VR ID and RIF interface, independently of guest

@@ -664,12 +664,14 @@ static doca_error_t create_ct_admission(struct eswitch_pipeline *pipeline,
   doca_error_t result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
+  *stage = "admission-pipe-size";
   result = set_pipe_identity(cfg, "ESW_CT_AUTHORIZED", DOCA_FLOW_PIPE_CONTROL,
                              false, 2 * pipeline->ct_capacity + 1);
-  *stage = "admission-pipe-create";
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
+    *stage = "admission-pipe-create";
     result = doca_flow_pipe_create(cfg, NULL, NULL,
                                    &pipeline->ct_admission_pipe);
+  }
   doca_flow_pipe_cfg_destroy(cfg);
   if (result == DOCA_SUCCESS) {
     struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
@@ -703,13 +705,17 @@ static doca_error_t create_ct_admission_with_retry(
       pipeline->ct_admission_pipe = NULL;
     }
     pipeline->ct_admission_miss = (struct eswitch_rule){0};
-    if ((*stage != NULL && strcmp(*stage, "admission-pipe-create") != 0) ||
-        (result != DOCA_ERROR_NO_MEMORY && result != DOCA_ERROR_FULL) ||
+    if ((strcmp(*stage, "admission-pipe-size") != 0 &&
+         strcmp(*stage, "admission-pipe-create") != 0) ||
+        (result != DOCA_ERROR_INVALID_VALUE &&
+         result != DOCA_ERROR_NO_MEMORY && result != DOCA_ERROR_FULL) ||
         pipeline->ct_capacity <= ESWITCH_CT_MIN_CAPACITY)
       return result;
+    fprintf(stderr, "CT admission capacity retry: stage=%s error=%s "
+                    "capacity=%u -> %u\n",
+            *stage, doca_error_get_descr(result), pipeline->ct_capacity,
+            pipeline->ct_capacity >> 1);
     pipeline->ct_capacity >>= 1;
-    fprintf(stderr, "CT admission resource retry: capacity=%u\n",
-            pipeline->ct_capacity);
   }
 }
 

@@ -30,8 +30,8 @@ ESWITCH_ACL_ACTION_ENTRIES="16"
 # Promote established TCP/UDP NAT sessions to DOCA Flow CT. First packets,
 # misses, ICMP and unsupported flows continue through the Arm slow path.
 ESWITCH_HW_CT="1"
-# Global CT table, up to 4096 concurrent sessions across all VFs.
-ESWITCH_HW_CT_CAPACITY="4096"
+# Global CT table, up to 2048 concurrent sessions across all VFs by default.
+ESWITCH_HW_CT_CAPACITY="2048"
 
 # Rate-limit broadcast ARP from router uplinks in DOCA Flow before RSS/Arm.
 # Unicast ARP replies and non-broadcast traffic bypass this meter. Set PPS to
