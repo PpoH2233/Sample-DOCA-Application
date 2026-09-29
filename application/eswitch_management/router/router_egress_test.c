@@ -9,6 +9,13 @@
 static struct router_config config;
 static char response[16384];
 
+static bool hardware_denies(const struct router_tcp_port_range *ranges,
+                            size_t count, uint16_t port) {
+  for (size_t i = 0; i < count; i++)
+    if (port >= ranges[i].first && port <= ranges[i].last) return true;
+  return false;
+}
+
 static bool switch_exists(void *context, uint16_t id) {
   (void)context;
   return id == 100 || id == 200;
@@ -129,6 +136,32 @@ int main(void) {
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_DENY);
   assert(router_egress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_NOT_APPLICABLE);
   command("vr ingress rule add --id 1 --interface guest --rule-id 100 --action allow --protocol tcp --port-range 2222-2223",true);
+  {
+    struct router_tcp_port_range ranges[8];
+    size_t count = router_ingress_tcp_deny_ranges(&config, guest, ranges, 8);
+    assert(count == 2);
+    assert(hardware_denies(ranges, count, 22));
+    assert(!hardware_denies(ranges, count, 2222));
+    assert(!hardware_denies(ranges, count, 2223));
+    assert(hardware_denies(ranges, count, 2224));
+    assert(!hardware_denies(ranges, count, 0));
+    config.nat_policies[0] = (struct router_nat_policy){
+        .vr_id=guest->vr_id, .interface_id=guest->interface_id,
+        .port_first=20000, .port_last=60999};
+    config.nat_policy_count=1;
+    count = router_ingress_tcp_deny_ranges(&config, guest, ranges, 8);
+    assert(count == 3);
+    assert(!hardware_denies(ranges, count, 40000));
+    assert(hardware_denies(ranges, count, 61000));
+    config.nat_policy_count=0;
+    config.ingress_rules[config.ingress_rule_count] =
+        (struct router_egress_rule){.vr_id=guest->vr_id,
+            .interface_id=guest->interface_id, .rule_id=101,
+            .protocol=0, .allow=true, .icmp_type=-1, .icmp_code=-1};
+    config.ingress_rule_count++;
+    assert(router_ingress_tcp_deny_ranges(&config, guest, ranges, 8) == 0);
+    config.ingress_rule_count--;
+  }
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_ALLOW);
   packet(frame,2224);
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_DENY);

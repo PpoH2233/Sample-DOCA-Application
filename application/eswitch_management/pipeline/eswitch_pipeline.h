@@ -95,6 +95,17 @@ struct eswitch_egress_acl {
   bool fallback_arm;
 };
 
+#define ESWITCH_INGRESS_DENY_MAX_RANGES 8U
+struct eswitch_ingress_deny {
+  uint16_t interface_id;
+  struct doca_flow_pipe *pipe;
+  struct eswitch_rule *rules;
+  uint16_t first[ESWITCH_INGRESS_DENY_MAX_RANGES];
+  uint16_t last[ESWITCH_INGRESS_DENY_MAX_RANGES];
+  size_t rule_count;
+  bool active;
+};
+
 struct eswitch_ct_adjacency {
   uint32_t id;
   uint16_t vswitch_id;
@@ -201,6 +212,8 @@ struct eswitch_pipeline {
   struct eswitch_sf_return_context
       sf_return_contexts[ESWITCH_MAX_SF_RETURN_CONTEXTS];
   struct eswitch_egress_acl egress_acls[ROUTER_MAX_EGRESS_POLICIES];
+  struct eswitch_ingress_deny ingress_denies[ROUTER_MAX_EGRESS_POLICIES];
+  uint64_t ingress_deny_failures;
   uint64_t egress_acl_failures;
   uint64_t egress_acl_pf_reply_fallbacks;
 
@@ -313,6 +326,8 @@ doca_error_t eswitch_pipeline_hw_route_stats(
 /* Inject the current guest-egress policy generation. Unsupported policies
  * and resource failures are steered to the authoritative Arm checker. */
 doca_error_t eswitch_pipeline_egress_acl_sync(
+    struct eswitch_pipeline *pipeline, const struct router_config *config);
+doca_error_t eswitch_pipeline_ingress_deny_sync(
     struct eswitch_pipeline *pipeline, const struct router_config *config);
 /* Install an exact, session-owned exception before delivering the inbound
  * port-forward packet to its guest. The hit still goes to Arm for NAT. */

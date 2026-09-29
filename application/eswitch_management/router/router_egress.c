@@ -1,6 +1,7 @@
 #include "router_egress.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #define ETH_LEN 14U
 #define IPV4_MIN_LEN 20U
@@ -110,4 +111,57 @@ enum router_egress_verdict router_ingress_check(
     const struct router_config *config, const struct router_interface *ingress,
     const uint8_t *frame, size_t length) {
   return firewall_check(config, ingress, frame, length, true);
+}
+
+size_t router_ingress_tcp_deny_ranges(
+    const struct router_config *config, const struct router_interface *rif,
+    struct router_tcp_port_range *ranges, size_t capacity) {
+  uint8_t *excluded;
+  bool default_deny = false;
+  size_t count = 0;
+  if (config == NULL || rif == NULL || ranges == NULL || capacity == 0 ||
+      rif->attachment != ROUTER_VSWITCH || !rif->has_address)
+    return 0;
+  for (size_t i = 0; i < config->ingress_policy_count; i++)
+    if (config->ingress_policies[i].vr_id == rif->vr_id &&
+        config->ingress_policies[i].interface_id == rif->interface_id)
+      default_deny = !config->ingress_policies[i].default_allow;
+  if (!default_deny)
+    return 0;
+  excluded = calloc(65536, 1);
+  if (excluded == NULL)
+    return 0;
+  excluded[0] = 1; /* In DOCA ACL, port mask 0 means ANY, not exact zero. */
+  /* Exclude every potentially allowed TCP destination port, even if source,
+   * destination or rule priority would narrow it. This over-approximates
+   * allows, so no packet allowed by Arm can be dropped here. */
+  for (size_t i = 0; i < config->ingress_rule_count; i++) {
+    const struct router_egress_rule *rule = &config->ingress_rules[i];
+    if (rule->vr_id != rif->vr_id || rule->interface_id != rif->interface_id ||
+        !rule->allow || (rule->protocol != 0 && rule->protocol != 6))
+      continue;
+    uint16_t first = rule->port_first ? rule->port_first : 0;
+    uint16_t last = rule->port_first ? rule->port_last : UINT16_MAX;
+    for (uint32_t port = first; port <= last; port++)
+      excluded[port] = 1;
+  }
+  /* Arm reverse-NAT lookup precedes ingress policy. Exempt the entire NAT
+   * allocation range, including Arm-only and not-yet-promoted sessions. */
+  for (size_t i = 0; i < config->nat_policy_count; i++) {
+    const struct router_nat_policy *nat = &config->nat_policies[i];
+    if (nat->vr_id != rif->vr_id || nat->interface_id != rif->interface_id)
+      continue;
+    for (uint32_t port = nat->port_first; port <= nat->port_last; port++)
+      excluded[port] = 1;
+  }
+  for (uint32_t port = 0; port <= UINT16_MAX;) {
+    uint32_t first;
+    if (excluded[port]) { port++; continue; }
+    first = port;
+    while (port <= UINT16_MAX && !excluded[port]) port++;
+    if (count == capacity) { free(excluded); return 0; }
+    ranges[count++] = (struct router_tcp_port_range){first, port - 1};
+  }
+  free(excluded);
+  return count;
 }

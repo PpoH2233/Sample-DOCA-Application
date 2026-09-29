@@ -1282,7 +1282,7 @@ promoted to hardware.
   4096), matching the software NAT table ceiling. This first implementation
   uses explicit flush at router mutation and shutdown and has no hardware aging
   or per-session CT counters.
-# Public-interface ingress firewall (v45)
+# Public-interface ingress firewall (v46)
 
 Ingress policies are scoped to VR ID and RIF interface, independently of guest
 egress policies. No policy preserves previous behavior. IPv4 rules inspect the
@@ -1316,15 +1316,24 @@ Mutations revoke hardware CT and software sessions before commit, preventing old
 sessions bypassing a tightened firewall. Existing SSH may therefore disconnect
 when changing rules; use an independent management connection.
 
-This version evaluates new ingress traffic on Arm (`public_ingress=arm-pre-nat`),
-not a new DOCA ACL pipe. Existing authorized NAT/PF TCP/UDP CT promotion remains
-available: session admission follows the first permitted slow-path packet(s).
+Arm remains authoritative (`public_ingress=arm-pre-nat`). On VS-backed public
+RIFs with `default=deny`, v46 additionally installs conservative DOCA Flow ACL
+DROP ranges for TCP destination ports that cannot match any allow rule. The
+entire configured SNAT port range is excluded, including Arm-only sessions;
+ACL misses continue to Arm. UDP, ICMP, port-link WAN, unsupported/too-complex
+policies, and rule combinations with no provably denied TCP range stay on Arm.
+If ACL programming fails, traffic falls back to Arm. Check
+`public_ingress_hw` for active policies, installed ranges, and failures;
+hardware-drop counters are not available in this version, so Arm's `denied`
+counter does not include hardware drops. Existing authorized NAT/PF TCP/UDP CT
+promotion remains available after the first permitted slow-path packet(s).
 VR-wide LPM promotion is suppressed for VRs with ingress policies so it cannot
 bypass enforcement. Dedicated port-link WAN and ICMP remain slow-path.
 
 BF3 smoke test: allow the actual PF public port before testing default deny;
 verify permitted SSH, denied other public ports, ICMP type/code, and outbound
-curl replies despite default deny. Check `eswitchctl status | grep public_ingress`.
+curl replies despite default deny. Check
+`eswitchctl status | grep -E '^public_ingress(_hw)?='`.
 Use a real listening target and packet captures rather than an upstream port
 that might be closed. Remove an allow rule during a transfer and confirm CT
 revocation plus denial of a fresh connection. Repeat on another VR on the same

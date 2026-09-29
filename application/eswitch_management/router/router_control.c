@@ -145,6 +145,11 @@ static void rollback_prearmed_candidate(struct eswitch_manager *m,
       if(result!=DOCA_SUCCESS)
         fprintf(stderr,"Router rollback egress ACL failed: %s\n",
                 doca_error_get_descr(result));
+      if(result==DOCA_SUCCESS)
+        result=eswitch_pipeline_ingress_deny_sync(m->pipeline,m->router);
+      if(result!=DOCA_SUCCESS)
+        fprintf(stderr,"Router rollback ingress deny failed: %s\n",
+                doca_error_get_descr(result));
     }
   }
 }
@@ -265,6 +270,14 @@ doca_error_t router_control_command(struct eswitch_manager *m,const char *reques
       doca_error_t result=eswitch_pipeline_egress_acl_sync(m->pipeline,candidate);
       if(result!=DOCA_SUCCESS) {
         snprintf(out,size,"ERR guest egress ACL transaction failed: %s\n",
+                 doca_error_get_descr(result));
+        ok=false;
+      }
+    }
+    if(ok) {
+      doca_error_t result=eswitch_pipeline_ingress_deny_sync(m->pipeline,candidate);
+      if(result!=DOCA_SUCCESS) {
+        snprintf(out,size,"ERR public ingress deny transaction failed: %s\n",
                  doca_error_get_descr(result));
         ok=false;
       }

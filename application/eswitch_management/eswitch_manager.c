@@ -567,6 +567,9 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
     result = eswitch_pipeline_egress_acl_sync(manager->pipeline,
                                               manager->router);
   if (result == DOCA_SUCCESS)
+    result = eswitch_pipeline_ingress_deny_sync(manager->pipeline,
+                                                manager->router);
+  if (result == DOCA_SUCCESS)
     result = eswitch_manager_hw_routes_sync(manager, manager->router);
   if (result != DOCA_SUCCESS)
     fprintf(stderr, "Failed to restore eSwitch configuration %s: %s\n",
@@ -2177,6 +2180,19 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->router->ingress_policy_count, manager->router->ingress_rule_count,
       manager->ingress_checked, manager->ingress_allowed, manager->ingress_denied,
       manager->ingress_established);
+  {
+    size_t active = 0, hw_rules = 0;
+    for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+      if (!manager->pipeline->ingress_denies[i].active) continue;
+      active++;
+      hw_rules += manager->pipeline->ingress_denies[i].rule_count;
+    }
+    used = append_text(response, size, used,
+        "public_ingress_hw=tcp-deny-port-ranges active_policies=%zu "
+        "hw_rules=%zu failures=%" PRIu64 " fallback=arm "
+        "reverse_nat_ports=exempt counter_state=off\n",
+        active, hw_rules, manager->pipeline->ingress_deny_failures);
+  }
   used = append_text(response, size, used,
       "guest_egress=%s policies=%zu rules=%zu checked=%" PRIu64
       " allowed=%" PRIu64 " denied=%" PRIu64

@@ -10,6 +10,7 @@
 
 #include "../../ethernet_switch/switch_config.h"
 #include "../eswitch_config.h"
+#include "../router/router_egress.h"
 
 #define ESWITCH_MAX_FLOOD_MEMBERS 254U
 #define ESWITCH_METADATA_VSWITCH_MASK UINT32_C(0xffff0000)
@@ -526,8 +527,7 @@ static doca_error_t create_local_ip(struct eswitch_pipeline *pipeline) {
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
   struct doca_flow_monitor monitor = {0};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_PIPE,
-                              .next_pipe = pipeline->rss_pipe};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
       .next_pipe = pipeline->egress_acl_selector_pipe != NULL
           ? pipeline->egress_acl_selector_pipe : pipeline->source_guard_pipe};
@@ -1527,6 +1527,197 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
   return DOCA_SUCCESS;
 }
 
+/* Local-IP entries are exact VS/MAC/IP matches. Switch only the selected RIF
+ * to an immutable deny generation after every ACL entry is committed. The
+ * miss, including every possible reverse-NAT port, always reaches Arm. */
+static doca_error_t ingress_local_target(struct eswitch_pipeline *pipeline,
+    struct eswitch_sf_return_context *context, struct doca_flow_pipe *target) {
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+      .next_pipe = target != NULL ? target : pipeline->rss_pipe};
+  doca_error_t result;
+  flow_entry_cookie_prepare(&context->local_ip_rule.cookie,
+      "swap public ingress deny", DOCA_FLOW_ENTRY_OP_UPD);
+  result = doca_flow_pipe_basic_update_entry(pipeline->runtime->queue_id,
+      pipeline->local_ip_pipe, 0, NULL, NULL, &fwd,
+      DOCA_FLOW_ENTRY_FLAGS_NO_WAIT, context->local_ip_rule.entry);
+  if (result != DOCA_SUCCESS)
+    return result;
+  return process_rules(pipeline, &context->local_ip_rule, 1);
+}
+
+static doca_error_t ingress_build_deny(struct eswitch_pipeline *pipeline,
+    const struct router_tcp_port_range *ranges, size_t count,
+    struct doca_flow_pipe **pipe, struct eswitch_rule *rules) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_match template = {0};
+  struct doca_flow_actions actions = {0};
+  struct doca_flow_actions *actions_array[1] = {&actions};
+  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                                .next_pipe = pipeline->rss_pipe};
+  doca_error_t result;
+  *pipe = NULL;
+  template.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+  template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  template.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+  template.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_PUBLIC_INGRESS_DENY_TCP",
+      DOCA_FLOW_PIPE_ACL, false, (uint32_t)count);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, &hit, &miss, pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+  for (size_t i = 0; i < count; i++) {
+    struct doca_flow_match match = {0}, mask = {0};
+    struct doca_flow_fwd drop = {.type = DOCA_FLOW_FWD_DROP};
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+    mask.parser_meta.outer_l4_type = UINT32_MAX;
+    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+    match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(ranges[i].first);
+    mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(ranges[i].last);
+    flow_entry_cookie_prepare(&rules[i].cookie,
+        "public ingress denied TCP port", DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_acl_add_entry(pipeline->runtime->queue_id,
+        *pipe, &match, &mask, 0, NULL, (uint32_t)i, &drop,
+        batch_flags((uint32_t)i, (uint32_t)count), &rules[i].cookie,
+        &rules[i].entry);
+    if (result != DOCA_SUCCESS)
+      break;
+  }
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, rules, (uint32_t)count);
+  if (result != DOCA_SUCCESS) {
+    doca_flow_pipe_destroy(*pipe);
+    *pipe = NULL;
+  }
+  return result;
+}
+
+doca_error_t eswitch_pipeline_ingress_deny_sync(
+    struct eswitch_pipeline *pipeline, const struct router_config *config) {
+  if (pipeline == NULL || config == NULL || !pipeline->created)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t s = 0; s < ROUTER_MAX_EGRESS_POLICIES; s++) {
+    struct eswitch_ingress_deny *slot = &pipeline->ingress_denies[s];
+    bool keep = false;
+    if (!slot->active)
+      continue;
+    for (size_t p = 0; p < config->ingress_policy_count; p++)
+      if (config->ingress_policies[p].interface_id == slot->interface_id)
+        keep = true;
+    if (!keep) {
+      for (size_t c = 0; c < ESWITCH_MAX_SF_RETURN_CONTEXTS; c++) {
+        struct eswitch_sf_return_context *context = &pipeline->sf_return_contexts[c];
+        if (context->active && !context->directed &&
+            context->interface_id == slot->interface_id &&
+            context->local_ip_rule.entry != NULL) {
+          doca_error_t result = ingress_local_target(pipeline, context, NULL);
+          if (result != DOCA_SUCCESS) return result;
+        }
+      }
+      doca_flow_pipe_destroy(slot->pipe);
+      free(slot->rules);
+      *slot = (struct eswitch_ingress_deny){0};
+    }
+  }
+  for (size_t p = 0; p < config->ingress_policy_count; p++) {
+    const struct router_egress_policy *policy = &config->ingress_policies[p];
+    const struct router_interface *rif = NULL;
+    struct eswitch_sf_return_context *context = NULL;
+    struct eswitch_ingress_deny *slot = NULL;
+    struct router_tcp_port_range ranges[ESWITCH_INGRESS_DENY_MAX_RANGES];
+    struct eswitch_rule *rules = NULL;
+    struct doca_flow_pipe *next = NULL;
+    size_t count;
+    doca_error_t result;
+    for (size_t i = 0; i < config->interface_count; i++)
+      if (config->interfaces[i].interface_id == policy->interface_id &&
+          config->interfaces[i].vr_id == policy->vr_id) rif = &config->interfaces[i];
+    if (rif == NULL || rif->attachment != ROUTER_VSWITCH || !rif->has_address)
+      continue;
+    for (size_t i = 0; i < ESWITCH_MAX_SF_RETURN_CONTEXTS; i++)
+      if (pipeline->sf_return_contexts[i].active &&
+          !pipeline->sf_return_contexts[i].directed &&
+          pipeline->sf_return_contexts[i].interface_id == rif->interface_id &&
+          pipeline->sf_return_contexts[i].local_ip_rule.entry != NULL)
+        context = &pipeline->sf_return_contexts[i];
+    if (context == NULL) continue;
+    for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++)
+      if (pipeline->ingress_denies[i].active &&
+          pipeline->ingress_denies[i].interface_id == rif->interface_id)
+        slot = &pipeline->ingress_denies[i];
+    count = router_ingress_tcp_deny_ranges(config, rif, ranges,
+                                           ESWITCH_INGRESS_DENY_MAX_RANGES);
+    if (slot != NULL && slot->rule_count == count) {
+      bool same = true;
+      for (size_t i = 0; i < count; i++)
+        if (slot->first[i] != ranges[i].first || slot->last[i] != ranges[i].last)
+          same = false;
+      if (same) continue;
+    }
+    if (count != 0) {
+      rules = calloc(count, sizeof(*rules));
+      if (rules == NULL) return DOCA_ERROR_NO_MEMORY;
+      result = ingress_build_deny(pipeline, ranges, count, &next, rules);
+      if (result != DOCA_SUCCESS) {
+        pipeline->ingress_deny_failures++;
+        fprintf(stderr, "Public ingress hardware deny fallback: vr=%u rif=%u error=%s\n",
+            policy->vr_id, policy->interface_id, doca_error_get_descr(result));
+        free(rules);
+        /* A stale deny generation can reject packets newly allowed by this
+         * policy. Remove it before accepting the Arm-only fallback. */
+        if (slot != NULL) {
+          result = ingress_local_target(pipeline, context, NULL);
+          if (result != DOCA_SUCCESS) return result;
+          doca_flow_pipe_destroy(slot->pipe);
+          free(slot->rules);
+          *slot = (struct eswitch_ingress_deny){0};
+        }
+        continue;
+      }
+    }
+    result = ingress_local_target(pipeline, context, next);
+    if (result != DOCA_SUCCESS) {
+      if (next != NULL) doca_flow_pipe_destroy(next);
+      free(rules);
+      return result;
+    }
+    if (slot == NULL)
+      for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++)
+        if (!pipeline->ingress_denies[i].active) {
+          slot = &pipeline->ingress_denies[i]; break;
+        }
+    if (slot == NULL) {
+      (void)ingress_local_target(pipeline, context, NULL);
+      if (next != NULL) doca_flow_pipe_destroy(next);
+      free(rules);
+      return DOCA_ERROR_NO_MEMORY;
+    }
+    if (slot->pipe != NULL) doca_flow_pipe_destroy(slot->pipe);
+    free(slot->rules);
+    *slot = (struct eswitch_ingress_deny){0};
+    slot->interface_id = rif->interface_id;
+    slot->pipe = next;
+    slot->rules = rules;
+    slot->rule_count = count;
+    slot->active = count != 0;
+    for (size_t i = 0; i < count; i++) {
+      slot->first[i] = ranges[i].first;
+      slot->last[i] = ranges[i].last;
+    }
+  }
+  return DOCA_SUCCESS;
+}
+
 static doca_error_t add_route_selector_rule(
     struct eswitch_pipeline *pipeline,
     struct eswitch_sf_return_context *context) {
@@ -1889,6 +2080,8 @@ static doca_error_t bind_sf_return_context(
   }
 
   if (!directed) {
+    struct doca_flow_fwd local_fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                                      .next_pipe = pipeline->rss_pipe};
     local_match.meta.pkt_meta =
         DOCA_HTOBE32((uint32_t)vswitch_id << 16);
     memcpy(local_match.outer.eth.dst_mac, rif_mac, 6);
@@ -1898,7 +2091,7 @@ static doca_error_t bind_sf_return_context(
                               "bind local RIF IPv4", DOCA_FLOW_ENTRY_OP_ADD);
     result = doca_flow_pipe_basic_add_entry(
         pipeline->runtime->queue_id, pipeline->local_ip_pipe, &local_match, 0,
-        NULL, NULL, NULL, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
+        NULL, NULL, &local_fwd, DOCA_FLOW_ENTRY_FLAGS_NO_WAIT,
         &free_context->local_ip_rule.cookie,
         &free_context->local_ip_rule.entry);
     if (result == DOCA_SUCCESS)
@@ -2064,6 +2257,22 @@ doca_error_t eswitch_pipeline_sf_unbind_rif(
     struct eswitch_pipeline *pipeline, uint16_t interface_id) {
   if (pipeline == NULL || !pipeline->created || interface_id == 0)
     return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_ingress_deny *slot = &pipeline->ingress_denies[i];
+    if (!slot->active || slot->interface_id != interface_id) continue;
+    for (size_t c = 0; c < ESWITCH_MAX_SF_RETURN_CONTEXTS; c++) {
+      struct eswitch_sf_return_context *context = &pipeline->sf_return_contexts[c];
+      if (context->active && !context->directed &&
+          context->interface_id == interface_id &&
+          context->local_ip_rule.entry != NULL) {
+        doca_error_t result = ingress_local_target(pipeline, context, NULL);
+        if (result != DOCA_SUCCESS) return result;
+      }
+    }
+    doca_flow_pipe_destroy(slot->pipe);
+    free(slot->rules);
+    *slot = (struct eswitch_ingress_deny){0};
+  }
   for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
     struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
     doca_error_t result;
@@ -2864,6 +3073,11 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
     doca_flow_pipe_destroy(pipeline->ct_ttl_pipe);
   if (pipeline->local_ip_pipe != NULL)
     doca_flow_pipe_destroy(pipeline->local_ip_pipe);
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    if (pipeline->ingress_denies[i].pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->ingress_denies[i].pipe);
+    free(pipeline->ingress_denies[i].rules);
+  }
   for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
     if (pipeline->egress_acls[i].pf_reply_pipe != NULL)
       doca_flow_pipe_destroy(pipeline->egress_acls[i].pf_reply_pipe);
