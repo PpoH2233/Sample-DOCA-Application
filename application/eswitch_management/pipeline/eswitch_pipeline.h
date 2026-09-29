@@ -180,6 +180,7 @@ struct eswitch_pipeline {
   struct doca_flow_pipe *ct_pipe;
   struct doca_flow_pipe *ct_egress_pipe;
   struct eswitch_rule ct_dispatch_rules[3];
+  struct eswitch_rule route_ttl_exception_rules[2];
   struct eswitch_rule route_fallback_rule;
   struct eswitch_hw_route_entry hw_routes[ROUTER_HW_MAX_ROUTES];
   size_t hw_route_count;

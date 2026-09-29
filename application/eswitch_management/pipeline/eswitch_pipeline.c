@@ -763,15 +763,12 @@ static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
                               .next_pipe = pipeline->hardware_ct_enabled
                                   ? pipeline->ct_dispatch_pipe
                                   : pipeline->rss_pipe};
-  /* HWS reserves space for the declared pipe size up front. A small LPM
-   * table should not reserve all 256 possible RIF eligibility entries,
-   * especially when CT has its own admission control pipe. Additional RIFs
-   * can safely fall back to Arm if this pipe reaches its capacity. */
-  uint32_t capacity = pipeline->hw_route_capacity + 1U;
+  /* Two TTL exceptions and one catchall precede the per-RIF entries. */
+  uint32_t capacity = pipeline->hw_route_capacity + 3U;
   doca_error_t result;
 
-  if (capacity > ROUTER_MAX_INTERFACES + 1U)
-    capacity = ROUTER_MAX_INTERFACES + 1U;
+  if (capacity > ROUTER_MAX_INTERFACES + 3U)
+    capacity = ROUTER_MAX_INTERFACES + 3U;
 
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
@@ -785,6 +782,28 @@ static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
   if (result != DOCA_SUCCESS)
     return result;
   printf("Hardware router eligibility reserved capacity=%u\n", capacity);
+
+  /* Packets reach this pipe only after the exact RIF-MAC selector. TTL 0/1
+   * must go to Arm; exact exceptions avoid a comparison in every RIF rule. */
+  for (uint8_t ttl = 0; ttl < 2; ttl++) {
+    struct doca_flow_match match = {0}, mask = {0};
+    struct eswitch_rule *rule = &pipeline->route_ttl_exception_rules[ttl];
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.outer.ip4.ttl = ttl;
+    mask.outer.ip4.ttl = UINT8_MAX;
+    flow_entry_cookie_prepare(&rule->cookie,
+                              "router TTL slow-path exception",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, pipeline->route_control_pipe,
+        &match, &mask, NULL, NULL, NULL, NULL, NULL, 0, &fwd,
+        &rule->cookie, &rule->entry);
+    if (result != DOCA_SUCCESS)
+      return result;
+  }
+  result = process_rules(pipeline, pipeline->route_ttl_exception_rules, 2);
+  if (result != DOCA_SUCCESS)
+    return result;
 
   flow_entry_cookie_prepare(&pipeline->route_fallback_rule.cookie,
                             "router slow-path fallback",
@@ -1753,7 +1772,6 @@ static doca_error_t add_route_eligible_rule(
     struct eswitch_sf_return_context *context) {
   struct doca_flow_match match = {0};
   struct doca_flow_match mask = {0};
-  struct doca_flow_match_condition condition = {0};
   struct doca_flow_actions actions = {0};
   struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
                               .next_pipe = pipeline->route_lpm_pipe};
@@ -1775,13 +1793,6 @@ static doca_error_t add_route_eligible_rule(
   mask.parser_meta.outer_l3_ok = UINT8_MAX;
   match.parser_meta.outer_ip4_checksum_ok = 1;
   mask.parser_meta.outer_ip4_checksum_ok = UINT8_MAX;
-  match.outer.ip4.ttl = 1;
-  condition.operation = DOCA_FLOW_COMPARE_GT;
-  condition.field_op.a.field_string = "outer.ipv4.ttl";
-  condition.field_op.a.bit_offset = 0;
-  condition.field_op.b.field_string = NULL;
-  condition.field_op.b.bit_offset = 0;
-  condition.field_op.width = 8;
   actions.meta.u32[1] = DOCA_HTOBE32(context->vr_id);
 
   flow_entry_cookie_prepare(&context->route_eligible_rule.cookie,
@@ -1789,7 +1800,7 @@ static doca_error_t add_route_eligible_rule(
                             DOCA_FLOW_ENTRY_OP_ADD);
   result = doca_flow_pipe_control_add_entry(
       pipeline->runtime->queue_id, pipeline->route_control_pipe,
-      &match, &mask, &condition, &actions, NULL, NULL, NULL, 0, &fwd,
+      &match, &mask, NULL, &actions, NULL, NULL, NULL, 1, &fwd,
       &context->route_eligible_rule.cookie,
       &context->route_eligible_rule.entry);
   if (result != DOCA_SUCCESS) {
