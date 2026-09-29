@@ -2102,16 +2102,20 @@ static size_t format_status(const struct eswitch_manager *manager,
           (uplink_arp_counter_result == DOCA_SUCCESS ? "ready" : "error"));
   used = append_text(response, size, used,
       "nat_dataplane=%s hw_ct_capability=%s hw_ct_state=%s "
-      "hw_ct_capacity=%u hw_ct_active=%zu hw_ct_promotions=%" PRIu64
+      "hw_ct_requested_capacity=%u hw_ct_capacity=%u "
+      "hw_ct_active=%zu hw_ct_promotions=%" PRIu64
       " hw_ct_failures=%" PRIu64 " hw_ct_full=%" PRIu64 "\n",
-      manager->pipeline->hardware_ct_enabled
+      manager->pipeline->hardware_ct_enabled &&
+              manager->pipeline->ct_admission_pipe != NULL
           ? "DOCA_FLOW_CT_TCP_UDP_PLUS_ARM_ICMP_SLOWPATH"
           : "ARM_NAPT_TCP_UDP_ICMP_ECHO",
       manager->hardware_ct_supported ? "supported" : "unsupported",
       !manager->pipeline->hardware_ct_requested ? "off" :
           (!manager->pipeline->hardware_ct_enabled ? "fallback-arm" :
-           (manager->pipeline->hardware_ct_degraded ? "degraded" :
-                                                      "ready")),
+           (manager->pipeline->ct_admission_pipe == NULL ||
+                    manager->pipeline->hardware_ct_degraded
+                ? "degraded" : "ready")),
+      manager->pipeline->ct_requested_capacity,
       manager->pipeline->ct_capacity, manager->pipeline->ct_active,
       manager->pipeline->ct_promotions, manager->pipeline->ct_failures,
       manager->pipeline->ct_full);

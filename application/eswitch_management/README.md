@@ -85,12 +85,16 @@ TCP/UDP first packet installs a bidirectional CT entry. Later packets take
 hardware and selects a post-CT L2/TTL adjacency. A miss still reaches Arm.
 ICMP Echo NAT intentionally remains on Arm. Set `ESWITCH_HW_ROUTING=0` and/or
 `ESWITCH_HW_CT=0` to disable either fast path for an Arm baseline. The default
-CT capacity is 4096 concurrent sessions globally (the software NAT table
-limit), shared across all VFs; it is not a per-VF reservation. LPM defaults to
-64 routes, matching the combined LPM/CT startup tested on BF3. Hardware
-admission and packet-path behavior at CT capacity 4096 still need BF3
-validation; check `hw_ct_state`, `hw_ct_active`, `hw_ct_failures` and
-`hw_ct_full` under load.
+CT capacity requests 4096 concurrent sessions globally (the software NAT table
+limit), shared across all VFs; it is not a per-VF reservation. If the admission
+pipe cannot be allocated, startup retries at half capacity down to 64;
+`hw_ct_requested_capacity` and `hw_ct_capacity` show requested and admitted
+capacity. LPM defaults to 64 routes, matching the combined LPM/CT startup
+tested on BF3. Hardware admission and packet-path behavior at higher CT
+capacities still need BF3 validation; require `ct_authorization=exact-ingress-session`
+and check `hw_ct_state`, `hw_ct_active`, `hw_ct_failures` and `hw_ct_full` under
+load. `hw_ct_state=degraded` with `ct_authorization=arm-only` means NAT remains
+on Arm even if the CT pipe was created.
 Successful per-packet traces are disabled by default; set
 `ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
 Broadcast ARP arriving on a router uplink can be rate-limited in DOCA Flow before

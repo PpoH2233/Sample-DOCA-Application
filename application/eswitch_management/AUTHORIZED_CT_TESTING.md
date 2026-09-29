@@ -21,8 +21,11 @@ pkg-config --modversion doca-flow
 
 Confirm the binary/library/firmware pairing before diagnosing CT errors.
 Use `ESWITCH_HW_CT_CAPACITY=64` for an isolated smoke, then validate the new
-4096-session default under load. Admission reserves two control entries per
-connection. Capacity is not a promise that the device has enough resources.
+4096-session request under load. Admission reserves two control entries per
+connection and startup retries smaller admission capacities on allocation
+failure. Confirm the admitted `hw_ct_capacity` and
+`ct_authorization=exact-ingress-session`; capacity is not a promise that the
+device has enough resources.
 
 ## Expected pipeline
 

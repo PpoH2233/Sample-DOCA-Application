@@ -195,6 +195,7 @@ struct eswitch_pipeline {
   bool hardware_routing_degraded;
   struct eswitch_ct_adjacency ct_adjacencies[ESWITCH_MAX_CT_ADJACENCIES];
   struct eswitch_ct_session ct_sessions[ROUTER_NAT_MAX_SESSIONS];
+  uint32_t ct_requested_capacity;
   uint32_t ct_capacity;
   size_t ct_active;
   struct offload_retry ct_retry;

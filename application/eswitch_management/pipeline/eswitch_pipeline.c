@@ -690,6 +690,29 @@ static doca_error_t create_ct_admission(struct eswitch_pipeline *pipeline,
   return result;
 }
 
+static doca_error_t create_ct_admission_with_retry(
+    struct eswitch_pipeline *pipeline, const char **stage) {
+  doca_error_t result;
+
+  for (;;) {
+    result = create_ct_admission(pipeline, stage);
+    if (result == DOCA_SUCCESS)
+      return DOCA_SUCCESS;
+    if (pipeline->ct_admission_pipe != NULL) {
+      doca_flow_pipe_destroy(pipeline->ct_admission_pipe);
+      pipeline->ct_admission_pipe = NULL;
+    }
+    pipeline->ct_admission_miss = (struct eswitch_rule){0};
+    if ((*stage != NULL && strcmp(*stage, "admission-pipe-create") != 0) ||
+        (result != DOCA_ERROR_NO_MEMORY && result != DOCA_ERROR_FULL) ||
+        pipeline->ct_capacity <= ESWITCH_CT_MIN_CAPACITY)
+      return result;
+    pipeline->ct_capacity >>= 1;
+    fprintf(stderr, "CT admission resource retry: capacity=%u\n",
+            pipeline->ct_capacity);
+  }
+}
+
 static doca_error_t create_route_lpm(struct eswitch_pipeline *pipeline) {
   struct doca_flow_pipe_cfg *cfg = NULL;
   struct doca_flow_match match = {0};
@@ -2913,6 +2936,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
   pipeline->hw_route_capacity = hardware_route_capacity;
   pipeline->hardware_ct_requested = hardware_ct_enabled;
   pipeline->hardware_ct_enabled = hardware_ct_enabled;
+  pipeline->ct_requested_capacity = hardware_ct_capacity;
   pipeline->ct_capacity = hardware_ct_capacity;
   pipeline->uplink_arp_pps = uplink_arp_pps;
   pipeline->uplink_arp_burst = uplink_arp_burst;
@@ -3027,7 +3051,7 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
     if (result == DOCA_SUCCESS)
       result = create_ct_guard(pipeline, &stage);
     if (result == DOCA_SUCCESS)
-      result = create_ct_admission(pipeline, &stage);
+      result = create_ct_admission_with_retry(pipeline, &stage);
     if (result != DOCA_SUCCESS) {
       if (pipeline->ct_admission_pipe != NULL)
         doca_flow_pipe_destroy(pipeline->ct_admission_pipe);
@@ -3044,7 +3068,8 @@ doca_error_t eswitch_pipeline_create(struct flow_runtime *runtime,
       fprintf(stderr, "CT admission unavailable: stage=%s; keeping Arm authorization: %s\n",
               stage, doca_error_get_descr(result));
     } else {
-      printf("CT authorization ready: exact-session -> IPv4 guard -> TTL exceptions -> CT\n");
+      printf("CT authorization ready: exact-session -> IPv4 guard -> TTL exceptions -> CT capacity=%u requested=%u\n",
+             pipeline->ct_capacity, pipeline->ct_requested_capacity);
     }
   }
   CREATE_STAGE("ARP dispatch", create_arp_dispatch(pipeline));
@@ -3792,7 +3817,8 @@ doca_error_t eswitch_pipeline_hw_routes_sync(
       }
     }
     pipeline->hardware_routing_degraded = false;
-    if (pipeline->hardware_ct_enabled && pipeline->ct_failures == 0)
+    if (pipeline->hardware_ct_enabled && pipeline->ct_failures == 0 &&
+        pipeline->ct_admission_pipe != NULL)
       pipeline->hardware_ct_degraded = false;
   }
   return first_error;
