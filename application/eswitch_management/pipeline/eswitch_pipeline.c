@@ -763,20 +763,28 @@ static doca_error_t create_route_control(struct eswitch_pipeline *pipeline) {
                               .next_pipe = pipeline->hardware_ct_enabled
                                   ? pipeline->ct_dispatch_pipe
                                   : pipeline->rss_pipe};
+  /* HWS reserves space for the declared pipe size up front. A small LPM
+   * table should not reserve all 256 possible RIF eligibility entries,
+   * especially when CT has its own admission control pipe. Additional RIFs
+   * can safely fall back to Arm if this pipe reaches its capacity. */
+  uint32_t capacity = pipeline->hw_route_capacity + 1U;
   doca_error_t result;
+
+  if (capacity > ROUTER_MAX_INTERFACES + 1U)
+    capacity = ROUTER_MAX_INTERFACES + 1U;
 
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
   result = set_pipe_identity(cfg, "ESW_ROUTER_ELIGIBLE",
-                             DOCA_FLOW_PIPE_CONTROL, false,
-                             ROUTER_MAX_INTERFACES + 1);
+                             DOCA_FLOW_PIPE_CONTROL, false, capacity);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL,
                                    &pipeline->route_control_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
   if (result != DOCA_SUCCESS)
     return result;
+  printf("Hardware router eligibility reserved capacity=%u\n", capacity);
 
   flow_entry_cookie_prepare(&pipeline->route_fallback_rule.cookie,
                             "router slow-path fallback",
