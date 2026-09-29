@@ -1784,9 +1784,18 @@ static doca_error_t add_route_eligible_rule(
       &match, &mask, &condition, &actions, NULL, NULL, NULL, 0, &fwd,
       &context->route_eligible_rule.cookie,
       &context->route_eligible_rule.entry);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Hardware route eligibility entry add failed: vr=%u "
+                    "vs=%u error=%s\n", context->vr_id, context->vswitch_id,
+            doca_error_get_descr(result));
     return result;
-  return process_rules(pipeline, &context->route_eligible_rule, 1);
+  }
+  result = process_rules(pipeline, &context->route_eligible_rule, 1);
+  if (result != DOCA_SUCCESS)
+    fprintf(stderr, "Hardware route eligibility entry commit failed: vr=%u "
+                    "vs=%u error=%s\n", context->vr_id, context->vswitch_id,
+            doca_error_get_descr(result));
+  return result;
 }
 
 static doca_error_t create_ingress_classifier(
