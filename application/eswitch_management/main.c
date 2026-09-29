@@ -66,6 +66,11 @@ static bool env_enabled(const char *name) {
       strcmp(value, "true") == 0 || strcmp(value, "on") == 0);
 }
 
+static bool env_enabled_by_default(const char *name) {
+  const char *value = getenv(name);
+  return value == NULL || *value == '\0' || env_enabled(name);
+}
+
 static bool parse_hw_route_capacity(uint32_t *capacity) {
   const char *value = getenv("ESWITCH_HW_ROUTE_CAPACITY");
   char *end = NULL;
@@ -196,8 +201,8 @@ int main(int argc, char **argv) {
   doca_error_t result;
   doca_error_t ct_capability;
   bool hardware_ct_supported = false;
-  bool hardware_routing_enabled = env_enabled("ESWITCH_HW_ROUTING");
-  bool hardware_ct_requested = env_enabled("ESWITCH_HW_CT");
+  bool hardware_routing_enabled = env_enabled_by_default("ESWITCH_HW_ROUTING");
+  bool hardware_ct_requested = env_enabled_by_default("ESWITCH_HW_CT");
   bool packet_debug = env_enabled("ESWITCH_PACKET_DEBUG");
   uint32_t hardware_route_capacity;
   uint32_t hardware_ct_capacity;

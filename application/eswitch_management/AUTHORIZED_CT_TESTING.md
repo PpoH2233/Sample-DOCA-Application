@@ -5,7 +5,8 @@
 Use an isolated BF3 test VF/VS and test destination, not production traffic.
 Preserve `eswitch.conf` and `eswitch.conf.router` and record startup logs/status.
 This change does not alter persisted CLI syntax or require recreating topology.
-Enable `ESWITCH_HW_CT=1` before starting the daemon. Hardware routing may remain
+CT is enabled by default; set `ESWITCH_HW_CT=1` explicitly when testing an
+older binary or overriding a service configuration. Hardware routing may remain
 disabled (`ESWITCH_HW_ROUTING=0`). Both guest and public interfaces must be
 `type=vs-link`; a dedicated `port-link` WAN remains Arm-only in this phase.
 
@@ -19,8 +20,8 @@ pkg-config --modversion doca-flow
 ```
 
 Confirm the binary/library/firmware pairing before diagnosing CT errors.
-Start with CT capacity 64 for the isolated smoke, then increase only after the
-single-connection test passes. Admission reserves two control entries per
+Use `ESWITCH_HW_CT_CAPACITY=64` for an isolated smoke, then validate the new
+4096-session default under load. Admission reserves two control entries per
 connection. Capacity is not a promise that the device has enough resources.
 
 ## Expected pipeline

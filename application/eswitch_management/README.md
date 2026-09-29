@@ -1,14 +1,15 @@
 # eSwitch Management
 
 Router integration is in progress: [router/README.md](router/README.md) records
-implemented control commands, readiness, SDK prerequisites, and the VF0–VF10
-test scope. L2 membership/FDB lives in `l2/`, shared hardware steering in
+implemented control commands, readiness, SDK prerequisites, and earlier VF
+test scopes. L2 membership/FDB lives in `l2/`, shared hardware steering in
 `pipeline/`, socket transport in `control/`, and VR configuration in `router/`.
 Router commands persist desired configuration. Addressed private vs-link RIFs
 support gateway ARP, local ICMP and Arm longest-prefix routing between private
 vSwitches. Public Arm routing and stateful TCP/UDP/ICMP Echo NAT are active.
-Private-to-private IPv4 routing has an opt-in DOCA Flow LPM fast path;
-optional DOCA Flow CT promotion offloads established TCP/UDP NAT sessions.
+Private-to-private IPv4 routing has a DOCA Flow LPM fast path enabled by
+default; DOCA Flow CT promotion is also enabled by default for established
+TCP/UDP NAT sessions.
 ICMP and all CT misses remain on the Arm slow path.
 Inbound traffic on a NAT RIF is processed by reverse NAT first. A reverse miss
 may continue only when the IPv4 destination is a local address owned by that
@@ -35,9 +36,9 @@ overflow drops the newest packet. `eswitchctl status` reports `neighbor_queue`,
 `enqueued`, `replayed`, `expired`, `overflow`, and `alloc_failures`; a healthy
 cold-start test should converge with `enqueued == replayed` and zero
 expiry/overflow.
-The default VF scope is `0-10`; explicit settings override that default.
-Existing build directories retain their Meson option: use `meson configure
-/build/eswitch-management -Dvf_scope=0-10` and rebuild. An exported
+The default VF scope is `0-20` (21 VF indexes); explicit settings override that
+default. Existing build directories retain their Meson option: use `meson
+configure /build/eswitch-management -Dvf_scope=0-20` and rebuild. An exported
 `ESWITCH_VF_SCOPE` still overrides the compiled default.
 
 `eswitch-management` is the single owner of the BlueField eSwitch, DOCA Flow
@@ -82,12 +83,18 @@ both `ESWITCH_HW_ROUTING=1` and `ESWITCH_HW_CT=1`, a successfully translated
 TCP/UDP first packet installs a bidirectional CT entry. Later packets take
 `LPM miss -> CT` outbound or `uplink -> CT` inbound; a CT hit performs NAT in
 hardware and selects a post-CT L2/TTL adjacency. A miss still reaches Arm.
-ICMP Echo NAT intentionally remains on Arm. The default is off until the
-target BF3 passes the smoke test below.
+ICMP Echo NAT intentionally remains on Arm. Set `ESWITCH_HW_ROUTING=0` and/or
+`ESWITCH_HW_CT=0` to disable either fast path for an Arm baseline. The default
+CT capacity is 4096 concurrent sessions globally (the software NAT table
+limit), shared across all VFs; it is not a per-VF reservation. LPM defaults to
+64 routes, matching the combined LPM/CT startup tested on BF3. Hardware
+admission and packet-path behavior at CT capacity 4096 still need BF3
+validation; check `hw_ct_state`, `hw_ct_active`, `hw_ct_failures` and
+`hw_ct_full` under load.
 Successful per-packet traces are disabled by default; set
 `ESWITCH_PACKET_DEBUG=1` temporarily for packet-level diagnosis.
-Broadcast ARP arriving on a router uplink is rate-limited in DOCA Flow before
-RSS with `ESWITCH_UPLINK_ARP_PPS` (default 256 packets/s) and
+Broadcast ARP arriving on a router uplink can be rate-limited in DOCA Flow before
+RSS with `ESWITCH_UPLINK_ARP_PPS` (default 0, classifier disabled) and
 `ESWITCH_UPLINK_ARP_BURST` (default 64 packets). Set the rate to `0` to disable
 the hardware classifier. DOCA Flow 3.4 does not expose ARP TPA/opcode as match
 fields, so the hardware meter deliberately preserves a bounded broadcast
@@ -98,7 +105,7 @@ status reports `uplink_arp_classifier=fallback-arm`. A ready classifier also
 reports `hw_drops` from the color-pipe miss counter; this value must increase
 when the offered broadcast-ARP rate exceeds the configured meter.
 `ESWITCH_HW_ROUTE_CAPACITY` selects a power-of-two capacity from 64 to 1024
-(default 1024). The requested capacity is included when actions memory is
+(default 64). The requested capacity is included when actions memory is
 reserved before Flow ports start, in addition to the existing L2/SF action
 pool. If the LPM allocation is still too large,
 the application retries smaller tables; if none can be admitted it remains
@@ -292,7 +299,7 @@ sudo docker build \
 `4`, or comma-separated indexes/ranges such as `0-6,10-20`. The parent DPDK
 port and exactly one Arm system SF representor are always probed. Startup fails
 closed when no SF or more than one SF is discovered. The image stores this as
-its default scope (`0-10`); a deployment may override it without rebuilding.
+its default scope (`0-20`); a deployment may override it without rebuilding.
 The image also enables DOCA Flow hardware LPM and CT by default, with Arm as
 the fail-open slow path when a capability or hardware resource is unavailable:
 
@@ -312,7 +319,7 @@ sudo docker build \
   --build-arg DOCA_DEVEL_IMAGE=nvcr.io/nvidia/doca/doca:devel-3.4.0 \
   --build-arg DOCA_RUNTIME_IMAGE=nvcr.io/nvidia/doca/doca:full-rt-3.4.0 \
   --build-arg DOCA_PKG_VERSION=3.4.0112 \
-  --build-arg VF_SCOPE='0-10' \
+  --build-arg VF_SCOPE='0-20' \
   -f application/eswitch_management/Dockerfile \
   -t eswitch-management:3.4.0 .
 ```
@@ -372,12 +379,12 @@ For a steady inter-VS flow, the egress hardware counter must increase while
 `routed_seen` stops increasing. Verify rollout on the BF3 with:
 
 ```bash
-# Baseline behavior is unchanged.
-ESWITCH_HW_ROUTING=0 /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
-
-# After stopping the baseline instance, enable the experimental fast path.
-ESWITCH_HW_ROUTING=1 ESWITCH_HW_CT=1 ESWITCH_HW_CT_CAPACITY=4096 \
+# Arm baseline for comparison.
+ESWITCH_HW_ROUTING=0 ESWITCH_HW_CT=0 \
   /build/eswitch-management/eswitch-management -l 0 -- 03:00.0
+
+# After stopping the baseline instance, run the default fast path.
+/build/eswitch-management/eswitch-management -l 0 -- 03:00.0
 /build/eswitch-management/eswitchctl status | grep -E 'hw_routing|hw_ct|nat_|routed_seen'
 /build/eswitch-management/eswitchctl tx-debug | grep -E 'egress_port|hw_routing'
 ```
