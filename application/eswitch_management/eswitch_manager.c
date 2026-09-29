@@ -569,8 +569,16 @@ doca_error_t eswitch_manager_init(struct dpdk_io *io,
   if (result == DOCA_SUCCESS)
     result = eswitch_pipeline_ingress_deny_sync(manager->pipeline,
                                                 manager->router);
-  if (result == DOCA_SUCCESS)
+  if (result == DOCA_SUCCESS) {
     result = eswitch_manager_hw_routes_sync(manager, manager->router);
+    if ((result == DOCA_ERROR_NO_MEMORY || result == DOCA_ERROR_FULL) &&
+        manager->pipeline->hardware_routing_degraded) {
+      fprintf(stderr, "Hardware route restore exhausted Flow resources; "
+                      "continuing with Arm routing: %s\n",
+              doca_error_get_descr(result));
+      result = DOCA_SUCCESS;
+    }
+  }
   if (result != DOCA_SUCCESS)
     fprintf(stderr, "Failed to restore eSwitch configuration %s: %s\n",
             manager->state_path, doca_error_get_descr(result));
