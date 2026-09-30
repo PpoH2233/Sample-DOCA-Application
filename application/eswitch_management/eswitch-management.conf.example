@@ -8,9 +8,9 @@ DEVICE_PCI="03:00.0"
 # StateDirectory=eswitch-management before starting the daemon.
 ESWITCH_STATE_FILE="/var/lib/eswitch-management/eswitch.conf"
 
-# VF indexes, not DPDK port IDs. The default probes VF0 through VF20;
+# VF indexes, not DPDK port IDs. The default probes VF0 through VF50;
 # the parent PF and one Arm system-SF are added independently.
-ESWITCH_VF_SCOPE="0-20"
+ESWITCH_VF_SCOPE="0-50"
 
 # Private-to-private IPv4 DOCA Flow LPM fast path. Unsupported traffic and
 # resource-admission failures remain on the Arm slow path.

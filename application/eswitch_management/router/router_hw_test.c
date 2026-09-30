@@ -49,17 +49,18 @@ int main(void) {
   assert(routes[1].vr_id == 101 && routes[1].target_port_id == 3);
   assert(routes[2].vr_id == 202 && routes[2].target_port_id == 8);
 
-  /* The current LPM hardware key has VR identity but not guest ingress RIF.
-   * A policy on one guest RIF therefore keeps the entire VR on Arm. */
+  /* Guest egress policy uses an exact authorized-flow gate before LPM, so it
+   * no longer suppresses the VR route plan. Public ingress policy remains a
+   * VR-wide suppression because untrusted ingress must not reach LPM. */
   {
     struct router_config filtered = config;
     filtered.egress_policies[filtered.egress_policy_count++] =
         (struct router_egress_policy){.vr_id = 101, .interface_id = 1,
                                       .default_allow = false};
-    assert(!router_hw_route_plans_equal(&config, &filtered, &neighbors, now));
+    assert(router_hw_route_plans_equal(&config, &filtered, &neighbors, now));
     count = router_hw_routes_build(&filtered, &neighbors, now, routes,
                                    ROUTER_HW_MAX_ROUTES);
-    assert(count == 1 && routes[0].vr_id == 202);
+    assert(count == 3);
     filtered.egress_policy_count=0;
     filtered.ingress_policies[filtered.ingress_policy_count++]=
         (struct router_egress_policy){.vr_id=101,.interface_id=2,.default_allow=false};

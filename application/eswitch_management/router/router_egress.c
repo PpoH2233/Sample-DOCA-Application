@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <netinet/in.h>
 
 #define ETH_LEN 14U
 #define IPV4_MIN_LEN 20U
@@ -113,14 +114,15 @@ enum router_egress_verdict router_ingress_check(
   return firewall_check(config, ingress, frame, length, true);
 }
 
-size_t router_ingress_tcp_deny_ranges(
+size_t router_ingress_l4_deny_ranges(
     const struct router_config *config, const struct router_interface *rif,
-    struct router_tcp_port_range *ranges, size_t capacity) {
+    uint8_t protocol, struct router_tcp_port_range *ranges, size_t capacity) {
   uint8_t *excluded;
   bool default_deny = false;
   size_t count = 0;
   if (config == NULL || rif == NULL || ranges == NULL || capacity == 0 ||
-      rif->attachment != ROUTER_VSWITCH || !rif->has_address)
+      rif->attachment != ROUTER_VSWITCH || !rif->has_address ||
+      (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP))
     return 0;
   for (size_t i = 0; i < config->ingress_policy_count; i++)
     if (config->ingress_policies[i].vr_id == rif->vr_id &&
@@ -131,14 +133,15 @@ size_t router_ingress_tcp_deny_ranges(
   excluded = calloc(65536, 1);
   if (excluded == NULL)
     return 0;
-  excluded[0] = 1; /* In DOCA ACL, port mask 0 means ANY, not exact zero. */
-  /* Exclude every potentially allowed TCP destination port, even if source,
+  /* Exclude every potentially allowed destination port, even if source,
    * destination or rule priority would narrow it. This over-approximates
    * allows, so no packet allowed by Arm can be dropped here. */
   for (size_t i = 0; i < config->ingress_rule_count; i++) {
     const struct router_egress_rule *rule = &config->ingress_rules[i];
-    if (rule->vr_id != rif->vr_id || rule->interface_id != rif->interface_id ||
-        !rule->allow || (rule->protocol != 0 && rule->protocol != 6))
+    if (rule->vr_id != rif->vr_id ||
+        rule->interface_id != rif->interface_id || !rule->allow ||
+        rule->icmp_type >= 0 || rule->icmp_code >= 0 ||
+        (rule->protocol != 0 && rule->protocol != protocol))
       continue;
     uint16_t first = rule->port_first ? rule->port_first : 0;
     uint16_t last = rule->port_first ? rule->port_last : UINT16_MAX;
@@ -163,5 +166,112 @@ size_t router_ingress_tcp_deny_ranges(
     ranges[count++] = (struct router_tcp_port_range){first, port - 1};
   }
   free(excluded);
+  return count;
+}
+
+size_t router_ingress_tcp_deny_ranges(
+    const struct router_config *config, const struct router_interface *rif,
+    struct router_tcp_port_range *ranges, size_t capacity) {
+  return router_ingress_l4_deny_ranges(config, rif, IPPROTO_TCP,
+                                       ranges, capacity);
+}
+
+static bool append_u8_prefixes(struct router_icmp_deny_match *matches,
+                               size_t capacity, size_t *count,
+                               uint8_t first, uint8_t last,
+                               bool type_dimension, uint8_t fixed) {
+  uint32_t cursor = first;
+  while (cursor <= last) {
+    uint32_t block = cursor == 0 ? 256U : cursor & (0U - cursor);
+    uint32_t remaining = (uint32_t)last - cursor + 1U;
+    uint8_t mask;
+    while (block > remaining)
+      block >>= 1;
+    if (*count == capacity)
+      return false;
+    mask = (uint8_t)~(block - 1U);
+    if (type_dimension) {
+      matches[*count] = (struct router_icmp_deny_match){
+          .type = (uint8_t)cursor, .type_mask = mask};
+    } else {
+      matches[*count] = (struct router_icmp_deny_match){
+          .type = fixed, .type_mask = UINT8_MAX,
+          .code = (uint8_t)cursor, .code_mask = mask};
+    }
+    (*count)++;
+    cursor += block;
+  }
+  return true;
+}
+
+size_t router_ingress_icmp_deny_matches(
+    const struct router_config *config, const struct router_interface *rif,
+    struct router_icmp_deny_match *matches, size_t capacity) {
+  bool allowed[256][256] = {{false}};
+  bool default_deny = false;
+  bool full_deny[256] = {false};
+  size_t count = 0;
+
+  if (config == NULL || rif == NULL || matches == NULL || capacity == 0 ||
+      rif->attachment != ROUTER_VSWITCH || !rif->has_address)
+    return 0;
+  for (size_t i = 0; i < config->ingress_policy_count; i++)
+    if (config->ingress_policies[i].vr_id == rif->vr_id &&
+        config->ingress_policies[i].interface_id == rif->interface_id)
+      default_deny = !config->ingress_policies[i].default_allow;
+  if (!default_deny)
+    return 0;
+  /* Ignore CIDR and priority restrictions when collecting possible allows.
+   * This can preserve extra traffic for Arm, but can never over-drop. */
+  for (size_t i = 0; i < config->ingress_rule_count; i++) {
+    const struct router_egress_rule *rule = &config->ingress_rules[i];
+    uint16_t type_first, type_last, code_first, code_last;
+    if (rule->vr_id != rif->vr_id ||
+        rule->interface_id != rif->interface_id || !rule->allow ||
+        rule->port_first != 0 ||
+        (rule->protocol != 0 && rule->protocol != IPPROTO_ICMP))
+      continue;
+    type_first = rule->icmp_type >= 0 ? (uint8_t)rule->icmp_type : 0;
+    type_last = rule->icmp_type >= 0 ? (uint8_t)rule->icmp_type : UINT8_MAX;
+    code_first = rule->icmp_code >= 0 ? (uint8_t)rule->icmp_code : 0;
+    code_last = rule->icmp_code >= 0 ? (uint8_t)rule->icmp_code : UINT8_MAX;
+    for (uint16_t type = type_first; type <= type_last; type++)
+      for (uint16_t code = code_first; code <= code_last; code++)
+        allowed[type][code] = true;
+  }
+  for (uint16_t type = 0; type <= UINT8_MAX; type++) {
+    full_deny[type] = true;
+    for (uint16_t code = 0; code <= UINT8_MAX; code++)
+      if (allowed[type][code]) {
+        full_deny[type] = false;
+        break;
+      }
+  }
+  for (uint16_t type = 0; type <= UINT8_MAX;) {
+    if (full_deny[type]) {
+      uint16_t first = type;
+      while (type <= UINT8_MAX && full_deny[type])
+        type++;
+      if (!append_u8_prefixes(matches, capacity, &count,
+                              (uint8_t)first, (uint8_t)(type - 1), true, 0))
+        return 0;
+      continue;
+    }
+    for (uint16_t code = 0; code <= UINT8_MAX;) {
+      uint16_t first;
+      if (allowed[type][code]) {
+        code++;
+        continue;
+      }
+      first = code;
+      while (code <= UINT8_MAX && !allowed[type][code])
+        code++;
+      if (!append_u8_prefixes(matches, capacity, &count,
+                              (uint8_t)first, (uint8_t)(code - 1), false,
+                              (uint8_t)type))
+        return 0;
+    }
+    type++;
+  }
   return count;
 }

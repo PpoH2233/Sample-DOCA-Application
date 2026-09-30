@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <netinet/in.h>
 
 static struct router_config config;
 static char response[16384];
@@ -13,6 +14,18 @@ static bool hardware_denies(const struct router_tcp_port_range *ranges,
                             size_t count, uint16_t port) {
   for (size_t i = 0; i < count; i++)
     if (port >= ranges[i].first && port <= ranges[i].last) return true;
+  return false;
+}
+
+static bool hardware_denies_icmp(
+    const struct router_icmp_deny_match *matches, size_t count,
+    uint8_t type, uint8_t code) {
+  for (size_t i = 0; i < count; i++)
+    if ((type & matches[i].type_mask) ==
+            (matches[i].type & matches[i].type_mask) &&
+        (code & matches[i].code_mask) ==
+            (matches[i].code & matches[i].code_mask))
+      return true;
   return false;
 }
 
@@ -144,7 +157,7 @@ int main(void) {
     assert(!hardware_denies(ranges, count, 2222));
     assert(!hardware_denies(ranges, count, 2223));
     assert(hardware_denies(ranges, count, 2224));
-    assert(!hardware_denies(ranges, count, 0));
+    assert(hardware_denies(ranges, count, 0));
     config.nat_policies[0] = (struct router_nat_policy){
         .vr_id=guest->vr_id, .interface_id=guest->interface_id,
         .port_first=20000, .port_last=60999};
@@ -166,9 +179,27 @@ int main(void) {
   packet(frame,2224);
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_DENY);
   command("vr ingress rule add --id 1 --interface guest --rule-id 110 --action allow --protocol udp --port-range 53",true);
+  {
+    struct router_tcp_port_range ranges[8];
+    size_t count = router_ingress_l4_deny_ranges(
+        &config, guest, IPPROTO_UDP, ranges, 8);
+    assert(count == 2);
+    assert(!hardware_denies(ranges, count, 53));
+    assert(hardware_denies(ranges, count, 52));
+    assert(hardware_denies(ranges, count, 54));
+  }
   packet(frame,53); frame[23]=17;
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_ALLOW);
   command("vr ingress rule add --id 1 --interface guest --rule-id 120 --action allow --protocol icmp --icmp-type 8 --icmp-code 0",true);
+  {
+    struct router_icmp_deny_match matches[256];
+    size_t count = router_ingress_icmp_deny_matches(
+        &config, guest, matches, 256);
+    assert(count != 0);
+    assert(!hardware_denies_icmp(matches, count, 8, 0));
+    assert(hardware_denies_icmp(matches, count, 8, 1));
+    assert(hardware_denies_icmp(matches, count, 3, 0));
+  }
   frame[23]=1; frame[34]=8; frame[35]=0;
   assert(router_ingress_check(&config,guest,frame,sizeof(frame))==ROUTER_EGRESS_ALLOW);
   frame[35]=1;

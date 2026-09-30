@@ -8,7 +8,7 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-arm-port-forward-range-v35`. This revision includes
+Contract revision: `doca34-policy-fastpath-v51`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions, plus Arm TCP/UDP single-port and 1:1 range port
@@ -600,12 +600,12 @@ routes can be promoted to the DOCA Flow hardware LPM fast path. When
 can be promoted to bidirectional DOCA Flow CT, independently of
 `ESWITCH_HW_ROUTING`; misses and ICMP
 remain on Arm. Unsupported or resource-constrained cases fail open to the Arm
-slow path. Hardware CT aging/counters and ICMP routing error generation are not
-implemented. Status strings
+slow path. CT activity counters and lease-based expiry are reported by
+`status`; ICMP routing error generation is not implemented. Status strings
 in `status`, `vr show` and `vr nat show` report the active/fallback stage, so a
 client should surface them rather than assume full offload.
 
-#### Arm port forwarding (BlueField CLI only)
+#### Port forwarding (BlueField CLI only)
 
 ```sh
 # RIF uplink-vlan6 already has 161.246.6.38/16; the private VS and route exist.
@@ -676,8 +676,11 @@ eswitchctl status | grep -E 'guest_egress|egress_acl'
 For teardown, delete each rule, then `vr egress policy delete --id 1
 --interface SW100`. This policy also applies to routed traffic toward another
 guest VS, because it is classified by **source guest RIF** before route
-selection; same-VS L2 traffic does not traverse the VR. Destination-only
-hardware LPM promotion remains disabled for a VR with a guest egress policy.
+selection; same-VS L2 traffic does not traverse the VR. An exact TCP/UDP flow
+authorized by the Arm policy checker is installed ahead of the policy ACL and
+may then enter the private LPM hardware path. Hardware LPM remains enabled for
+eligible private routes in a VR with a guest egress policy; an authorization
+miss follows the existing ACL/Arm policy path.
 TCP/UDP NAT CT promotion is permitted only after Arm authorizes and forwards
 the packet. An exact ingress VS/port/MAC/5-tuple gate precedes local delivery
 and ACL; each connection owns a CT zone. Gate misses retain the old policy
@@ -1283,9 +1286,10 @@ promoted to hardware.
   pipe rejects the requested size or cannot be allocated, startup retries
   smaller powers of two down to 64;
   `hw_ct_requested_capacity` and `hw_ct_capacity` report the request and the
-  admitted limit. This first implementation uses explicit flush at router
-  mutation and shutdown and has no hardware aging or per-session CT counters.
-# Public-interface ingress firewall (v46)
+  admitted limit. Router mutations and shutdown explicitly flush CT. Runtime
+  uses a fixed 30-second hardware lease; per-direction hit counters are
+  retained across entry retirement for dataplane verification.
+# Public-interface ingress firewall (v51)
 
 Ingress policies are scoped to VR ID and RIF interface, independently of guest
 egress policies. No policy preserves previous behavior. IPv4 rules inspect the
@@ -1319,17 +1323,24 @@ Mutations revoke hardware CT and software sessions before commit, preventing old
 sessions bypassing a tightened firewall. Existing SSH may therefore disconnect
 when changing rules; use an independent management connection.
 
-Arm remains authoritative (`public_ingress=arm-pre-nat`). On VS-backed public
-RIFs with `default=deny`, v46 additionally installs conservative DOCA Flow ACL
-DROP ranges for TCP destination ports that cannot match any allow rule. The
-entire configured SNAT port range is excluded, including Arm-only sessions;
-ACL misses continue to Arm. UDP, ICMP, port-link WAN, unsupported/too-complex
-policies, and rule combinations with no provably denied TCP range stay on Arm.
-If ACL programming fails, traffic falls back to Arm. Check
-`public_ingress_hw` for active policies, installed ranges, and failures;
-hardware-drop counters are not available in this version, so Arm's `denied`
-counter does not include hardware drops. Existing authorized NAT/PF TCP/UDP CT
-promotion remains available after the first permitted slow-path packet(s).
+Arm remains authoritative for policy admission (`public_ingress=arm-pre-nat`).
+On VS-backed public RIFs with `default=deny`, v51 additionally installs one
+combined DOCA Flow CONTROL deny pipe for TCP and UDP destination-port prefixes
+and conservative ICMP type/code prefixes that cannot match any allow rule.
+Port intervals are decomposed into aligned 16-bit prefixes because BF3 rejected
+a second ACL range pipe with `DOCA_ERROR_NO_MEMORY`. The entire configured SNAT
+port range is excluded for TCP and UDP, including Arm-only sessions; CONTROL
+misses continue to Arm. CIDR- or priority-dependent ICMP decisions remain on
+Arm so the hardware deny set cannot over-drop. Port-link WAN,
+unsupported/too-complex policies, and rule combinations with no provably denied
+region stay on Arm. If hardware programming fails, traffic falls back to Arm.
+Check `public_ingress_hw` for per-protocol installed rules, failures, aggregate
+`hw_drops`, and the `tcp_drops`, `udp_drops`, and `icmp_drops` counters; Arm's
+`denied` counter does not include hardware drops. An allowed
+PF flow sends its first inbound packet and first
+guest reply through Arm. The reply completes the exact session identity and
+promotes eligible VS-to-VS TCP/UDP traffic to bidirectional CT; subsequent
+packets bypass the Arm policy checker on exact CT admission hits.
 VR-wide LPM promotion is suppressed for VRs with ingress policies so it cannot
 bypass enforcement. Dedicated port-link WAN and ICMP remain slow-path.
 

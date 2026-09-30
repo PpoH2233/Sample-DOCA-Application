@@ -1296,15 +1296,21 @@ static doca_error_t acl_pf_reply_fallback(
     return result;
   if (slot->pf_reply_pipe != NULL)
     doca_flow_pipe_destroy(slot->pf_reply_pipe);
+  if (slot->authorized_pipe != NULL)
+    doca_flow_pipe_destroy(slot->authorized_pipe);
   if (slot->pipe != NULL)
     doca_flow_pipe_destroy(slot->pipe);
   free(slot->pf_replies);
+  free(slot->authorized);
   free(slot->rules);
   slot->pf_reply_pipe = NULL;
+  slot->authorized_pipe = NULL;
   slot->pipe = NULL;
   slot->pf_replies = NULL;
+  slot->authorized = NULL;
   slot->rules = NULL;
   slot->pf_reply_count = 0;
+  slot->authorized_count = 0;
   slot->rule_count = 0;
   slot->fallback_arm = true;
   pipeline->egress_acl_pf_reply_fallbacks++;
@@ -1416,6 +1422,255 @@ fallback:
   return acl_pf_reply_fallback(pipeline, config, slot);
 }
 
+/* An Arm-authorized TCP/UDP flow may bypass subsequent policy rechecks, but
+ * it still enters the existing IPv4/TTL guard and VR-keyed LPM pipeline. */
+static doca_error_t acl_build_authorized_pipe(
+    struct eswitch_pipeline *pipeline, struct doca_flow_pipe *miss_target,
+    struct doca_flow_pipe **pipe, struct eswitch_rule *miss_rule) {
+  struct doca_flow_pipe_cfg *cfg = NULL;
+  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
+                               .next_pipe = miss_target};
+  doca_error_t result;
+
+  *pipe = NULL;
+  result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
+  if (result != DOCA_SUCCESS)
+    return result;
+  result = set_pipe_identity(cfg, "ESW_EGRESS_AUTHORIZED",
+      DOCA_FLOW_PIPE_CONTROL, false,
+      ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS + 1U);
+  if (result == DOCA_SUCCESS)
+    result = doca_flow_pipe_create(cfg, NULL, NULL, pipe);
+  doca_flow_pipe_cfg_destroy(cfg);
+  if (result != DOCA_SUCCESS)
+    return result;
+  flow_entry_cookie_prepare(&miss_rule->cookie,
+                            "authorized-flow policy miss",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, *pipe, NULL, NULL, NULL, NULL,
+      NULL, NULL, NULL, 7, &miss, &miss_rule->cookie, &miss_rule->entry);
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, miss_rule, 1);
+  if (result != DOCA_SUCCESS) {
+    doca_flow_pipe_destroy(*pipe);
+    *pipe = NULL;
+  }
+  return result;
+}
+
+static bool authorized_flow_parse(const uint8_t *frame, size_t length,
+                                  uint8_t *protocol, uint32_t *source_ip,
+                                  uint32_t *destination_ip,
+                                  uint16_t *source_port,
+                                  uint16_t *destination_port) {
+  const uint8_t *ip, *l4;
+  uint16_t total_length, fragment;
+
+  if (frame == NULL || protocol == NULL || source_ip == NULL ||
+      destination_ip == NULL || source_port == NULL ||
+      destination_port == NULL || length < 14U + 20U ||
+      frame[12] != 0x08 || frame[13] != 0x00)
+    return false;
+  ip = frame + 14U;
+  if (ip[0] != 0x45 || ip[8] <= 1)
+    return false;
+  total_length = (uint16_t)((uint16_t)ip[2] << 8 | ip[3]);
+  fragment = (uint16_t)((uint16_t)ip[6] << 8 | ip[7]);
+  if (total_length < 20U || total_length > length - 14U ||
+      (fragment & 0x3fffU) != 0)
+    return false;
+  *protocol = ip[9];
+  if ((*protocol == IPPROTO_TCP && total_length < 40U) ||
+      (*protocol == IPPROTO_UDP && total_length < 28U) ||
+      (*protocol != IPPROTO_TCP && *protocol != IPPROTO_UDP))
+    return false;
+  *source_ip = (uint32_t)ip[12] << 24 | (uint32_t)ip[13] << 16 |
+               (uint32_t)ip[14] << 8 | ip[15];
+  *destination_ip = (uint32_t)ip[16] << 24 | (uint32_t)ip[17] << 16 |
+                    (uint32_t)ip[18] << 8 | ip[19];
+  l4 = ip + 20U;
+  *source_port = (uint16_t)((uint16_t)l4[0] << 8 | l4[1]);
+  *destination_port = (uint16_t)((uint16_t)l4[2] << 8 | l4[3]);
+  return true;
+}
+
+static bool authorized_flow_same(
+    const struct eswitch_egress_authorized_flow *flow, uint8_t protocol,
+    uint16_t ingress_port, uint32_t source_ip, uint32_t destination_ip,
+    uint16_t source_port, uint16_t destination_port,
+    const uint8_t source_mac[6]) {
+  return flow->rule.entry != NULL && flow->protocol == protocol &&
+      flow->ingress_port == ingress_port && flow->source_ip == source_ip &&
+      flow->destination_ip == destination_ip &&
+      flow->source_port == source_port &&
+      flow->destination_port == destination_port &&
+      memcmp(flow->source_mac, source_mac, 6) == 0;
+}
+
+doca_error_t eswitch_pipeline_egress_authorize(
+    struct eswitch_pipeline *pipeline, uint16_t vr_id,
+    uint16_t interface_id, uint16_t ingress_port,
+    const uint8_t *frame, size_t length, uint64_t now_ns) {
+  struct eswitch_egress_acl *slot = NULL;
+  struct eswitch_egress_authorized_flow *free_flow = NULL;
+  struct doca_flow_match match = {0}, mask = {0};
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+  struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->route_control_pipe};
+  uint8_t protocol;
+  uint32_t source_ip, destination_ip;
+  uint16_t source_port, destination_port;
+  doca_error_t result;
+
+  if (pipeline == NULL || frame == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (!pipeline->hardware_routing_enabled ||
+      !authorized_flow_parse(frame, length, &protocol, &source_ip,
+                             &destination_ip, &source_port,
+                             &destination_port))
+    return DOCA_ERROR_NOT_SUPPORTED;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++)
+    if (pipeline->egress_acls[i].active &&
+        pipeline->egress_acls[i].vr_id == vr_id &&
+        pipeline->egress_acls[i].interface_id == interface_id) {
+      slot = &pipeline->egress_acls[i];
+      break;
+    }
+  if (slot == NULL || slot->authorized_pipe == NULL ||
+      slot->authorized == NULL)
+    return DOCA_ERROR_NOT_SUPPORTED;
+  result = eswitch_pipeline_egress_authorized_prune(pipeline, now_ns);
+  if (result != DOCA_SUCCESS)
+    return result;
+  for (size_t i = 0; i < ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS; i++) {
+    struct eswitch_egress_authorized_flow *flow = &slot->authorized[i];
+    if (authorized_flow_same(flow, protocol, ingress_port, source_ip,
+                             destination_ip, source_port, destination_port,
+                             frame + 6)) {
+      flow->lease_until_ns = now_ns + ESWITCH_EGRESS_AUTHORIZED_LEASE_NS;
+      return DOCA_SUCCESS;
+    }
+    if (flow->rule.entry == NULL && free_flow == NULL)
+      free_flow = flow;
+  }
+  if (free_flow == NULL) {
+    pipeline->egress_authorized_failures++;
+    return DOCA_ERROR_NO_MEMORY;
+  }
+  match.meta.pkt_meta = DOCA_HTOBE32(
+      eswitch_metadata_encode(slot->vswitch_id, ingress_port));
+  mask.meta.pkt_meta = UINT32_MAX;
+  memcpy(match.outer.eth.dst_mac, slot->rif_mac, 6);
+  memcpy(match.outer.eth.src_mac, frame + 6, 6);
+  memset(mask.outer.eth.dst_mac, UINT8_MAX, 6);
+  memset(mask.outer.eth.src_mac, UINT8_MAX, 6);
+  match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+  mask.parser_meta.outer_l3_type = UINT32_MAX;
+  match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+  match.outer.ip4.src_ip = DOCA_HTOBE32(source_ip);
+  match.outer.ip4.dst_ip = DOCA_HTOBE32(destination_ip);
+  mask.outer.ip4.src_ip = mask.outer.ip4.dst_ip = UINT32_MAX;
+  mask.parser_meta.outer_l4_type = UINT32_MAX;
+  if (protocol == IPPROTO_TCP) {
+    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+    match.outer.tcp.l4_port.src_port = DOCA_HTOBE16(source_port);
+    match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(destination_port);
+    mask.outer.tcp.l4_port.src_port = UINT16_MAX;
+    mask.outer.tcp.l4_port.dst_port = UINT16_MAX;
+  } else {
+    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
+    match.outer.udp.l4_port.src_port = DOCA_HTOBE16(source_port);
+    match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(destination_port);
+    mask.outer.udp.l4_port.src_port = UINT16_MAX;
+    mask.outer.udp.l4_port.dst_port = UINT16_MAX;
+  }
+  flow_entry_cookie_prepare(&free_flow->rule.cookie,
+                            "authorize guest egress flow",
+                            DOCA_FLOW_ENTRY_OP_ADD);
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, slot->authorized_pipe, &match, &mask,
+      NULL, NULL, NULL, NULL, &monitor, 0, &fwd,
+      &free_flow->rule.cookie, &free_flow->rule.entry);
+  if (result == DOCA_SUCCESS)
+    result = process_rules(pipeline, &free_flow->rule, 1);
+  if (result != DOCA_SUCCESS) {
+    pipeline->egress_authorized_failures++;
+    if (free_flow->rule.entry != NULL)
+      (void)remove_rule(pipeline, &free_flow->rule,
+                        "rollback guest egress authorization");
+    return result;
+  }
+  free_flow->protocol = protocol;
+  free_flow->ingress_port = ingress_port;
+  free_flow->source_ip = source_ip;
+  free_flow->destination_ip = destination_ip;
+  free_flow->source_port = source_port;
+  free_flow->destination_port = destination_port;
+  memcpy(free_flow->source_mac, frame + 6, 6);
+  free_flow->lease_until_ns = now_ns + ESWITCH_EGRESS_AUTHORIZED_LEASE_NS;
+  slot->authorized_count++;
+  pipeline->egress_authorized_promotions++;
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_egress_authorized_prune(
+    struct eswitch_pipeline *pipeline, uint64_t now_ns) {
+  if (pipeline == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (slot->authorized == NULL)
+      continue;
+    for (size_t j = 0; j < ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS; j++) {
+      struct eswitch_egress_authorized_flow *flow = &slot->authorized[j];
+      struct doca_flow_resource_query query = {0};
+      doca_error_t result;
+      if (flow->rule.entry == NULL || now_ns < flow->lease_until_ns)
+        continue;
+      result = doca_flow_resource_query_entry(flow->rule.entry, &query);
+      if (result == DOCA_SUCCESS)
+        pipeline->egress_authorized_retired_hits += query.counter.total_pkts;
+      result = remove_rule(pipeline, &flow->rule,
+                           "expire guest egress authorization");
+      if (result != DOCA_SUCCESS)
+        return result;
+      *flow = (struct eswitch_egress_authorized_flow){0};
+      if (slot->authorized_count != 0)
+        slot->authorized_count--;
+      pipeline->egress_authorized_removals++;
+    }
+  }
+  return DOCA_SUCCESS;
+}
+
+doca_error_t eswitch_pipeline_egress_authorized_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *hits) {
+  if (pipeline == NULL || hits == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  *hits = pipeline->egress_authorized_retired_hits;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    const struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (slot->authorized == NULL)
+      continue;
+    for (size_t j = 0; j < ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS; j++) {
+      struct doca_flow_resource_query query = {0};
+      doca_error_t result;
+      if (slot->authorized[j].rule.entry == NULL)
+        continue;
+      result = doca_flow_resource_query_entry(
+          slot->authorized[j].rule.entry, &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *hits += query.counter.total_pkts;
+    }
+  }
+  return DOCA_SUCCESS;
+}
+
 static doca_error_t acl_select_target(struct eswitch_pipeline *pipeline,
                                       struct eswitch_egress_acl *slot,
                                       const struct router_interface *rif,
@@ -1467,9 +1722,12 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     struct eswitch_egress_acl *slot = acl_slot(pipeline, policy->interface_id);
     struct doca_flow_pipe *next_pipe = NULL, *old_pipe;
     struct doca_flow_pipe *next_pf_pipe = NULL, *old_pf_pipe;
+    struct doca_flow_pipe *next_authorized_pipe = NULL, *old_authorized_pipe;
     struct eswitch_rule *next_rules = NULL, *old_rules;
     struct eswitch_pf_reply_exception *next_pf_replies = NULL;
     struct eswitch_pf_reply_exception *old_pf_replies;
+    struct eswitch_egress_authorized_flow *next_authorized = NULL;
+    struct eswitch_egress_authorized_flow *old_authorized;
     uint64_t fingerprint;
     size_t count = 0;
     bool fallback, has_pf = false;
@@ -1530,22 +1788,52 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
         fallback = true;
       }
     }
+    if (pipeline->hardware_routing_enabled) {
+      struct doca_flow_pipe *policy_target = fallback ? pipeline->rss_pipe :
+          (next_pf_pipe != NULL ? next_pf_pipe : next_pipe);
+      /* The extra slot owns the fallback cookie for the pipe lifetime. */
+      next_authorized = calloc(ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS + 1U,
+                               sizeof(*next_authorized));
+      if (next_authorized != NULL)
+        result = acl_build_authorized_pipe(pipeline, policy_target,
+            &next_authorized_pipe,
+            &next_authorized[ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS].rule);
+      else
+        result = DOCA_ERROR_NO_MEMORY;
+      if (result != DOCA_SUCCESS) {
+        pipeline->egress_authorized_failures++;
+        fprintf(stderr, "Guest egress authorization fallback: vr=%u rif=%u error=%s\n",
+                policy->vr_id, policy->interface_id,
+                doca_error_get_descr(result));
+        if (next_authorized_pipe != NULL)
+          doca_flow_pipe_destroy(next_authorized_pipe);
+        free(next_authorized);
+        next_authorized_pipe = NULL;
+        next_authorized = NULL;
+      }
+    }
     result = acl_select_target(pipeline, slot, rif,
-                               fallback ? pipeline->rss_pipe :
-                               (next_pf_pipe != NULL ? next_pf_pipe : next_pipe));
+        next_authorized_pipe != NULL ? next_authorized_pipe :
+        (fallback ? pipeline->rss_pipe :
+         (next_pf_pipe != NULL ? next_pf_pipe : next_pipe)));
     if (result != DOCA_SUCCESS) {
+      if (next_authorized_pipe != NULL)
+        doca_flow_pipe_destroy(next_authorized_pipe);
       if (next_pf_pipe != NULL)
         doca_flow_pipe_destroy(next_pf_pipe);
       if (next_pipe != NULL)
         doca_flow_pipe_destroy(next_pipe);
       free(next_pf_replies);
+      free(next_authorized);
       free(next_rules);
       return result;
     }
     old_pipe = slot->pipe;
     old_pf_pipe = slot->pf_reply_pipe;
+    old_authorized_pipe = slot->authorized_pipe;
     old_rules = slot->rules;
     old_pf_replies = slot->pf_replies;
+    old_authorized = slot->authorized;
     slot->vr_id = policy->vr_id;
     slot->interface_id = policy->interface_id;
     slot->vswitch_id = rif->vswitch_id;
@@ -1553,17 +1841,23 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     slot->fingerprint = fingerprint;
     slot->pipe = next_pipe;
     slot->pf_reply_pipe = next_pf_pipe;
+    slot->authorized_pipe = next_authorized_pipe;
     slot->rules = next_rules;
     slot->pf_replies = next_pf_replies;
+    slot->authorized = next_authorized;
     slot->pf_reply_count = 0;
+    slot->authorized_count = 0;
     slot->rule_count = fallback ? 0 : count;
     slot->fallback_arm = fallback;
     slot->active = true;
     if (old_pf_pipe != NULL)
       doca_flow_pipe_destroy(old_pf_pipe);
+    if (old_authorized_pipe != NULL)
+      doca_flow_pipe_destroy(old_authorized_pipe);
     if (old_pipe != NULL)
       doca_flow_pipe_destroy(old_pipe);
     free(old_pf_replies);
+    free(old_authorized);
     free(old_rules);
   }
   for (size_t s = 0; s < ROUTER_MAX_EGRESS_POLICIES; s++) {
@@ -1584,10 +1878,13 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
       return result;
     if (slot->pf_reply_pipe != NULL)
       doca_flow_pipe_destroy(slot->pf_reply_pipe);
+    if (slot->authorized_pipe != NULL)
+      doca_flow_pipe_destroy(slot->authorized_pipe);
     if (slot->pipe != NULL)
       doca_flow_pipe_destroy(slot->pipe);
     free(slot->rules);
     free(slot->pf_replies);
+    free(slot->authorized);
     *slot = (struct eswitch_egress_acl){0};
   }
   return DOCA_SUCCESS;
@@ -1611,57 +1908,135 @@ static doca_error_t ingress_local_target(struct eswitch_pipeline *pipeline,
   return process_rules(pipeline, &context->local_ip_rule, 1);
 }
 
+struct ingress_deny_spec {
+  uint8_t protocol;
+  uint16_t port, port_mask;
+  uint8_t icmp_type, icmp_type_mask;
+  uint8_t icmp_code, icmp_code_mask;
+};
+
+/* Split inclusive port ranges into ordinary CONTROL-pipe ternary prefixes. */
+static bool ingress_append_port_specs(
+    const struct router_tcp_port_range *ranges, size_t range_count,
+    uint8_t protocol, struct ingress_deny_spec *specs, size_t *spec_count) {
+  for (size_t i = 0; i < range_count; i++) {
+    uint32_t cursor = ranges[i].first;
+    while (cursor <= ranges[i].last) {
+      uint32_t block = cursor == 0 ? UINT32_C(65536) : cursor & (0U - cursor);
+      uint32_t remaining = (uint32_t)ranges[i].last - cursor + 1U;
+      while (block > remaining)
+        block >>= 1;
+      if (*spec_count == ESWITCH_INGRESS_DENY_MAX_RULES)
+        return false;
+      specs[*spec_count] = (struct ingress_deny_spec){
+          .protocol = protocol,
+          .port = (uint16_t)cursor,
+          .port_mask = (uint16_t)~(block - 1U)};
+      (*spec_count)++;
+      cursor += block;
+    }
+  }
+  return true;
+}
+
+static uint64_t ingress_specs_fingerprint(
+    const struct ingress_deny_spec *specs, size_t count) {
+  const uint8_t *bytes = (const uint8_t *)specs;
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (size_t i = 0; i < count * sizeof(*specs); i++) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  hash ^= count;
+  return hash;
+}
+
 static doca_error_t ingress_build_deny(struct eswitch_pipeline *pipeline,
-    const struct router_tcp_port_range *ranges, size_t count,
-    struct doca_flow_pipe **pipe, struct eswitch_rule *rules) {
+    const struct ingress_deny_spec *specs,
+    struct doca_flow_pipe **pipe, struct eswitch_rule *rules,
+    size_t rule_count) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_match template = {0};
-  struct doca_flow_actions actions = {0};
-  struct doca_flow_actions *actions_array[1] = {&actions};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
+  struct doca_flow_monitor counter = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+  struct doca_flow_fwd drop = {.type = DOCA_FLOW_FWD_DROP};
   struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-                                .next_pipe = pipeline->rss_pipe};
+                               .next_pipe = pipeline->rss_pipe};
+  const char *stage = "pipe-cfg-create";
   doca_error_t result;
+  size_t rule_index = 0;
+
   *pipe = NULL;
-  template.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
-  template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-  template.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
-  template.outer.tcp.l4_port.dst_port = UINT16_MAX;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, "ESW_PUBLIC_INGRESS_DENY_TCP",
-      DOCA_FLOW_PIPE_ACL, false, (uint32_t)count);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
-  if (result == DOCA_SUCCESS)
-    result = doca_flow_pipe_create(cfg, &hit, &miss, pipe);
+  stage = "pipe-identity";
+  result = set_pipe_identity(cfg, "ESW_PUBLIC_INGRESS_DENY",
+      DOCA_FLOW_PIPE_CONTROL, false, (uint32_t)rule_count + 1U);
+  if (result == DOCA_SUCCESS) {
+    stage = "pipe-create";
+    result = doca_flow_pipe_create(cfg, NULL, NULL, pipe);
+  }
   doca_flow_pipe_cfg_destroy(cfg);
-  if (result != DOCA_SUCCESS)
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Public ingress deny build failed: stage=%s rules=%zu error=%s\n",
+            stage, rule_count, doca_error_get_descr(result));
     return result;
-  for (size_t i = 0; i < count; i++) {
+  }
+
+  for (rule_index = 0; rule_index < rule_count; rule_index++) {
+    const struct ingress_deny_spec *spec = &specs[rule_index];
     struct doca_flow_match match = {0}, mask = {0};
-    struct doca_flow_fwd drop = {.type = DOCA_FLOW_FWD_DROP};
-    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-    match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+    match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+    mask.parser_meta.outer_l3_type = UINT32_MAX;
     mask.parser_meta.outer_l4_type = UINT32_MAX;
-    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
-    match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(ranges[i].first);
-    mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(ranges[i].last);
-    flow_entry_cookie_prepare(&rules[i].cookie,
-        "public ingress denied TCP port", DOCA_FLOW_ENTRY_OP_ADD);
-    result = doca_flow_pipe_acl_add_entry(pipeline->runtime->queue_id,
-        *pipe, &match, &mask, 0, NULL, (uint32_t)i, &drop,
-        batch_flags((uint32_t)i, (uint32_t)count), &rules[i].cookie,
-        &rules[i].entry);
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    if (spec->protocol == IPPROTO_TCP) {
+      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+      match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(spec->port);
+      mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(spec->port_mask);
+    } else if (spec->protocol == IPPROTO_UDP) {
+      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
+      match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(spec->port);
+      mask.outer.udp.l4_port.dst_port = DOCA_HTOBE16(spec->port_mask);
+    } else {
+      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_ICMP;
+      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_ICMP;
+      match.outer.icmp.type = spec->icmp_type;
+      match.outer.icmp.code = spec->icmp_code;
+      mask.outer.icmp.type = spec->icmp_type_mask;
+      mask.outer.icmp.code = spec->icmp_code_mask;
+    }
+    flow_entry_cookie_prepare(&rules[rule_index].cookie,
+        "public ingress denied protocol prefix", DOCA_FLOW_ENTRY_OP_ADD);
+    stage = "deny-entry-add";
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, *pipe, &match, &mask,
+        NULL, NULL, NULL, NULL, &counter, 0, &drop,
+        &rules[rule_index].cookie, &rules[rule_index].entry);
     if (result != DOCA_SUCCESS)
       break;
   }
-  if (result == DOCA_SUCCESS)
-    result = process_rules(pipeline, rules, (uint32_t)count);
+
+  if (result == DOCA_SUCCESS && rule_index != rule_count)
+    result = DOCA_ERROR_BAD_STATE;
+  if (result == DOCA_SUCCESS) {
+    flow_entry_cookie_prepare(&rules[rule_count].cookie,
+        "public ingress Arm fallback", DOCA_FLOW_ENTRY_OP_ADD);
+    stage = "fallback-entry-add";
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, *pipe, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, 7, &miss,
+        &rules[rule_count].cookie, &rules[rule_count].entry);
+  }
+  if (result == DOCA_SUCCESS) {
+    stage = "entry-process";
+    result = process_rules(pipeline, rules, (uint32_t)rule_count + 1U);
+  }
   if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Public ingress deny build failed: stage=%s rules=%zu error=%s\n",
+            stage, rule_count, doca_error_get_descr(result));
     doca_flow_pipe_destroy(*pipe);
     *pipe = NULL;
   }
@@ -1701,9 +2076,13 @@ doca_error_t eswitch_pipeline_ingress_deny_sync(
     struct eswitch_sf_return_context *context = NULL;
     struct eswitch_ingress_deny *slot = NULL;
     struct router_tcp_port_range ranges[ESWITCH_INGRESS_DENY_MAX_RANGES];
+    struct router_icmp_deny_match icmp[256];
+    struct ingress_deny_spec specs[ESWITCH_INGRESS_DENY_MAX_RULES] = {{0}};
     struct eswitch_rule *rules = NULL;
     struct doca_flow_pipe *next = NULL;
-    size_t count;
+    size_t entry_count = 0;
+    size_t tcp_count = 0, udp_count = 0, icmp_count = 0;
+    uint64_t fingerprint;
     doca_error_t result;
     for (size_t i = 0; i < config->interface_count; i++)
       if (config->interfaces[i].interface_id == policy->interface_id &&
@@ -1721,19 +2100,44 @@ doca_error_t eswitch_pipeline_ingress_deny_sync(
       if (pipeline->ingress_denies[i].active &&
           pipeline->ingress_denies[i].interface_id == rif->interface_id)
         slot = &pipeline->ingress_denies[i];
-    count = router_ingress_tcp_deny_ranges(config, rif, ranges,
-                                           ESWITCH_INGRESS_DENY_MAX_RANGES);
-    if (slot != NULL && slot->rule_count == count) {
-      bool same = true;
-      for (size_t i = 0; i < count; i++)
-        if (slot->first[i] != ranges[i].first || slot->last[i] != ranges[i].last)
-          same = false;
-      if (same) continue;
+    {
+      size_t range_count = router_ingress_l4_deny_ranges(
+          config, rif, IPPROTO_TCP, ranges, ESWITCH_INGRESS_DENY_MAX_RANGES);
+      size_t before = entry_count;
+      if (!ingress_append_port_specs(ranges, range_count, IPPROTO_TCP,
+                                     specs, &entry_count))
+        entry_count = 0;
+      tcp_count = entry_count - before;
     }
-    if (count != 0) {
-      rules = calloc(count, sizeof(*rules));
+    {
+      size_t range_count = router_ingress_l4_deny_ranges(
+          config, rif, IPPROTO_UDP, ranges, ESWITCH_INGRESS_DENY_MAX_RANGES);
+      size_t before = entry_count;
+      if (!ingress_append_port_specs(ranges, range_count, IPPROTO_UDP,
+                                     specs, &entry_count))
+        entry_count = 0;
+      udp_count = entry_count >= before ? entry_count - before : 0;
+    }
+    icmp_count = router_ingress_icmp_deny_matches(
+        config, rif, icmp, sizeof(icmp) / sizeof(icmp[0]));
+    if (entry_count + icmp_count > ESWITCH_INGRESS_DENY_MAX_RULES)
+      entry_count = 0;
+    else
+      for (size_t i = 0; i < icmp_count; i++)
+        specs[entry_count++] = (struct ingress_deny_spec){
+            .protocol = IPPROTO_ICMP,
+            .icmp_type = icmp[i].type,
+            .icmp_type_mask = icmp[i].type_mask,
+            .icmp_code = icmp[i].code,
+            .icmp_code_mask = icmp[i].code_mask};
+    fingerprint = ingress_specs_fingerprint(specs, entry_count);
+    if (slot != NULL && slot->fingerprint == fingerprint)
+      continue;
+    if (entry_count != 0) {
+      /* One extra entry is the lowest-priority Arm fallback. */
+      rules = calloc(entry_count + 1U, sizeof(*rules));
       if (rules == NULL) return DOCA_ERROR_NO_MEMORY;
-      result = ingress_build_deny(pipeline, ranges, count, &next, rules);
+      result = ingress_build_deny(pipeline, specs, &next, rules, entry_count);
       if (result != DOCA_SUCCESS) {
         pipeline->ingress_deny_failures++;
         fprintf(stderr, "Public ingress hardware deny fallback: vr=%u rif=%u error=%s\n",
@@ -1774,12 +2178,12 @@ doca_error_t eswitch_pipeline_ingress_deny_sync(
     slot->interface_id = rif->interface_id;
     slot->pipe = next;
     slot->rules = rules;
-    slot->rule_count = count;
-    slot->active = count != 0;
-    for (size_t i = 0; i < count; i++) {
-      slot->first[i] = ranges[i].first;
-      slot->last[i] = ranges[i].last;
-    }
+    slot->fingerprint = fingerprint;
+    slot->rule_count = entry_count;
+    slot->tcp_rule_count = tcp_count;
+    slot->udp_rule_count = udp_count;
+    slot->icmp_rule_count = icmp_count;
+    slot->active = entry_count != 0;
   }
   return DOCA_SUCCESS;
 }
@@ -2361,9 +2765,12 @@ doca_error_t eswitch_pipeline_sf_unbind_rif(
       return result;
     if (slot->pf_reply_pipe != NULL)
       doca_flow_pipe_destroy(slot->pf_reply_pipe);
+    if (slot->authorized_pipe != NULL)
+      doca_flow_pipe_destroy(slot->authorized_pipe);
     if (slot->pipe != NULL)
       doca_flow_pipe_destroy(slot->pipe);
     free(slot->pf_replies);
+    free(slot->authorized);
     free(slot->rules);
     *slot = (struct eswitch_egress_acl){0};
   }
@@ -2820,6 +3227,8 @@ doca_error_t eswitch_pipeline_ct_promote(
     goto fail;
   }
   pipeline->ct_promotions++;
+  if (session->port_forward)
+    pipeline->ct_pf_promotions++;
   offload_retry_reset(&pipeline->ct_retry);
   return DOCA_SUCCESS;
 
@@ -2864,6 +3273,9 @@ doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
     return DOCA_SUCCESS;
   for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
     struct eswitch_ct_session *session = &pipeline->ct_sessions[i];
+    struct doca_flow_resource_query origin = {0}, reply = {0};
+    uint64_t last_hit_s = 0;
+    bool counters_ready = false;
     doca_error_t result;
 
     if (session->entry == NULL ||
@@ -2878,6 +3290,19 @@ doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
       if (first_error == DOCA_SUCCESS)
         first_error = result;
       continue;
+    }
+    /* Admission is closed, so the final CT counter snapshot is stable. Keep
+     * it only after confirmed removal; a failed removal may be retried. */
+    result = doca_flow_ct_query_entry(
+        ct_queue_id(pipeline), pipeline->ct_pipe,
+        DOCA_FLOW_CT_ENTRY_FLAGS_NO_WAIT, session->entry,
+        &origin, &reply, &last_hit_s);
+    if (result == DOCA_SUCCESS) {
+      counters_ready = true;
+    } else {
+      pipeline->ct_counter_query_failures++;
+      fprintf(stderr, "Failed to snapshot retired NAT CT counters: %s\n",
+              doca_error_get_descr(result));
     }
     flow_entry_cookie_prepare(&session->cookie, "remove NAT CT connection",
                               DOCA_FLOW_ENTRY_OP_DEL);
@@ -2897,6 +3322,10 @@ doca_error_t eswitch_pipeline_ct_flush(struct eswitch_pipeline *pipeline,
       if (first_error == DOCA_SUCCESS)
         first_error = result;
       continue;
+    }
+    if (counters_ready) {
+      pipeline->ct_retired_origin_hits += origin.counter.total_pkts;
+      pipeline->ct_retired_reply_hits += reply.counter.total_pkts;
     }
     router_nat_session_set_hardware_active(session->software, false);
     *session = (struct eswitch_ct_session){0};
@@ -2944,8 +3373,8 @@ doca_error_t eswitch_pipeline_ct_stats(
 
   if (pipeline == NULL || origin_hits == NULL || reply_hits == NULL)
     return DOCA_ERROR_INVALID_VALUE;
-  *origin_hits = 0;
-  *reply_hits = 0;
+  *origin_hits = pipeline->ct_retired_origin_hits;
+  *reply_hits = pipeline->ct_retired_reply_hits;
   if (!pipeline->hardware_ct_enabled || pipeline->ct_pipe == NULL)
     return DOCA_SUCCESS;
   for (size_t i = 0; i < ROUTER_NAT_MAX_SESSIONS; i++) {
@@ -3194,9 +3623,12 @@ void eswitch_pipeline_destroy(struct eswitch_pipeline *pipeline) {
   for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
     if (pipeline->egress_acls[i].pf_reply_pipe != NULL)
       doca_flow_pipe_destroy(pipeline->egress_acls[i].pf_reply_pipe);
+    if (pipeline->egress_acls[i].authorized_pipe != NULL)
+      doca_flow_pipe_destroy(pipeline->egress_acls[i].authorized_pipe);
     if (pipeline->egress_acls[i].pipe != NULL)
       doca_flow_pipe_destroy(pipeline->egress_acls[i].pipe);
     free(pipeline->egress_acls[i].pf_replies);
+    free(pipeline->egress_acls[i].authorized);
     free(pipeline->egress_acls[i].rules);
   }
   if (pipeline->egress_acl_selector_pipe != NULL)
@@ -3937,6 +4369,43 @@ doca_error_t eswitch_pipeline_hw_route_stats(
   if (result == DOCA_SUCCESS)
     *lpm_misses = query.counter.total_pkts;
   return result;
+}
+
+doca_error_t eswitch_pipeline_ingress_deny_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *drop_packets,
+    uint64_t *tcp_drop_packets, uint64_t *udp_drop_packets,
+    uint64_t *icmp_drop_packets) {
+  struct doca_flow_resource_query query = {0};
+
+  if (pipeline == NULL || drop_packets == NULL || tcp_drop_packets == NULL ||
+      udp_drop_packets == NULL || icmp_drop_packets == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  *drop_packets = 0;
+  *tcp_drop_packets = 0;
+  *udp_drop_packets = 0;
+  *icmp_drop_packets = 0;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    const struct eswitch_ingress_deny *deny = &pipeline->ingress_denies[i];
+    if (!deny->active)
+      continue;
+    for (size_t j = 0; j < deny->rule_count; j++) {
+      doca_error_t result;
+      if (deny->rules[j].entry == NULL)
+        return DOCA_ERROR_BAD_STATE;
+      memset(&query, 0, sizeof(query));
+      result = doca_flow_resource_query_entry(deny->rules[j].entry, &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *drop_packets += query.counter.total_pkts;
+      if (j < deny->tcp_rule_count)
+        *tcp_drop_packets += query.counter.total_pkts;
+      else if (j < deny->tcp_rule_count + deny->udp_rule_count)
+        *udp_drop_packets += query.counter.total_pkts;
+      else
+        *icmp_drop_packets += query.counter.total_pkts;
+    }
+  }
+  return DOCA_SUCCESS;
 }
 
 static doca_error_t create_egress_gate_for(

@@ -64,6 +64,8 @@ struct eswitch_flood_group {
 #define ESWITCH_MAX_SF_RETURN_CONTEXTS 256U
 #define ESWITCH_MAX_CT_ADJACENCIES 1024U
 #define ESWITCH_MAX_PF_REPLY_EXCEPTIONS 128U
+#define ESWITCH_MAX_EGRESS_AUTHORIZED_FLOWS 128U
+#define ESWITCH_EGRESS_AUTHORIZED_LEASE_NS UINT64_C(30000000000)
 
 struct eswitch_pf_reply_exception {
   const struct router_nat_session *session;
@@ -73,6 +75,18 @@ struct eswitch_pf_reply_exception {
   uint16_t inside_port;
   uint32_t remote_ip;
   uint16_t remote_port;
+  struct eswitch_rule rule;
+};
+
+struct eswitch_egress_authorized_flow {
+  uint8_t protocol;
+  uint16_t ingress_port;
+  uint32_t source_ip;
+  uint32_t destination_ip;
+  uint16_t source_port;
+  uint16_t destination_port;
+  uint8_t source_mac[6];
+  uint64_t lease_until_ns;
   struct eswitch_rule rule;
 };
 
@@ -86,9 +100,12 @@ struct eswitch_egress_acl {
   uint64_t fingerprint;
   struct doca_flow_pipe *pipe;
   struct doca_flow_pipe *pf_reply_pipe;
+  struct doca_flow_pipe *authorized_pipe;
   struct eswitch_rule *rules;
   struct eswitch_pf_reply_exception *pf_replies;
+  struct eswitch_egress_authorized_flow *authorized;
   size_t pf_reply_count;
+  size_t authorized_count;
   size_t rule_count;
   struct eswitch_rule selector;
   bool active;
@@ -96,13 +113,17 @@ struct eswitch_egress_acl {
 };
 
 #define ESWITCH_INGRESS_DENY_MAX_RANGES 8U
+#define ESWITCH_INGRESS_DENY_PREFIXES_PER_RANGE 32U
+#define ESWITCH_INGRESS_DENY_MAX_RULES 512U
 struct eswitch_ingress_deny {
   uint16_t interface_id;
   struct doca_flow_pipe *pipe;
   struct eswitch_rule *rules;
-  uint16_t first[ESWITCH_INGRESS_DENY_MAX_RANGES];
-  uint16_t last[ESWITCH_INGRESS_DENY_MAX_RANGES];
+  uint64_t fingerprint;
   size_t rule_count;
+  size_t tcp_rule_count;
+  size_t udp_rule_count;
+  size_t icmp_rule_count;
   bool active;
 };
 
@@ -205,6 +226,10 @@ struct eswitch_pipeline {
   const char *ct_last_failure_stage;
   doca_error_t ct_last_failure;
   uint64_t ct_promotions;
+  uint64_t ct_pf_promotions;
+  uint64_t ct_retired_origin_hits;
+  uint64_t ct_retired_reply_hits;
+  uint64_t ct_counter_query_failures;
   uint64_t ct_failures;
   uint64_t ct_full;
   bool hardware_ct_requested;
@@ -219,6 +244,10 @@ struct eswitch_pipeline {
   uint64_t ingress_deny_failures;
   uint64_t egress_acl_failures;
   uint64_t egress_acl_pf_reply_fallbacks;
+  uint64_t egress_authorized_promotions;
+  uint64_t egress_authorized_removals;
+  uint64_t egress_authorized_failures;
+  uint64_t egress_authorized_retired_hits;
 
   struct eswitch_rule rss_rule;
   struct eswitch_rule learning_clone_rules[2];
@@ -337,6 +366,10 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     struct eswitch_pipeline *pipeline, const struct router_config *config);
 doca_error_t eswitch_pipeline_ingress_deny_sync(
     struct eswitch_pipeline *pipeline, const struct router_config *config);
+doca_error_t eswitch_pipeline_ingress_deny_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *drop_packets,
+    uint64_t *tcp_drop_packets, uint64_t *udp_drop_packets,
+    uint64_t *icmp_drop_packets);
 /* Install an exact, session-owned exception before delivering the inbound
  * port-forward packet to its guest. The hit still goes to Arm for NAT. */
 doca_error_t eswitch_pipeline_egress_acl_pf_reply_add(
@@ -346,6 +379,14 @@ doca_error_t eswitch_pipeline_egress_acl_pf_reply_prune(
     struct eswitch_pipeline *pipeline);
 doca_error_t eswitch_pipeline_egress_acl_pf_reply_flush(
     struct eswitch_pipeline *pipeline);
+doca_error_t eswitch_pipeline_egress_authorize(
+    struct eswitch_pipeline *pipeline, uint16_t vr_id,
+    uint16_t interface_id, uint16_t ingress_port,
+    const uint8_t *frame, size_t length, uint64_t now_ns);
+doca_error_t eswitch_pipeline_egress_authorized_prune(
+    struct eswitch_pipeline *pipeline, uint64_t now_ns);
+doca_error_t eswitch_pipeline_egress_authorized_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *hits);
 
 /* Promote a software TCP/UDP NAT session into the bidirectional CT table.
  * Both adjacency entries are committed before the CT connection becomes

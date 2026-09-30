@@ -1414,6 +1414,17 @@ static void route_arm_frame(struct eswitch_manager *manager,
     goto out;
   }
   manager->routed_forwarded++;
+  if (egress_verdict == ROUTER_EGRESS_ALLOW && nat_session == NULL &&
+      ingress->attachment == ROUTER_VSWITCH &&
+      egress->attachment == ROUTER_VSWITCH) {
+    result = eswitch_pipeline_egress_authorize(
+        manager->pipeline, ingress->vr_id, ingress->interface_id,
+        ingress_port, frame, length, now_ns);
+    if (result != DOCA_SUCCESS && result != DOCA_ERROR_NOT_SUPPORTED &&
+        manager->packet_debug)
+      fprintf(stderr, "Guest egress flow authorization deferred: %s\n",
+              doca_error_get_descr(result));
+  }
   if (manager->packet_debug)
     printf("ROUTE TX: vr=%u ingress-rif=%u egress-rif=%u attachment=%s "
          "egress-vs=%u prefix=/%u next-hop=%u.%u.%u.%u "
@@ -1966,6 +1977,13 @@ doca_error_t eswitch_manager_maintenance(struct eswitch_manager *manager) {
       fprintf(stderr, "Port-forward reply exception cleanup deferred: %s\n",
               doca_error_get_descr(result));
   }
+  {
+    doca_error_t result = eswitch_pipeline_egress_authorized_prune(
+        manager->pipeline, now_ns);
+    if (result != DOCA_SUCCESS && manager->packet_debug)
+      fprintf(stderr, "Guest egress authorization cleanup deferred: %s\n",
+              doca_error_get_descr(result));
+  }
   probe_configured_next_hops(manager, manager->router, now_ns);
   {
     doca_error_t result = eswitch_manager_hw_routes_sync(manager,
@@ -1992,6 +2010,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   size_t egress_acl_fallback = 0;
   size_t egress_acl_rules = 0;
   size_t egress_acl_pf_replies = 0;
+  size_t egress_authorized_active = 0;
   uint64_t sf_ingress_hits = 0;
   uint64_t sf_context_hits = 0;
   uint64_t local_ip_hits = 0;
@@ -2002,6 +2021,11 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t hw_eligibility_fallbacks = 0;
   uint64_t hw_ct_origin_hits = 0;
   uint64_t hw_ct_reply_hits = 0;
+  uint64_t ingress_hw_drops = 0;
+  uint64_t ingress_tcp_hw_drops = 0;
+  uint64_t ingress_udp_hw_drops = 0;
+  uint64_t ingress_icmp_hw_drops = 0;
+  uint64_t egress_authorized_hits = 0;
   uint64_t uplink_arp_hw_drops = 0;
   uint64_t now_ns = monotonic_ns();
   uint64_t hw_retry_in_ms = manager->next_hw_route_retry_ns > now_ns
@@ -2010,6 +2034,8 @@ static size_t format_status(const struct eswitch_manager *manager,
   doca_error_t sf_counter_result;
   doca_error_t hw_counter_result;
   doca_error_t ct_counter_result;
+  doca_error_t ingress_counter_result;
+  doca_error_t egress_authorized_counter_result;
   doca_error_t uplink_arp_counter_result;
   uint64_t uptime = (now_ns - manager->started_ns) / 1000000000ULL;
 
@@ -2023,6 +2049,7 @@ static size_t format_status(const struct eswitch_manager *manager,
     egress_acl_fallback += acl->fallback_arm;
     egress_acl_rules += acl->rule_count;
     egress_acl_pf_replies += acl->pf_reply_count;
+    egress_authorized_active += acl->authorized_count;
   }
   for (uint16_t i = 0; i < manager->ports->count; i++) {
     const struct ethernet_port *port = manager->ports->items[i].ethernet;
@@ -2051,6 +2078,11 @@ static size_t format_status(const struct eswitch_manager *manager,
       &hw_eligibility_fallbacks);
   ct_counter_result = eswitch_pipeline_ct_stats(
       manager->pipeline, &hw_ct_origin_hits, &hw_ct_reply_hits);
+  ingress_counter_result = eswitch_pipeline_ingress_deny_stats(
+      manager->pipeline, &ingress_hw_drops, &ingress_tcp_hw_drops,
+      &ingress_udp_hw_drops, &ingress_icmp_hw_drops);
+  egress_authorized_counter_result = eswitch_pipeline_egress_authorized_stats(
+      manager->pipeline, &egress_authorized_hits);
   uplink_arp_counter_result = eswitch_pipeline_uplink_arp_drop_query(
       manager->pipeline, &uplink_arp_hw_drops);
   used = append_text(response, size, used, "OK\n");
@@ -2125,6 +2157,7 @@ static size_t format_status(const struct eswitch_manager *manager,
       "nat_dataplane=%s hw_ct_capability=%s hw_ct_state=%s "
       "hw_ct_requested_capacity=%u hw_ct_capacity=%u "
       "hw_ct_active=%zu hw_ct_promotions=%" PRIu64
+      " hw_ct_pf_promotions=%" PRIu64
       " hw_ct_failures=%" PRIu64 " hw_ct_full=%" PRIu64 "\n",
       manager->pipeline->hardware_ct_enabled &&
               manager->pipeline->ct_admission_pipe != NULL
@@ -2138,17 +2171,21 @@ static size_t format_status(const struct eswitch_manager *manager,
                 ? "degraded" : "ready")),
       manager->pipeline->ct_requested_capacity,
       manager->pipeline->ct_capacity, manager->pipeline->ct_active,
-      manager->pipeline->ct_promotions, manager->pipeline->ct_failures,
+      manager->pipeline->ct_promotions,
+      manager->pipeline->ct_pf_promotions,
+      manager->pipeline->ct_failures,
       manager->pipeline->ct_full);
   used = append_text(response, size, used,
       "ct_authorization=%s ct_scope=vs-to-vs-nat-tcp-udp "
       "ct_zone=connection ct_lease_ms=30000 ct_activity_counters=%s "
-      "origin_hits=%" PRIu64 " reply_hits=%" PRIu64 "\n",
+      "origin_hits=%" PRIu64 " reply_hits=%" PRIu64
+      " retired_query_failures=%" PRIu64 "\n",
       manager->pipeline->ct_admission_pipe != NULL ? "exact-ingress-session"
                                                   : "arm-only",
       !manager->pipeline->hardware_ct_enabled ? "off" :
           (ct_counter_result == DOCA_SUCCESS ? "ready" : "error"),
-      hw_ct_origin_hits, hw_ct_reply_hits);
+      hw_ct_origin_hits, hw_ct_reply_hits,
+      manager->pipeline->ct_counter_query_failures);
   used = append_text(response, size, used,
       "ct_retry_backoff_ms=%u ct_retry_suppressed=%" PRIu64
       " ct_no_memory=%" PRIu64 " ct_last_failure_stage=%s"
@@ -2218,24 +2255,36 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->ingress_checked, manager->ingress_allowed, manager->ingress_denied,
       manager->ingress_established);
   {
-    size_t active = 0, hw_rules = 0;
+    size_t active = 0, hw_rules = 0, tcp_rules = 0, udp_rules = 0,
+           icmp_rules = 0;
     for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
       if (!manager->pipeline->ingress_denies[i].active) continue;
       active++;
       hw_rules += manager->pipeline->ingress_denies[i].rule_count;
+      tcp_rules += manager->pipeline->ingress_denies[i].tcp_rule_count;
+      udp_rules += manager->pipeline->ingress_denies[i].udp_rule_count;
+      icmp_rules += manager->pipeline->ingress_denies[i].icmp_rule_count;
     }
     used = append_text(response, size, used,
-        "public_ingress_hw=tcp-deny-port-ranges active_policies=%zu "
-        "hw_rules=%zu failures=%" PRIu64 " fallback=arm "
-        "reverse_nat_ports=exempt counter_state=off\n",
-        active, hw_rules, manager->pipeline->ingress_deny_failures);
+        "public_ingress_hw=tcp-udp-icmp-deny active_policies=%zu "
+        "hw_rules=%zu tcp_rules=%zu udp_rules=%zu icmp_rules=%zu "
+        "failures=%" PRIu64 " fallback=arm "
+        "reverse_nat_ports=exempt hw_drops=%" PRIu64
+        " tcp_drops=%" PRIu64 " udp_drops=%" PRIu64
+        " icmp_drops=%" PRIu64 " counter_state=%s\n",
+        active, hw_rules, tcp_rules, udp_rules, icmp_rules,
+        manager->pipeline->ingress_deny_failures,
+        ingress_hw_drops,
+        ingress_tcp_hw_drops, ingress_udp_hw_drops,
+        ingress_icmp_hw_drops,
+        ingress_counter_result == DOCA_SUCCESS ? "ready" : "error");
   }
   used = append_text(response, size, used,
       "guest_egress=%s policies=%zu rules=%zu checked=%" PRIu64
       " allowed=%" PRIu64 " denied=%" PRIu64
       " established_pf_replies=%" PRIu64 "\n",
       !manager->router->egress_policy_count ? "disabled" :
-          (egress_acl_active ? "doca-acl-deny-plus-arm-recheck" :
+          (egress_acl_active ? "doca-acl-deny-plus-exact-authorize" :
                                "arm-pre-route"),
       manager->router->egress_policy_count,
       manager->router->egress_rule_count,manager->egress_checked,
@@ -2243,12 +2292,22 @@ static size_t format_status(const struct eswitch_manager *manager,
       manager->egress_established_replies);
   used = append_text(response, size, used,
       "egress_acl=%s active_policies=%zu fallback_policies=%zu "
-      "hw_rules=%zu failures=%" PRIu64 " arm_recheck=enabled "
+      "hw_rules=%zu failures=%" PRIu64 " arm_recheck=miss-only "
       "pf_reply_exceptions=%zu pf_reply_fallbacks=%" PRIu64 "\n",
       manager->pipeline->egress_acl_selector_pipe != NULL ? "ready" : "off",
       egress_acl_active, egress_acl_fallback, egress_acl_rules,
       manager->pipeline->egress_acl_failures, egress_acl_pf_replies,
       manager->pipeline->egress_acl_pf_reply_fallbacks);
+  used = append_text(response, size, used,
+      "egress_authorized=exact-tcp-udp active=%zu promotions=%" PRIu64
+      " removals=%" PRIu64 " failures=%" PRIu64 " hw_hits=%" PRIu64
+      " counter_state=%s lease_ms=30000\n",
+      egress_authorized_active,
+      manager->pipeline->egress_authorized_promotions,
+      manager->pipeline->egress_authorized_removals,
+      manager->pipeline->egress_authorized_failures,
+      egress_authorized_hits,
+      egress_authorized_counter_result == DOCA_SUCCESS ? "ready" : "error");
   used = append_text(response, size, used,
       "router_link_dataplane=arm forwards=%" PRIu64 " drops=%" PRIu64
       " max_hops=%u\n", manager->router_link_forwards,

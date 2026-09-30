@@ -120,7 +120,8 @@ enum router_nat_result router_nat_port_forward_inbound(
     const struct router_nat_session **session);
 
 /* Reject a PF session after the translated target fails route validation.
- * PF sessions are Arm-owned; they are never promoted to hardware CT. */
+ * An authorized PF session becomes CT-eligible after its first guest reply
+ * proves the inside port/MAC identity. */
 void router_nat_port_forward_reject(struct router_nat_table *table,
                                     const struct router_nat_session *session);
 

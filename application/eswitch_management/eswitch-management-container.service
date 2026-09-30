@@ -1,0 +1,40 @@
+[Unit]
+Description=NVIDIA BlueField eSwitch Management Container
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=/dev/hugepages
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/eswitch-management-container.conf
+
+RuntimeDirectory=eswitch-management
+RuntimeDirectoryMode=0755
+
+StateDirectory=eswitch-management
+StateDirectoryMode=0750
+
+ExecStartPre=-/usr/bin/docker rm -f eswitch-management
+
+ExecStart=/usr/bin/docker run --rm \
+  --name eswitch-management \
+  --privileged \
+  --network host \
+  --ulimit memlock=-1:-1 \
+  --env ESWITCH_VF_SCOPE=0-50 \
+  --mount type=bind,src=/dev/hugepages,dst=/dev/hugepages \
+  --mount type=bind,src=/run/eswitch-management,dst=/run/eswitch-management \
+  --mount type=bind,src=/var/lib/eswitch-management,dst=/var/lib/eswitch-management \
+  ${IMAGE} -l ${EAL_CORE} -- ${DEVICE_PCI}
+
+ExecStop=/usr/bin/docker stop --time 30 eswitch-management
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=0
+TimeoutStopSec=45
+SuccessExitStatus=0 143
+
+[Install]
+WantedBy=multi-user.target

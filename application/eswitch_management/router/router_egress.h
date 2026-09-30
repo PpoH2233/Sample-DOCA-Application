@@ -25,5 +25,16 @@ struct router_tcp_port_range { uint16_t first, last; };
 size_t router_ingress_tcp_deny_ranges(
     const struct router_config *config, const struct router_interface *rif,
     struct router_tcp_port_range *ranges, size_t capacity);
+size_t router_ingress_l4_deny_ranges(
+    const struct router_config *config, const struct router_interface *rif,
+    uint8_t protocol, struct router_tcp_port_range *ranges, size_t capacity);
+
+struct router_icmp_deny_match {
+  uint8_t type, type_mask;
+  uint8_t code, code_mask;
+};
+size_t router_ingress_icmp_deny_matches(
+    const struct router_config *config, const struct router_interface *rif,
+    struct router_icmp_deny_match *matches, size_t capacity);
 
 #endif
