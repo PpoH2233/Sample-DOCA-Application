@@ -70,17 +70,17 @@ printf '%s' "${out}" | grep -q '"vswitch_id"' && chk "P1 no ids when vlan absent
 # ---------------------------------------------------------------------------
 # P2: ensure-network-device with vlan 100 -> vswitch_id = vr_id = vlan
 # ---------------------------------------------------------------------------
-payload p2 '{"payload":{"network_id":"42","vlan":"100"},"physical-network-extension-details":{"hosts":"192.0.2.10,192.0.2.11"},"network-extension-details":{}}'
+payload p2 '{"payload":{"network_id":"42","vlan":"900"},"physical-network-extension-details":{"hosts":"192.0.2.10,192.0.2.11"},"network-extension-details":{}}'
 out=$("${PROXY}" ensure-network-device "${TEST_ROOT}/p2.json" 60 2>"${TEST_ROOT}/p2.err")
 rc=$?
 chk "P2 rc" "0" "${rc}"
-printf '%s' "${out}" | grep -q '"vswitch_id":"100"' && chk "P2 vswitch_id" "yes" "yes" || chk "P2 vswitch_id" "yes" "no"
-printf '%s' "${out}" | grep -q '"vr_id":"100"' && chk "P2 vr_id" "yes" "yes" || chk "P2 vr_id" "yes" "no"
+printf '%s' "${out}" | grep -q '"vswitch_id":"900"' && chk "P2 vswitch_id" "yes" "yes" || chk "P2 vswitch_id" "yes" "no"
+printf '%s' "${out}" | grep -q '"vr_id":"900"' && chk "P2 vr_id" "yes" "yes" || chk "P2 vr_id" "yes" "no"
 
 # ---------------------------------------------------------------------------
 # P3: sticky host selection via network-extension-details
 # ---------------------------------------------------------------------------
-payload p3 '{"payload":{"network_id":"42","vlan":"100"},"physical-network-extension-details":{"hosts":"192.0.2.10,192.0.2.11"},"network-extension-details":{"host":"192.0.2.11","vswitch_id":"100"}}'
+payload p3 '{"payload":{"network_id":"42","vlan":"900"},"physical-network-extension-details":{"hosts":"192.0.2.10,192.0.2.11"},"network-extension-details":{"host":"192.0.2.11","vswitch_id":"900"}}'
 out=$("${PROXY}" ensure-network-device "${TEST_ROOT}/p3.json" 60 2>"${TEST_ROOT}/p3.err")
 rc=$?
 chk "P3 rc" "0" "${rc}"
@@ -109,6 +109,23 @@ grep -qF "dpu-eswitch-wrapper.sh' 'implement-network'" "${TEST_ROOT}/ssh.log" &&
     chk "P5 wrapper invoked" "yes" "yes" || chk "P5 wrapper invoked" "yes" "no"
 grep -qF "cs-extnet-payload" "${TEST_ROOT}/ssh.log" && \
     chk "P5 payload upload staged" "yes" "yes" || chk "P5 payload upload" "yes" "no"
+
+# Replayed ensure must not hash an existing network to an unregistered DPU.
+payload p6 '{"payload":{"network_id":"42","vlan":"900"},"physical-network-extension-details":{"hosts":"192.0.2.10"},"network-extension-details":{"host":"192.0.2.11"}}'
+"${PROXY}" ensure-network-device "${TEST_ROOT}/p6.json" 60 >"${TEST_ROOT}/p6.out" 2>"${TEST_ROOT}/p6.err"
+chk "P6 reject moving pinned network" "1" "$?"
+
+payload p7 '{"payload":{"network_id":"42","vlan":"899"},"physical-network-extension-details":{"hosts":"192.0.2.10"},"network-extension-details":{}}'
+"${PROXY}" ensure-network-device "${TEST_ROOT}/p7.json" 60 >"${TEST_ROOT}/p7.out" 2>"${TEST_ROOT}/p7.err"
+chk "P7 reject VID899" "1" "$?"
+
+for command in apply-fw-rules add-port-forward delete-port-forward; do
+    rm -f "${TEST_ROOT}/ssh.log"
+    "${PROXY}" "${command}" "${TEST_ROOT}/p5.json" 60 >"${TEST_ROOT}/forward.out" 2>"${TEST_ROOT}/forward.err"
+    chk "P8 ${command} forward" "0" "$?"
+    grep -qF "dpu-eswitch-wrapper.sh' '${command}'" "${TEST_ROOT}/ssh.log" && \
+        chk "P8 ${command} wrapper invocation" "yes" "yes" || chk "P8 ${command} wrapper invocation" "yes" "no"
+done
 
 echo
 echo "result: pass=${pass} fail=${fail}"

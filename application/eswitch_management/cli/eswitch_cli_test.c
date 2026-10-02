@@ -99,9 +99,14 @@ int main(void) {
   struct eswitch_cli_command all = line("vs show\n", true);
   assert(all.verb == ESWITCH_CLI_VS_SHOW && !all.has_id && all.id == 0);
   accept_id("vs show --id 200\n", ESWITCH_CLI_VS_SHOW, 200, false);
+  struct eswitch_cli_command named = line("vs create --id 900 --name VS900\n", true);
+  assert(strcmp(named.name, "VS900") == 0);
+  line("vs create --id 900 --name bad/name\n", false);
+  line("vs delete --id 900 --name VS900\n", false);
 
   /* Canonical port and fdb resources. */
   accept_verb("port show\n", ESWITCH_CLI_PORT_SHOW, false);
+  assert(line("port show --all\n", true).all_ports);
   struct eswitch_cli_command fdb = line("fdb show\n", true);
   assert(fdb.verb == ESWITCH_CLI_FDB_SHOW && !fdb.has_id && fdb.id == 0);
   accept_id("fdb show --id 100\n", ESWITCH_CLI_FDB_SHOW, 100, false);

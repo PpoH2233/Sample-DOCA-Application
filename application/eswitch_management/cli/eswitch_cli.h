@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "../eswitch_vlan.h"
+#include "../eswitch_config.h"
 
 #define ESWITCH_CLI_REQUEST_SIZE 512U
 #define ESWITCH_CLI_MAX_COMMAND_SIZE (ESWITCH_CLI_REQUEST_SIZE - 2U)
@@ -53,6 +54,8 @@ struct eswitch_cli_command {
   bool has_port;
   bool has_mode;
   bool has_vlan;
+  bool all_ports;
+  char name[ESWITCH_VS_NAME_SIZE];
   /* True when the caller used a deprecated alias or a legacy positional
    * argument instead of the canonical resource-first named form. */
   bool legacy;

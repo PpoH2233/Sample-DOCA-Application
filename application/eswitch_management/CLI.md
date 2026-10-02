@@ -8,11 +8,19 @@ start another DOCA or DPDK process, and does not need to shell out to
 
 Everything below is normative unless marked as an example.
 
-Contract revision: `doca34-policy-fastpath-v51`. This revision includes
+Contract revision: `doca34-policy-fastpath-v53`. This revision includes
 logical router-links, Arm router-link forwarding, NAT44 for TCP/UDP/ICMP Echo,
 private DOCA Flow LPM promotion, TCP/UDP DOCA Flow CT promotion, and route-plan
 aware control transactions, plus Arm TCP/UDP single-port and 1:1 range port
-forwarding on an addressed public RIF. CloudStack integration is not included.
+forwarding on an addressed public RIF. The CloudStack adapter is documented
+in `cs-network-extension/dpu-eswitch/README.md`. v53 moves local-IP egress
+exceptions into a CONTROL guard and projects ordered ALL rules onto TCP/UDP
+CONTROL entries; ICMP/other protocols retain Arm enforcement. `egress_acl`
+exposes `engine=control`, `scope=tcp-udp`, `other_protocols=arm`, `hw_hits` and
+`counter_state`. Up to seven TCP/UDP-relevant rules per policy are offloaded,
+with port ranges decomposed to ternary prefixes and default action at priority7.
+Larger policies use complete Arm enforcement. Hardware counts include the
+explicit default entry and reset on generation replacement.
 
 ## 1. Grammar
 
@@ -28,12 +36,12 @@ The complete canonical command set:
 | --- | --- | --- |
 | 1 | `status` | query |
 | 2 | `tx-debug` | query |
-| 3 | `vs create --id <id>` | mutation |
+| 3 | `vs create --id <id> [--name <name>]` | mutation |
 | 4 | `vs delete --id <id>` | mutation |
 | 5 | `vs show [--id <id>]` | query |
 | 6 | `vs port attach --id <id> --port <port-id> [--mode access\|trunk] [--vlan <interval[,interval]>]` | mutation |
 | 7 | `vs port detach --id <id> --port <port-id>` | mutation |
-| 8 | `port show` | query |
+| 8 | `port show [--all]` | query |
 | 9 | `fdb show [--id <id>]` | query |
 | 10 | `vr create --id <id>` | mutation |
 | 11 | `vr delete --id <id>` | mutation |
@@ -513,6 +521,10 @@ not exist. `--id 0` is treated as "no filter" and lists everything.
 
 ### 5.6 `port show`
 
+`port show --all` returns every assignable physical/representor identity,
+including already attached/reserved ports, for stable-identity reconciliation.
+It still omits the reserved system SF. The numeric IDs remain runtime-only.
+
 Assignable DPDK ports. An access-owned port and a port directly reserved by a
 VR are hidden. The physical parent remains visible after trunk attachment so
 additional VLAN memberships can be configured on the same p0.
@@ -709,7 +721,7 @@ counts deferred packet-triggered attempts; `ct_last_failure_stage` and
 `ct_last_error` retain the latest failed stage/error. No CLI syntax changes
 are required. See [performance tests](PERFORMANCE_TESTING.md).
 
-`vr egress policy set` and `vr egress rule add` inject a DOCA Flow ACL
+`vr egress policy set` and `vr egress rule add` inject a DOCA Flow CONTROL ACL
 generation for the guest RIF, independent of `ESWITCH_HW_ROUTING`. A lower
 `rule-id` has higher priority. TCP/UDP IPv4 CIDRs and destination port ranges
 are candidates for hardware ACL entries. Other protocols currently use the

@@ -1,4 +1,5 @@
 #include "router_egress.h"
+#include "router_acl_plan.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -34,6 +35,31 @@ static bool switch_exists(void *context, uint16_t id) {
   return id == 100 || id == 200;
 }
 
+static void test_control_port_prefixes(void) {
+  const uint16_t ranges[][2] = {{1, 65535}, {80, 80}, {443, 443},
+      {2222, 2223}, {1000, 2017}, {65535, 65535}};
+  struct router_egress_rule rule = {0};
+  assert(router_acl_port_count(&rule) == 1);
+  assert(router_acl_port_block(0, 65535) == 65536);
+  for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); i++) {
+    rule.port_first = ranges[i][0];
+    rule.port_last = ranges[i][1];
+    size_t blocks = 0;
+    for (uint32_t port = 0; port <= 65535U; port++) {
+      unsigned int matches = 0;
+      for (uint32_t cursor = rule.port_first; cursor <= rule.port_last;) {
+        uint32_t block = router_acl_port_block(cursor, rule.port_last);
+        uint16_t mask = (uint16_t)~(block - 1U);
+        matches += ((uint16_t)port & mask) == ((uint16_t)cursor & mask);
+        if (port == 0) blocks++;
+        cursor += block;
+      }
+      assert(matches == (port >= rule.port_first && port <= rule.port_last));
+    }
+    assert(blocks == router_acl_port_count(&rule));
+  }
+}
+
 static void command(const char *request, bool expected) {
   struct router_inventory inventory = {.switch_exists = switch_exists};
   bool changed = false;
@@ -60,6 +86,21 @@ static void packet(uint8_t frame[54], uint16_t destination_port) {
 }
 
 int main(void) {
+  test_control_port_prefixes();
+  struct router_egress_rule projected = {.protocol = 0, .icmp_type = -1, .icmp_code = -1};
+  assert(router_acl_applies(&projected, 6));
+  assert(router_acl_applies(&projected, 17));
+  assert(!router_acl_applies(&projected, 1));
+  projected.protocol = 6;
+  assert(router_acl_applies(&projected, 6));
+  assert(!router_acl_applies(&projected, 17));
+  projected.protocol = 1;
+  assert(!router_acl_applies(&projected, 6));
+  assert(!router_acl_applies(&projected, 17));
+  projected.protocol = 17;
+  assert(router_acl_applies(&projected, 17));
+  projected.icmp_type = 8;
+  assert(!router_acl_applies(&projected, 17));
   uint8_t frame[54];
   const struct router_interface *guest;
   char path[] = "/tmp/eswitch-egress-test-XXXXXX";

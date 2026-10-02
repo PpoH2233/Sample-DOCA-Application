@@ -6,6 +6,20 @@
 #define ESWITCH_SOCKET_PATH "/run/eswitch-management/control.sock"
 #define ESWITCH_STATE_PATH "/var/lib/eswitch-management/eswitch.conf"
 #define ESWITCH_MAX_VSWITCHES 64U
+#define ESWITCH_VS_NAME_SIZE 64U
+/* Names are one control/state token, with no quoting or whitespace. */
+static inline int eswitch_vs_name_valid(const char *name) {
+  unsigned n = 0;
+  if (!name || !*name) return 0;
+  for (; name[n]; n++) {
+    char c = name[n];
+    if (n >= ESWITCH_VS_NAME_SIZE - 1U ||
+        !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+      return 0;
+  }
+  return 1;
+}
 #define ESWITCH_MAX_VLAN_MEMBERSHIPS 512U
 /* Persistence and the runtime pipeline must enforce the same limit.  Apart
  * from rejecting an unrestorable configuration, a larger persistence-only

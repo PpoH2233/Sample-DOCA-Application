@@ -223,6 +223,7 @@ static doca_error_t manager_to_state(const struct eswitch_manager *manager,
     result = eswitch_state_add_switch(state, manager->switches[i].id);
     if (result != DOCA_SUCCESS)
       return result;
+    strcpy(state->switch_names[state->switch_count - 1], manager->switches[i].name);
   }
   for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
     const struct eswitch_port_membership *configured =
@@ -304,6 +305,7 @@ static doca_error_t restore_manager(struct eswitch_manager *manager) {
     result = create_vswitch(manager, state.switch_ids[i]);
     if (result != DOCA_SUCCESS)
       goto out;
+    strcpy(find_vswitch(manager, state.switch_ids[i])->name, state.switch_names[i]);
   }
   for (size_t i = 0; i < state.member_count; i++) {
     int port_index = find_state_member_port(manager, &state.members[i]);
@@ -339,10 +341,11 @@ out:
 }
 
 static doca_error_t create_vswitch_persisted(struct eswitch_manager *manager,
-                                             uint16_t id) {
+                                             uint16_t id, const char *name) {
   doca_error_t result = create_vswitch(manager, id);
 
   if (result == DOCA_SUCCESS) {
+    strcpy(find_vswitch(manager, id)->name, name);
     doca_error_t save_result = persist_manager(manager);
     if (save_result != DOCA_SUCCESS) {
       doca_error_t rollback = delete_vswitch(manager, id);
@@ -472,9 +475,11 @@ static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
   struct eswitch_port_membership *members;
   uint16_t member_count = 0;
   doca_error_t result;
+  char old_name[ESWITCH_VS_NAME_SIZE];
 
   if (find_vswitch(manager, id) == NULL)
     return DOCA_ERROR_NOT_FOUND;
+  strcpy(old_name, find_vswitch(manager, id)->name);
   members = calloc(ESWITCH_MAX_VLAN_MEMBERSHIPS, sizeof(*members));
   if (members == NULL)
     return DOCA_ERROR_NO_MEMORY;
@@ -489,6 +494,8 @@ static doca_error_t delete_vswitch_persisted(struct eswitch_manager *manager,
     doca_error_t save_result = persist_manager(manager);
     if (save_result != DOCA_SUCCESS) {
       doca_error_t rollback = create_vswitch(manager, id);
+      if (rollback == DOCA_SUCCESS)
+        strcpy(find_vswitch(manager, id)->name, old_name);
       for (uint16_t i = 0; rollback == DOCA_SUCCESS && i < member_count; i++)
         rollback = attach_port(manager, id, members[i].port_id,
                                members[i].mode, members[i].vlan_id,
@@ -2026,6 +2033,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   uint64_t ingress_udp_hw_drops = 0;
   uint64_t ingress_icmp_hw_drops = 0;
   uint64_t egress_authorized_hits = 0;
+  uint64_t egress_acl_hits = 0;
   uint64_t uplink_arp_hw_drops = 0;
   uint64_t now_ns = monotonic_ns();
   uint64_t hw_retry_in_ms = manager->next_hw_route_retry_ns > now_ns
@@ -2036,6 +2044,7 @@ static size_t format_status(const struct eswitch_manager *manager,
   doca_error_t ct_counter_result;
   doca_error_t ingress_counter_result;
   doca_error_t egress_authorized_counter_result;
+  doca_error_t egress_acl_counter_result;
   doca_error_t uplink_arp_counter_result;
   uint64_t uptime = (now_ns - manager->started_ns) / 1000000000ULL;
 
@@ -2083,6 +2092,8 @@ static size_t format_status(const struct eswitch_manager *manager,
       &ingress_udp_hw_drops, &ingress_icmp_hw_drops);
   egress_authorized_counter_result = eswitch_pipeline_egress_authorized_stats(
       manager->pipeline, &egress_authorized_hits);
+  egress_acl_counter_result = eswitch_pipeline_egress_acl_stats(
+      manager->pipeline, &egress_acl_hits);
   uplink_arp_counter_result = eswitch_pipeline_uplink_arp_drop_query(
       manager->pipeline, &uplink_arp_hw_drops);
   used = append_text(response, size, used, "OK\n");
@@ -2293,11 +2304,14 @@ static size_t format_status(const struct eswitch_manager *manager,
   used = append_text(response, size, used,
       "egress_acl=%s active_policies=%zu fallback_policies=%zu "
       "hw_rules=%zu failures=%" PRIu64 " arm_recheck=miss-only "
-      "pf_reply_exceptions=%zu pf_reply_fallbacks=%" PRIu64 "\n",
+      "pf_reply_exceptions=%zu pf_reply_fallbacks=%" PRIu64
+      " engine=control scope=tcp-udp other_protocols=arm hw_hits=%" PRIu64
+      " counter_state=%s\n",
       manager->pipeline->egress_acl_selector_pipe != NULL ? "ready" : "off",
       egress_acl_active, egress_acl_fallback, egress_acl_rules,
       manager->pipeline->egress_acl_failures, egress_acl_pf_replies,
-      manager->pipeline->egress_acl_pf_reply_fallbacks);
+      manager->pipeline->egress_acl_pf_reply_fallbacks, egress_acl_hits,
+      egress_acl_counter_result == DOCA_SUCCESS ? "ready" : "error");
   used = append_text(response, size, used,
       "egress_authorized=exact-tcp-udp active=%zu promotions=%" PRIu64
       " removals=%" PRIu64 " failures=%" PRIu64 " hw_hits=%" PRIu64
@@ -2428,7 +2442,8 @@ static size_t format_vswitches(const struct eswitch_manager *manager,
       continue;
     if (filter != 0 && vs->id != filter)
       continue;
-    used = append_text(response, size, used, "vs=%u ports=[", vs->id);
+    used = append_text(response, size, used, "vs=%u name=%s ports=[", vs->id,
+                       vs->name[0] ? vs->name : "-");
     for (size_t i = 0; i < ESWITCH_MAX_PERSISTED_MEMBERS; i++) {
       const struct eswitch_port_membership *member = &manager->memberships[i];
       if (!member->active || member->vswitch_id != vs->id)
@@ -2475,7 +2490,7 @@ static size_t format_vswitches(const struct eswitch_manager *manager,
 }
 
 static size_t format_available_ports(const struct eswitch_manager *manager,
-                                     char *response, size_t size) {
+                                     char *response, size_t size, bool all) {
   size_t used = append_text(response, size, 0, "OK\n");
   size_t shown = 0;
 
@@ -2495,8 +2510,8 @@ static size_t format_available_ports(const struct eswitch_manager *manager,
     /* A parent port remains selectable after its first trunk membership: the
      * same physical trunk can carry another VLAN into another VS. Access
      * ports and VF representors remain exclusive. */
-    if (access_member || router_control_port_reserved(manager, i) ||
-        (trunk_member && port->role != ETHERNET_PORT_ROLE_PARENT))
+    if (!all && (access_member || router_control_port_reserved(manager, i) ||
+        (trunk_member && port->role != ETHERNET_PORT_ROLE_PARENT)))
       continue;
     if (port->role == ETHERNET_PORT_ROLE_PARENT) {
       used = append_text(response, size, used,
@@ -2541,7 +2556,7 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
     (void)format_tx_debug(manager, response, response_size);
     return DOCA_SUCCESS;
   } else if (parsed.verb == ESWITCH_CLI_PORT_SHOW) {
-    (void)format_available_ports(manager, response, response_size);
+    (void)format_available_ports(manager, response, response_size, parsed.all_ports);
     return DOCA_SUCCESS;
   } else if (parsed.verb == ESWITCH_CLI_VS_SHOW) {
     /* An explicit filter for an absent vSwitch is a lookup miss, not an empty
@@ -2559,7 +2574,7 @@ doca_error_t eswitch_manager_command(const char *request, char *response,
                        response_size - strlen(response));
     return DOCA_SUCCESS;
   } else if (parsed.verb == ESWITCH_CLI_VS_CREATE) {
-    result = create_vswitch_persisted(manager, parsed.id);
+    result = create_vswitch_persisted(manager, parsed.id, parsed.name);
   } else if (parsed.verb == ESWITCH_CLI_VS_DELETE) {
     if (manager->router && router_switch_reserved(manager->router, parsed.id)) {
       snprintf(response, response_size,

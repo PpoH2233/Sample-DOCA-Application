@@ -112,6 +112,7 @@ struct eswitch_egress_acl {
   bool fallback_arm;
 };
 
+
 #define ESWITCH_INGRESS_DENY_MAX_RANGES 8U
 #define ESWITCH_INGRESS_DENY_PREFIXES_PER_RANGE 32U
 #define ESWITCH_INGRESS_DENY_MAX_RULES 512U
@@ -386,6 +387,8 @@ doca_error_t eswitch_pipeline_egress_authorize(
 doca_error_t eswitch_pipeline_egress_authorized_prune(
     struct eswitch_pipeline *pipeline, uint64_t now_ns);
 doca_error_t eswitch_pipeline_egress_authorized_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *hits);
+doca_error_t eswitch_pipeline_egress_acl_stats(
     const struct eswitch_pipeline *pipeline, uint64_t *hits);
 
 /* Promote a software TCP/UDP NAT session into the bidirectional CT table.

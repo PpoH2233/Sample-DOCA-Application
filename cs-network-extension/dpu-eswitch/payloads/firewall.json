@@ -1,0 +1,16 @@
+{
+  "physical-network-extension-details": {},
+  "network-extension-details": {"vlan":"900", "vswitch_id":"900", "vr_id":"900"},
+  "payload": {
+    "network_id":"42", "vlan":"900", "cidr":"10.90.0.0/24",
+    "fw_rules": {
+      "default_egress_allow":false, "cidr":"10.90.0.0/24",
+      "rules":[
+        {"id":100001, "type":"ingress", "protocol":"tcp", "portStart":2222, "portEnd":2222,
+         "publicIp":"203.0.113.10", "sourceCidrs":["192.0.2.0/24"], "destCidrs":[]},
+        {"id":100002, "type":"egress", "protocol":"tcp", "portStart":443, "portEnd":443,
+         "sourceCidrs":[], "destCidrs":["0.0.0.0/0"]}
+      ]
+    }
+  }
+}

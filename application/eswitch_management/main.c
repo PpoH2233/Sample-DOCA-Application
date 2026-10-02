@@ -6,6 +6,7 @@
 #include <rte_pause.h>
 #include <doca_dev.h>
 #include <doca_flow_ct.h>
+#include <doca_log.h>
 
 #include "../../ethernet_device_discovery/dpdk_runtime.h"
 #include "../ethernet_switch/dpdk_io.h"
@@ -213,6 +214,20 @@ int main(int argc, char **argv) {
   uint32_t legacy_actions_mem_size;
   int separator;
   int exit_status = EXIT_FAILURE;
+  struct doca_log_backend *sdk_log = NULL;
+
+  /* As in the shipped flow_acl_main.c: SDK failures need their own sink;
+   * application fprintf diagnostics alone hide the driver rejection. */
+  result = doca_log_backend_create_standard();
+  if (result == DOCA_SUCCESS)
+    result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+  if (result == DOCA_SUCCESS)
+    result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+  if (result != DOCA_SUCCESS) {
+    fprintf(stderr, "Failed to initialize SDK logging: %s\n",
+            doca_error_get_descr(result));
+    return EXIT_FAILURE;
+  }
 
   separator = find_separator(argc, argv);
   if (separator < 0 || separator + 2 != argc) {

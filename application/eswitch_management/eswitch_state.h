@@ -30,6 +30,7 @@ struct eswitch_state_member {
 
 struct eswitch_state {
   uint16_t switch_ids[ESWITCH_MAX_VSWITCHES];
+  char switch_names[ESWITCH_MAX_VSWITCHES][ESWITCH_VS_NAME_SIZE];
   size_t switch_count;
   struct eswitch_state_member *members;
   size_t member_count;

@@ -134,8 +134,25 @@ that cannot be admitted continue through the existing Arm pre-route check.
 If the larger reserve prevents Flow ports from starting with `NO_MEMORY`,
 startup retries the previous action-memory budget so ACL can fall back to Arm
 without taking down the switch.
-For policies with no destination-port rule, the ACL template omits the TCP-port
-field so IPv4-only local-RIF bypasses do not require an unused L4 match.
+In v53 a CONTROL guard sends every local address of the owning VR to Arm
+before policy evaluation. The policy engine is also DOCA Flow CONTROL,
+avoiding the failed ACL ERP commit/cleanup in SDK3.4.0112. The guard dispatches
+TCP/UDP to the policy pipe and sends
+ICMP/other protocols to the authoritative Arm checker. Ordered `all` rules
+expand to TCP and UDP entries; ICMP rules are omitted from that projection,
+preserving each protocol's first-match/default decision. PF reply exceptions
+remain ahead of the policy ACL. Failure to create any stage retains Arm
+fallback. Status `egress_acl` reports the TCP/UDP scope and per-entry
+`hw_hits` separately from exact authorization/CT counters; installed entries
+alone do not prove hardware traffic. A default miss is not included in these
+entry hit counts in v52. In v53 the explicit default decision has its own
+counter and is included in `hw_hits` and `hw_rules`; `engine=control` identifies
+the implementation. At most seven TCP/UDP-relevant ordered rules per policy
+use hardware (priorities0..6, default7). Port ranges expand to disjoint ternary
+prefixes without consuming extra priority levels. Larger policies retain full
+Arm enforcement, never a truncated hardware projection. Hardware hits reset
+when a policy generation is replaced. SDK warnings/errors are now logged to
+stderr through the SDK backend, independently of application diagnostics.
 
 ```text
 endpoint
@@ -262,9 +279,13 @@ At startup the daemon probes current ports first, loads this file, maps
 `parent` or `(host,pf,vf)` to the current DPDK port ID, then recreates the
 vSwitches and attachments. Startup fails instead of silently omitting a
 configured port when an identity cannot be resolved or the file is invalid.
+Version 5 additionally stores optional single-token VS names, for example
+`vswitch 900 VS900`, created with `vs create --id 900 --name VS900`.
+Names contain at most 63 ASCII letters/digits/underscore/hyphen/dot. Numeric-only
+creation/state remain supported; `vs show` exposes `name=-` for unnamed switches.
 Version 4 stores a primary VLAN interval and an optional second interval;
 exact VLANs repeat the same value and an absent second interval is `0 0`.
-Versions 1, 2 and 3 remain readable and are upgraded on the next successful
+Versions 1, 2, 3 and 4 remain readable and are upgraded on the next successful
 mutation. Learned dynamic FDB entries are not persisted and are relearned from
 traffic.
 See [eswitch.conf.example](eswitch.conf.example) for a complete example.

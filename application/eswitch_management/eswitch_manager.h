@@ -21,6 +21,7 @@
 struct managed_vswitch {
   bool exists;
   uint16_t id;
+  char name[ESWITCH_VS_NAME_SIZE];
   struct eswitch_flood_group flood;
 };
 

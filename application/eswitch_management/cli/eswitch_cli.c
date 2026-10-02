@@ -11,6 +11,7 @@ enum option_bit {
   OPTION_PORT = 2u,
   OPTION_MODE = 4u,
   OPTION_VLAN = 8u,
+  OPTION_NAME = 16u,
 };
 
 static bool parse_u16(const char *text, uint16_t *value) {
@@ -127,6 +128,11 @@ static bool parse_options(size_t start, size_t count,
                            &out->vlan_extra_id, &out->vlan_extra_last))
         return false;
       out->has_vlan = true;
+    } else if (strcmp(key, "--name") == 0) {
+      bit = OPTION_NAME;
+      if (!eswitch_vs_name_valid(value))
+        return false;
+      strcpy(out->name, value);
     } else {
       return false;
     }
@@ -208,7 +214,9 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
     if (strcmp(tokens[1], "create") == 0 || strcmp(tokens[1], "delete") == 0) {
       out->verb = strcmp(tokens[1], "create") == 0 ? ESWITCH_CLI_VS_CREATE
                                                    : ESWITCH_CLI_VS_DELETE;
-      return parse_options(2, token_count, tokens, OPTION_ID, OPTION_ID, out) &&
+      return parse_options(2, token_count, tokens,
+                           OPTION_ID | (out->verb == ESWITCH_CLI_VS_CREATE ? OPTION_NAME : 0u),
+                           OPTION_ID, out) &&
              out->id != 0;
     }
     if (strcmp(tokens[1], "show") == 0) {
@@ -241,9 +249,13 @@ bool eswitch_cli_parse(size_t token_count, const char *const *tokens,
     return parse_options(2, token_count, tokens, OPTION_ID, 0u, out);
   }
   if (strcmp(resource, "port") == 0) {
-    if (token_count != 2 || strcmp(tokens[1], "show") != 0)
+    if ((token_count != 2 && token_count != 3) || strcmp(tokens[1], "show") != 0)
       return false;
     out->verb = ESWITCH_CLI_PORT_SHOW;
+    if (token_count == 3) {
+      if (strcmp(tokens[2], "--all") != 0) return false;
+      out->all_ports = true;
+    }
     return true;
   }
 
@@ -363,7 +375,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
     return "Run: eswitchctl --help\n";
   resource = tokens[0];
   if (strcmp(resource, "vs-create") == 0)
-    return "Usage: vs create --id <id>\n";
+    return "Usage: vs create --id <id> [--name <name>]\n";
   if (strcmp(resource, "vs-delete") == 0)
     return "Usage: vs delete --id <id>\n";
   if (strcmp(resource, "vs-list") == 0)
@@ -380,7 +392,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
   if (strcmp(resource, "fdb") == 0)
     return "Usage: fdb show [--id <id>]\n";
   if (strcmp(resource, "port") == 0)
-    return "Usage: port show\n";
+    return "Usage: port show [--all]\n";
   if (strcmp(resource, "status") == 0)
     return "Usage: status\n";
   if (strcmp(resource, "tx-debug") == 0)
@@ -388,7 +400,7 @@ const char *eswitch_cli_usage_for_tokens(size_t token_count,
   if (strcmp(resource, "vs") != 0)
     return "Run: eswitchctl --help\n";
   if (token_count >= 2 && strcmp(tokens[1], "create") == 0)
-    return "Usage: vs create --id <id>\n";
+    return "Usage: vs create --id <id> [--name <name>]\n";
   if (token_count >= 2 && strcmp(tokens[1], "delete") == 0)
     return "Usage: vs delete --id <id>\n";
   if (token_count >= 2 && strcmp(tokens[1], "show") == 0)
@@ -427,7 +439,7 @@ void eswitch_cli_help(FILE *output, const char *program,
           "  tx-debug                                 Show SF return/TX "
           "diagnostics\n\n"
           "Virtual switch (L2):\n"
-          "  vs create --id <id>                      Create a virtual "
+          "  vs create --id <id> [--name <name>]        Create a virtual "
           "switch\n"
           "  vs delete --id <id>                      Delete a virtual "
           "switch\n"

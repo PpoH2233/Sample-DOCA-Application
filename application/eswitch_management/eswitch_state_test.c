@@ -62,6 +62,7 @@ int main(void) {
          (int)sizeof(path));
   assert(eswitch_state_init(8, &written) == DOCA_SUCCESS);
   assert(eswitch_state_add_switch(&written, 100) == DOCA_SUCCESS);
+  strcpy(written.switch_names[0], "VS100");
   assert(eswitch_state_add_switch(&written, 200) == DOCA_SUCCESS);
   assert(eswitch_state_add_switch(&written, 300) == DOCA_SUCCESS);
   assert(eswitch_state_add_member(&written, &parent) == DOCA_SUCCESS);
@@ -78,6 +79,7 @@ int main(void) {
   assert(eswitch_state_load(path, &loaded, &exists) == DOCA_SUCCESS);
   assert(exists);
   assert(loaded.switch_count == 3);
+  assert(strcmp(loaded.switch_names[0], "VS100") == 0);
   assert(loaded.switch_ids[0] == 100 && loaded.switch_ids[1] == 200);
   assert(loaded.member_count == 3);
   assert(loaded.members[0].kind == ESWITCH_STATE_PORT_PARENT);
@@ -134,6 +136,20 @@ int main(void) {
   assert(loaded.members[0].vlan_last == 899);
   assert(loaded.members[0].vlan_extra_id == 0);
   assert(loaded.members[0].vlan_extra_last == 0);
+  eswitch_state_destroy(&loaded);
+
+  /* Numeric-only version 4 is still accepted after adding optional names. */
+  {
+    FILE *legacy = fopen(path, "w");
+    assert(legacy != NULL);
+    assert(fputs("version 4\nvswitch 10\n"
+                 "member 10 parent trunk 6 6 0 0\n", legacy) >= 0);
+    assert(fclose(legacy) == 0);
+  }
+  assert(eswitch_state_init(8, &loaded) == DOCA_SUCCESS);
+  assert(eswitch_state_load(path, &loaded, &exists) == DOCA_SUCCESS);
+  assert(loaded.switch_count == 1 && loaded.switch_names[0][0] == '\0');
+  assert(loaded.members[0].vlan_id == 6);
   eswitch_state_destroy(&loaded);
 
   assert(unlink(path) == 0);

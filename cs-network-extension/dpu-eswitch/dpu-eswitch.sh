@@ -348,6 +348,8 @@ if [ "${COMMAND}" = "ensure-network-device" ]; then
     # wrapper derives them later from the implement-network payload.
     if [ -n "${VLAN}" ]; then
         VLAN="${VLAN#vlan://}"
+        [[ "${VLAN}" =~ ^[0-9]+$ ]] && [ "${VLAN}" -ge 900 ] && [ "${VLAN}" -le 999 ] || \
+            die "guest VID must be 900-999" 1
     fi
 
     # ---- Step 1: honour the previously selected host (sticky assignment) ----
@@ -370,11 +372,12 @@ if [ "${COMMAND}" = "ensure-network-device" ]; then
                     fi
                     exit 0
                 else
-                    log "ensure-network-device: current host ${CURRENT_HOST} not reachable - failover"
+                    die "network ${NETWORK_ID} is pinned to unavailable DPU ${CURRENT_HOST}; move VM/network state before reassignment" 1
                 fi
                 break
             fi
         done
+        die "network ${NETWORK_ID} is pinned to DPU ${CURRENT_HOST} outside registered hosts; explicit migration required" 1
     fi
 
     # ---- Step 2: stable hash-based host selection for new / failed-over networks ----
@@ -463,4 +466,3 @@ fi
 
 log "Command '${COMMAND}' completed successfully on ${REMOTE_HOST}"
 exit 0
-

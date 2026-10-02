@@ -55,6 +55,7 @@ doca_error_t create_vswitch(struct eswitch_manager *manager,
     if (!manager->switches[i].exists) {
       manager->switches[i].exists = true;
       manager->switches[i].id = id;
+      manager->switches[i].name[0] = '\0';
       printf("VSWITCH CREATE: id=%u\n", id);
       return DOCA_SUCCESS;
     }

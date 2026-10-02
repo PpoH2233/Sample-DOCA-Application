@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define ESWITCH_STATE_VERSION 4U
+#define ESWITCH_STATE_VERSION 5U
 #define ESWITCH_STATE_LINE_SIZE 512U
 
 static bool switch_exists(const struct eswitch_state *state,
@@ -164,7 +164,7 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
   if (count == 2 && strcmp(tokens[0], "version") == 0) {
     if (*version_seen || !parse_u32(tokens[1], &values[0]) ||
         (values[0] != 1U && values[0] != 2U && values[0] != 3U &&
-         values[0] != ESWITCH_STATE_VERSION))
+         values[0] != 4U && values[0] != ESWITCH_STATE_VERSION))
       goto invalid;
     *version_seen = true;
     *version = values[0];
@@ -172,13 +172,17 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
   }
   if (!*version_seen)
     goto invalid;
-  if (count == 2 && strcmp(tokens[0], "vswitch") == 0) {
+  if ((count == 2 || (count == 3 && *version == 5U)) && strcmp(tokens[0], "vswitch") == 0) {
     if (!parse_u32(tokens[1], &values[0]) || values[0] == 0 ||
         values[0] > UINT16_MAX)
       goto invalid;
     result = eswitch_state_add_switch(state, (uint16_t)values[0]);
     if (result != DOCA_SUCCESS)
       goto invalid;
+    if (count == 3) {
+      if (!eswitch_vs_name_valid(tokens[2])) goto invalid;
+      strcpy(state->switch_names[state->switch_count - 1], tokens[2]);
+    }
     return DOCA_SUCCESS;
   }
   if (count >= 3 && strcmp(tokens[0], "member") == 0) {
@@ -189,14 +193,14 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
     if ((*version == 1U && count == 3) ||
         (*version == 2U && count == 5) ||
         (*version == 3U && count == 6) ||
-        (*version == ESWITCH_STATE_VERSION && count == 8)) {
+        (*version >= 4U && count == 8)) {
       if (strcmp(tokens[2], "parent") != 0)
         goto invalid;
       member.kind = ESWITCH_STATE_PORT_PARENT;
     } else if ((*version == 1U && count == 6) ||
                (*version == 2U && count == 8) ||
                (*version == 3U && count == 9) ||
-               (*version == ESWITCH_STATE_VERSION && count == 11)) {
+               (*version >= 4U && count == 11)) {
       if (strcmp(tokens[2], "representor") != 0)
         goto invalid;
       for (size_t i = 0; i < 3; i++) {
@@ -233,7 +237,7 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
             goto invalid;
           member.vlan_last = (uint16_t)values[0];
         }
-        if (*version == ESWITCH_STATE_VERSION) {
+        if (*version >= 4U) {
           if (!parse_u32(tokens[mode_index + 3], &values[0]) ||
               values[0] > UINT16_MAX ||
               !parse_u32(tokens[mode_index + 4], &values[1]) ||
@@ -252,7 +256,7 @@ static doca_error_t parse_line(char *line, unsigned int line_number,
                  (*version >= 3U &&
                   (!parse_u32(tokens[mode_index + 2], &values[1]) ||
                    values[1] > UINT16_MAX || values[1] != values[0])) ||
-                 (*version == ESWITCH_STATE_VERSION &&
+                 (*version >= 4U &&
                   (!parse_u32(tokens[mode_index + 3], &values[1]) ||
                    values[1] != 0 ||
                    !parse_u32(tokens[mode_index + 4], &values[1]) ||
@@ -376,7 +380,10 @@ doca_error_t eswitch_state_save(const char *path,
               ESWITCH_STATE_VERSION) < 0)
     goto fail;
   for (size_t i = 0; i < state->switch_count; i++) {
-    if (fprintf(file, "vswitch %u\n", state->switch_ids[i]) < 0)
+    if (state->switch_names[i][0] && !eswitch_vs_name_valid(state->switch_names[i]))
+      goto fail;
+    if (fprintf(file, "vswitch %u%s%s\n", state->switch_ids[i],
+                state->switch_names[i][0] ? " " : "", state->switch_names[i]) < 0)
       goto fail;
   }
   for (size_t i = 0; i < state->member_count; i++) {

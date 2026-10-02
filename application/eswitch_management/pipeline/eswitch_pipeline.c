@@ -11,6 +11,7 @@
 #include "../../ethernet_switch/switch_config.h"
 #include "../eswitch_config.h"
 #include "../router/router_egress.h"
+#include "../router/router_acl_plan.h"
 
 #define ESWITCH_MAX_FLOOD_MEMBERS 254U
 #define ESWITCH_METADATA_VSWITCH_MASK UINT32_C(0xffff0000)
@@ -1003,17 +1004,54 @@ static bool acl_can_offload(const struct router_config *config,
                             const struct router_egress_policy *policy,
                             const struct router_egress_rule *const *rules,
                             size_t count) {
-  /* The DOCA 3.4 ACL sample programs TCP/UDP five-tuples with an explicit
-   * L4 parser type. Keep other protocols on the authoritative Arm path until
-   * their ACL entry shapes are validated on the target hardware. */
+  /* The front CONTROL pipe sends other protocols to Arm. ALL rules are
+   * expanded for TCP/UDP without changing first-match order. */
   (void)config;
   (void)policy;
-  for (size_t i = 0; i < count; i++)
-    if ((rules[i]->protocol != IPPROTO_TCP &&
-         rules[i]->protocol != IPPROTO_UDP) ||
-        rules[i]->icmp_type >= 0 || rules[i]->icmp_code >= 0)
+  size_t priorities = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (rules[i]->protocol != 0 && rules[i]->protocol != IPPROTO_ICMP &&
+        rules[i]->protocol != IPPROTO_TCP && rules[i]->protocol != IPPROTO_UDP)
       return false;
-  return true;
+    priorities += router_acl_applies(rules[i], IPPROTO_TCP) ||
+                  router_acl_applies(rules[i], IPPROTO_UDP);
+  }
+  /* CONTROL supports priorities 0..7. Reserve 7 for default action;
+   * never truncate a larger ordered policy or wrap priority values. */
+  return priorities <= 7U;
+}
+
+static size_t acl_projected_count(
+    const struct router_egress_rule *const *rules, size_t count) {
+  size_t total = 1; /* Explicit, counted default decision at priority 7. */
+  for (size_t i = 0; i < count; i++) {
+    total += (router_acl_applies(rules[i], IPPROTO_TCP) +
+              router_acl_applies(rules[i], IPPROTO_UDP)) *
+             router_acl_port_count(rules[i]);
+  }
+  return total;
+}
+
+doca_error_t eswitch_pipeline_egress_acl_stats(
+    const struct eswitch_pipeline *pipeline, uint64_t *hits) {
+  if (pipeline == NULL || hits == NULL)
+    return DOCA_ERROR_INVALID_VALUE;
+  *hits = 0;
+  for (size_t i = 0; i < ROUTER_MAX_EGRESS_POLICIES; i++) {
+    const struct eswitch_egress_acl *slot = &pipeline->egress_acls[i];
+    if (!slot->active || slot->fallback_arm)
+      continue;
+    for (size_t j = 0; j < slot->rule_count; j++) {
+      struct doca_flow_resource_query query = {0};
+      if (slot->rules == NULL || slot->rules[j].entry == NULL)
+        return DOCA_ERROR_BAD_STATE;
+      doca_error_t result = doca_flow_resource_query_entry(slot->rules[j].entry, &query);
+      if (result != DOCA_SUCCESS)
+        return result;
+      *hits += query.counter.total_pkts;
+    }
+  }
+  return DOCA_SUCCESS;
 }
 
 static doca_error_t acl_build_generation(
@@ -1023,39 +1061,22 @@ static doca_error_t acl_build_generation(
     const struct router_egress_rule *const *rules, size_t count,
     struct doca_flow_pipe **pipe, struct eswitch_rule **entries) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_match template = {0};
-  struct doca_flow_actions actions = {0};
-  struct doca_flow_actions *actions_array[1] = {&actions};
-  struct doca_flow_fwd hit = {.type = DOCA_FLOW_FWD_CHANGEABLE};
   struct doca_flow_fwd miss = {0};
-  size_t local_count = 0, total, position = 0;
+  struct doca_flow_monitor monitor = {
+      .counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED};
+  size_t total = acl_projected_count(rules, count), position = 0;
+  uint8_t priority = 0;
   const char *stage = "pipe-config-create";
   doca_error_t result;
 
   *pipe = NULL;
   *entries = NULL;
-  /* A default-allow miss already forwards local destinations to Arm. Avoid
-   * consuming ACL entries for redundant local-RIF exceptions; in particular,
-   * some HWS configurations reject an IP-only ACL entry at insertion time.
-   * Default-deny still needs explicit exceptions and safely falls back to
-   * Arm if the hardware cannot install them. */
-  if (!policy->default_allow)
-    for (size_t i = 0; i < config->interface_count; i++)
-      if (config->interfaces[i].vr_id == policy->vr_id &&
-          config->interfaces[i].has_address)
-        local_count++;
-  total = local_count + count;
-  template.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
-  template.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-  template.outer.ip4.src_ip = UINT32_MAX;
-  template.outer.ip4.dst_ip = UINT32_MAX;
-  /* Match the shipped DOCA 3.4 flow_acl template for a populated TCP/UDP
-   * ACL. The ACL entry supplies its own TCP or UDP parser type and ports. */
-  if (count != 0) {
-    template.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
-    template.outer.tcp.l4_port.src_port = UINT16_MAX;
-    template.outer.tcp.l4_port.dst_port = UINT16_MAX;
-  }
+  (void)config;
+  /* The 3.4 ACL ERP compiler rejects the production wildcard entries and
+   * crashes on teardown. Use the installed CONTROL sample shape already
+   * validated by ingress deny, with ordinary ternary port prefixes. */
+  if (!acl_can_offload(config, policy, rules, count))
+    return DOCA_ERROR_NOT_SUPPORTED;
   miss.type = policy->default_allow ? DOCA_FLOW_FWD_PIPE
                                     : DOCA_FLOW_FWD_DROP;
   if (policy->default_allow)
@@ -1069,19 +1090,10 @@ static doca_error_t acl_build_generation(
   }
   stage = "pipe-config-identity";
   result = set_pipe_identity(cfg, "ESW_GUEST_EGRESS_ACL",
-                             DOCA_FLOW_PIPE_ACL, false,
-                             total ? (uint32_t)total : 1U);
-  if (result == DOCA_SUCCESS) {
-    stage = "pipe-config-match";
-    result = doca_flow_pipe_cfg_set_match(cfg, &template, NULL);
-  }
-  if (result == DOCA_SUCCESS) {
-    stage = "pipe-config-actions";
-    result = doca_flow_pipe_cfg_set_actions(cfg, actions_array, NULL, NULL, 1);
-  }
+                             DOCA_FLOW_PIPE_CONTROL, false, (uint32_t)total);
   if (result == DOCA_SUCCESS) {
     stage = "pipe-create";
-    result = doca_flow_pipe_create(cfg, &hit, &miss, pipe);
+    result = doca_flow_pipe_create(cfg, NULL, NULL, pipe);
   }
   doca_flow_pipe_cfg_destroy(cfg);
   if (result != DOCA_SUCCESS) {
@@ -1090,8 +1102,6 @@ static doca_error_t acl_build_generation(
             doca_error_get_descr(result));
     return result;
   }
-  if (total == 0)
-    return DOCA_SUCCESS;
   *entries = calloc(total, sizeof(**entries));
   if (*entries == NULL) {
     fprintf(stderr, "Guest egress ACL build failed: vr=%u rif=%u stage=entry-storage entries=%zu error=Memory allocation failure\n",
@@ -1100,76 +1110,69 @@ static doca_error_t acl_build_generation(
     *pipe = NULL;
     return DOCA_ERROR_NO_MEMORY;
   }
-  /* Arm exempts every local IP of this VR, not just the ingress RIF IP.
-   * Insert these before user rules so a default-deny cannot intercept them. */
-  for (size_t i = 0; i < config->interface_count; i++) {
-    const struct router_interface *local = &config->interfaces[i];
-    struct doca_flow_match match = {0}, mask = {0};
-    struct doca_flow_fwd fwd = {.type = DOCA_FLOW_FWD_PIPE,
-                                .next_pipe = pipeline->rss_pipe};
-    if (policy->default_allow || local->vr_id != policy->vr_id ||
-        !local->has_address)
+  for (size_t r = 0; r < count; r++) {
+    const struct router_egress_rule *rule = rules[r];
+    if (!router_acl_applies(rule, IPPROTO_TCP) &&
+        !router_acl_applies(rule, IPPROTO_UDP))
       continue;
-    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-    match.outer.ip4.dst_ip = DOCA_HTOBE32(local->address);
-    mask.outer.ip4.dst_ip = UINT32_MAX;
-    flow_entry_cookie_prepare(&(*entries)[position].cookie,
-                              "guest egress local-RIF bypass",
-                              DOCA_FLOW_ENTRY_OP_ADD);
-    stage = "local-RIF-entry-add";
-    result = doca_flow_pipe_acl_add_entry(
-        pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
-        (uint32_t)position, &fwd,
-        batch_flags((uint32_t)position, (uint32_t)total),
-        &(*entries)[position].cookie, &(*entries)[position].entry);
-    if (result != DOCA_SUCCESS)
-      goto build_done;
-    position++;
-  }
-  for (size_t i = 0; i < count; i++, position++) {
-    const struct router_egress_rule *rule = rules[i];
-    struct doca_flow_match match = {0}, mask = {0};
-    struct doca_flow_fwd fwd = {0};
+    for (unsigned int p = 0; p < 2U; p++) {
+      uint8_t protocol = p == 0 ? IPPROTO_TCP : IPPROTO_UDP;
+      if (!router_acl_applies(rule, protocol))
+        continue;
+      uint32_t last = rule->port_first == 0 ? 65535U : rule->port_last;
+      for (uint32_t cursor = rule->port_first; cursor <= last;) {
+        uint32_t block = router_acl_port_block(cursor, last);
+        struct doca_flow_match match = {0}, mask = {0};
+        struct doca_flow_fwd fwd = {0};
 
-    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
-    match.outer.ip4.src_ip = DOCA_HTOBE32(rule->source);
-    match.outer.ip4.dst_ip = DOCA_HTOBE32(rule->destination);
-    mask.outer.ip4.src_ip = DOCA_HTOBE32(
-        ipv4_prefix_mask(rule->source_prefix));
-    mask.outer.ip4.dst_ip = DOCA_HTOBE32(
-        ipv4_prefix_mask(rule->destination_prefix));
-    if (rule->protocol == IPPROTO_TCP) {
-      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
-      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
-    } else {
-      match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
-      match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
-    }
-    mask.parser_meta.outer_l4_type = UINT32_MAX;
-    if (rule->port_first != 0) {
-      /* ACL interprets the mask port as the inclusive range end. */
-      if (rule->protocol == IPPROTO_TCP) {
-        match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
-        mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
-      } else {
-        match.outer.udp.l4_port.dst_port = DOCA_HTOBE16(rule->port_first);
-        mask.outer.udp.l4_port.dst_port = DOCA_HTOBE16(rule->port_last);
+        match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+        mask.parser_meta.outer_l3_type = UINT32_MAX;
+        match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+        match.outer.ip4.src_ip = DOCA_HTOBE32(rule->source);
+        match.outer.ip4.dst_ip = DOCA_HTOBE32(rule->destination);
+        mask.outer.ip4.src_ip = DOCA_HTOBE32(
+            ipv4_prefix_mask(rule->source_prefix));
+        mask.outer.ip4.dst_ip = DOCA_HTOBE32(
+            ipv4_prefix_mask(rule->destination_prefix));
+        if (protocol == IPPROTO_TCP) {
+          match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;
+          match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;
+          match.outer.tcp.l4_port.dst_port = DOCA_HTOBE16((uint16_t)cursor);
+          mask.outer.tcp.l4_port.dst_port = DOCA_HTOBE16((uint16_t)~(block - 1U));
+        } else {
+          match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;
+          match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;
+          match.outer.udp.l4_port.dst_port = DOCA_HTOBE16((uint16_t)cursor);
+          mask.outer.udp.l4_port.dst_port = DOCA_HTOBE16((uint16_t)~(block - 1U));
+        }
+        mask.parser_meta.outer_l4_type = UINT32_MAX;
+        fwd.type = rule->allow ? DOCA_FLOW_FWD_PIPE : DOCA_FLOW_FWD_DROP;
+        if (rule->allow)
+          fwd.next_pipe = pipeline->rss_pipe;
+        flow_entry_cookie_prepare(&(*entries)[position].cookie,
+                                  "guest egress ACL rule", DOCA_FLOW_ENTRY_OP_ADD);
+        stage = "policy-rule-entry-add";
+        result = doca_flow_pipe_control_add_entry(
+            pipeline->runtime->queue_id, *pipe, &match, &mask,
+            NULL, NULL, NULL, NULL, &monitor, priority, &fwd,
+            &(*entries)[position].cookie, &(*entries)[position].entry);
+        if (result != DOCA_SUCCESS)
+          goto build_done;
+        position++;
+        cursor += block;
       }
     }
-    fwd.type = rule->allow ? DOCA_FLOW_FWD_PIPE : DOCA_FLOW_FWD_DROP;
-    if (rule->allow)
-      fwd.next_pipe = pipeline->rss_pipe;
-    flow_entry_cookie_prepare(&(*entries)[position].cookie,
-                              "guest egress ACL rule", DOCA_FLOW_ENTRY_OP_ADD);
-    stage = "policy-rule-entry-add";
-    result = doca_flow_pipe_acl_add_entry(
-        pipeline->runtime->queue_id, *pipe, &match, &mask, 0, NULL,
-        (uint32_t)position, &fwd,
-        batch_flags((uint32_t)position, (uint32_t)total),
-        &(*entries)[position].cookie, &(*entries)[position].entry);
-    if (result != DOCA_SUCCESS)
-      break;
+    priority++;
   }
+  flow_entry_cookie_prepare(&(*entries)[position].cookie,
+      "guest egress default decision", DOCA_FLOW_ENTRY_OP_ADD);
+  stage = "default-entry-add";
+  result = doca_flow_pipe_control_add_entry(
+      pipeline->runtime->queue_id, *pipe, NULL, NULL,
+      NULL, NULL, NULL, NULL, &monitor, 7, &miss,
+      &(*entries)[position].cookie, &(*entries)[position].entry);
+  if (result == DOCA_SUCCESS)
+    position++;
 build_done:
   if (result == DOCA_SUCCESS) {
     stage = "entries-process";
@@ -1187,33 +1190,73 @@ build_done:
   return result;
 }
 
-/* These are exact session exceptions, not port-range policy rules. A control
- * pipe avoids the ACL template's protocol/range/action constraints. Hits
- * still go to Arm for session validation; misses go to the policy ACL. */
+/* CONTROL owns IP-only local exceptions and protocol dispatch. PF reply
+ * exceptions are exact session matches in this same stage. Other protocols
+ * retain Arm enforcement instead of falling through a TCP/UDP ACL miss. */
 static doca_error_t acl_build_pf_reply_pipe(
-    struct eswitch_pipeline *pipeline, struct doca_flow_pipe *acl_pipe,
-    struct eswitch_rule *miss_rule,
+    struct eswitch_pipeline *pipeline, const struct router_config *config,
+    const struct router_egress_policy *policy,
+    struct doca_flow_pipe *acl_pipe,
+    struct eswitch_pf_reply_exception *storage,
     struct doca_flow_pipe **reply_pipe) {
   struct doca_flow_pipe_cfg *cfg = NULL;
-  struct doca_flow_fwd miss = {.type = DOCA_FLOW_FWD_PIPE,
-                               .next_pipe = acl_pipe};
+  struct doca_flow_fwd arm = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = pipeline->rss_pipe};
+  struct doca_flow_fwd acl = {.type = DOCA_FLOW_FWD_PIPE,
+                              .next_pipe = acl_pipe};
+  size_t position = ESWITCH_MAX_PF_REPLY_EXCEPTIONS;
   doca_error_t result;
 
   *reply_pipe = NULL;
   result = doca_flow_pipe_cfg_create(&cfg, pipeline->switch_port);
   if (result != DOCA_SUCCESS)
     return result;
-  result = set_pipe_identity(cfg, "ESW_PF_REPLY_EXACT", DOCA_FLOW_PIPE_CONTROL,
-                             false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS + 1);
+  result = set_pipe_identity(cfg, "ESW_GUEST_EGRESS_GUARD", DOCA_FLOW_PIPE_CONTROL,
+                             false, ESWITCH_MAX_PF_REPLY_EXCEPTIONS +
+                                    ROUTER_MAX_INTERFACES + 3U);
   if (result == DOCA_SUCCESS)
     result = doca_flow_pipe_create(cfg, NULL, NULL, reply_pipe);
   doca_flow_pipe_cfg_destroy(cfg);
+  for (size_t i = 0; result == DOCA_SUCCESS && i < config->interface_count; i++) {
+    const struct router_interface *local = &config->interfaces[i];
+    struct doca_flow_match match = {0}, mask = {0};
+    struct eswitch_rule *rule;
+    if (local->vr_id != policy->vr_id || !local->has_address)
+      continue;
+    rule = &storage[position++].rule;
+    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;
+    match.outer.ip4.dst_ip = DOCA_HTOBE32(local->address);
+    mask.outer.ip4.dst_ip = UINT32_MAX;
+    flow_entry_cookie_prepare(&rule->cookie, "egress local-RIF CONTROL bypass",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, *reply_pipe, &match, &mask,
+        NULL, NULL, NULL, NULL, NULL, 0, &arm, &rule->cookie, &rule->entry);
+    if (result == DOCA_SUCCESS)
+      result = process_rules(pipeline, rule, 1);
+  }
+  for (unsigned int i = 0; result == DOCA_SUCCESS && i < 2; i++) {
+    struct doca_flow_match match = {0}, mask = {0};
+    struct eswitch_rule *rule = &storage[position++].rule;
+    match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
+    mask.parser_meta.outer_l3_type = UINT32_MAX;
+    match.parser_meta.outer_l4_type = i == 0 ? DOCA_FLOW_L4_META_TCP : DOCA_FLOW_L4_META_UDP;
+    mask.parser_meta.outer_l4_type = UINT32_MAX;
+    flow_entry_cookie_prepare(&rule->cookie, "egress TCP/UDP ACL dispatch",
+                              DOCA_FLOW_ENTRY_OP_ADD);
+    result = doca_flow_pipe_control_add_entry(
+        pipeline->runtime->queue_id, *reply_pipe, &match, &mask,
+        NULL, NULL, NULL, NULL, NULL, 1, &acl, &rule->cookie, &rule->entry);
+    if (result == DOCA_SUCCESS)
+      result = process_rules(pipeline, rule, 1);
+  }
   if (result == DOCA_SUCCESS) {
+    struct eswitch_rule *miss_rule = &storage[position].rule;
     flow_entry_cookie_prepare(&miss_rule->cookie, "PF exception policy miss",
                               DOCA_FLOW_ENTRY_OP_ADD);
     result = doca_flow_pipe_control_add_entry(
         pipeline->runtime->queue_id, *reply_pipe, NULL, NULL, NULL, NULL,
-        NULL, NULL, NULL, 7, &miss, &miss_rule->cookie, &miss_rule->entry);
+        NULL, NULL, NULL, 7, &arm, &miss_rule->cookie, &miss_rule->entry);
     if (result == DOCA_SUCCESS)
       result = process_rules(pipeline, miss_rule, 1);
   }
@@ -1730,7 +1773,7 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     struct eswitch_egress_authorized_flow *old_authorized;
     uint64_t fingerprint;
     size_t count = 0;
-    bool fallback, has_pf = false;
+    bool fallback;
     doca_error_t result;
 
     if (rif == NULL || rif->attachment != ROUTER_VSWITCH || slot == NULL)
@@ -1744,9 +1787,6 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
           config->egress_rules[i].interface_id == policy->interface_id)
         ordered[count++] = &config->egress_rules[i];
     qsort(ordered, count, sizeof(ordered[0]), acl_rule_order);
-    for (size_t i = 0; i < config->port_forward_count; i++)
-      if (config->port_forwards[i].vr_id == policy->vr_id)
-        has_pf = true;
     fingerprint = acl_fingerprint(config, policy, ordered, count);
     fallback = !acl_can_offload(config, policy, ordered, count);
     if (slot->active && slot->vr_id == policy->vr_id &&
@@ -1758,16 +1798,17 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     if (!fallback) {
       result = acl_build_generation(pipeline, config, policy, ordered, count,
                                     &next_pipe, &next_rules);
-      if (result == DOCA_SUCCESS && has_pf) {
-        /* The extra slot owns the miss cookie; prune/flush iterate only
-         * session slots and never remove the policy fallback. */
-        next_pf_replies = calloc(ESWITCH_MAX_PF_REPLY_EXCEPTIONS + 1,
+      if (result == DOCA_SUCCESS) {
+        /* Session prune/flush only visit the leading PF reservation slots;
+         * immutable local/dispatch cookies live in the trailing slots. */
+        next_pf_replies = calloc(ESWITCH_MAX_PF_REPLY_EXCEPTIONS +
+                                 ROUTER_MAX_INTERFACES + 3U,
                                  sizeof(*next_pf_replies));
         if (next_pf_replies == NULL)
           result = DOCA_ERROR_NO_MEMORY;
         else
-          result = acl_build_pf_reply_pipe(pipeline, next_pipe,
-              &next_pf_replies[ESWITCH_MAX_PF_REPLY_EXCEPTIONS].rule,
+          result = acl_build_pf_reply_pipe(pipeline, config, policy, next_pipe,
+              next_pf_replies,
               &next_pf_pipe);
       }
       if (result != DOCA_SUCCESS) {
@@ -1847,7 +1888,7 @@ doca_error_t eswitch_pipeline_egress_acl_sync(
     slot->authorized = next_authorized;
     slot->pf_reply_count = 0;
     slot->authorized_count = 0;
-    slot->rule_count = fallback ? 0 : count;
+    slot->rule_count = fallback ? 0 : acl_projected_count(ordered, count);
     slot->fallback_arm = fallback;
     slot->active = true;
     if (old_pf_pipe != NULL)
